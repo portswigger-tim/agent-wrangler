@@ -5,6 +5,9 @@
 // `resolve_repo`). The server is deliberately left running when the window closes —
 // sessions live in tmux and the board keeps watching them.
 //
+// A menu-bar item lists live sessions and goes red when one needs you (see `tray`);
+// closing the window hides it, so the item stays the way back in.
+//
 // A server the app starts itself is supervised: the board's Restart button (and a
 // self-update restart) make the server exit expecting a supervisor to bring it
 // back, so the app respawns it (see `supervise`). The supervisor lives and dies
@@ -12,6 +15,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod supervise;
+mod tray;
 
 use std::fs::OpenOptions;
 use std::net::{SocketAddr, TcpStream};
@@ -22,7 +26,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tauri::{WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::{TrayIcon, TrayIconBuilder};
+use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
 
 const LAUNCHD_LABEL: &str = "net.portswigger.agent-wrangler";
 const START_TIMEOUT: Duration = Duration::from_secs(60);
@@ -317,13 +323,120 @@ fn open_externally(url: &str) {
     let _ = Command::new(opener).arg(url).spawn();
 }
 
+// Brings the board window forward, optionally on a session.
+fn show_board(app: &AppHandle, origin: &str, session: Option<&str>) {
+    let Some(win) = app.get_webview_window("main") else { return };
+    let _ = win.show();
+    let _ = win.unminimize();
+    let _ = win.set_focus();
+    let Some(id) = session else { return };
+    let frag = format!("#session={}", encode_fragment(id));
+    let on_board = win.url().map(|u| u.as_str().starts_with(origin)).unwrap_or(false);
+    if on_board {
+        // Same page: the board listens for hashchange, no reload needed.
+        let _ = win.eval(format!("location.hash = '{frag}';"));
+    } else if let Ok(url) = format!("{origin}/{frag}").parse() {
+        let _ = win.navigate(url);
+    }
+}
+
+fn build_menu(app: &AppHandle, entries: &[tray::Entry]) -> tauri::Result<Menu<tauri::Wry>> {
+    let menu = Menu::new(app)?;
+    menu.append(&MenuItem::with_id(app, "show", "Show board", true, None::<&str>)?)?;
+    if !entries.is_empty() {
+        menu.append(&PredefinedMenuItem::separator(app)?)?;
+    }
+    for e in entries {
+        let text = if e.needs_you { format!("\u{25CF} {}", e.label) } else { format!("   {}", e.label) };
+        menu.append(&MenuItem::with_id(app, format!("session:{}", e.id), text, true, None::<&str>)?)?;
+    }
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    menu.append(&MenuItem::with_id(app, "quit", "Quit Agent Wrangler", true, None::<&str>)?)?;
+    Ok(menu)
+}
+
+// Reflects the server's session list in the tray. `None` entries = server not
+// reachable: quiet icon, bare menu.
+fn update_tray(app: &AppHandle, tray: &TrayIcon, entries: Vec<tray::Entry>) {
+    let app2 = app.clone();
+    let tray = tray.clone();
+    let _ = app.run_on_main_thread(move || {
+        let attention = tray::attention(&entries);
+        if let Ok(menu) = build_menu(&app2, &entries) {
+            let _ = tray.set_menu(Some(menu));
+        }
+        if let Some(icon) = tray::icon(attention) {
+            let _ = tray.set_icon(Some(icon));
+            let _ = tray.set_icon_as_template(!attention);
+        }
+    });
+}
+
+// Follows the server's control socket for as long as the app runs, reconnecting
+// across server restarts. Only the board's own `graph` pushes are read.
+fn watch_sessions(app: AppHandle, tray: TrayIcon, port: u16) {
+    std::thread::spawn(move || {
+        let url = format!("ws://127.0.0.1:{port}/ws");
+        let mut last: Option<Vec<tray::Entry>> = None;
+        loop {
+            if let Ok((mut socket, _)) = tungstenite::connect(url.as_str()) {
+                while let Ok(msg) = socket.read() {
+                    let Ok(text) = msg.to_text() else { continue };
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { continue };
+                    if v["type"] != "graph" {
+                        continue;
+                    }
+                    let entries = tray::entries(&v["graph"]);
+                    // The server re-pushes the graph every couple of seconds; rebuilding
+                    // an open menu for a no-op would make it flicker.
+                    if last.as_ref() != Some(&entries) {
+                        last = Some(entries.clone());
+                        update_tray(&app, &tray, entries);
+                    }
+                }
+            }
+            if last.take().is_some() {
+                update_tray(&app, &tray, Vec::new());
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
+}
+
 fn main() {
     let port = port();
     let origin = format!("http://127.0.0.1:{port}");
+    let reopen_origin = origin.clone();
 
     tauri::Builder::default()
+        // The window hides rather than closes: the tray is the way back in, and the
+        // app (like the server) keeps running until you quit it.
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(move |app| {
             let nav_origin = origin.clone();
+            let handle = app.handle().clone();
+            let tray_origin = origin.clone();
+            let mut tray = TrayIconBuilder::with_id("main")
+                .tooltip("Agent Wrangler")
+                .menu(&build_menu(&handle, &[])?)
+                .on_menu_event(move |app, event| match event.id.as_ref() {
+                    "show" => show_board(app, &tray_origin, None),
+                    "quit" => app.exit(0),
+                    id => {
+                        if let Some(session) = id.strip_prefix("session:") {
+                            show_board(app, &tray_origin, Some(session));
+                        }
+                    }
+                });
+            if let Some(icon) = tray::icon(false) {
+                tray = tray.icon(icon).icon_as_template(true);
+            }
+            watch_sessions(handle, tray.build(app)?, port);
             let win = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("Agent Wrangler")
                 .inner_size(1440.0, 900.0)
@@ -354,6 +467,15 @@ fn main() {
             });
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Agent Wrangler desktop");
+        .build(tauri::generate_context!())
+        .expect("error while building Agent Wrangler desktop")
+        .run(move |app, event| {
+            // Dock click with the window hidden.
+            #[cfg(target_os = "macos")]
+            if let RunEvent::Reopen { .. } = event {
+                show_board(app, &reopen_origin, None);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }
