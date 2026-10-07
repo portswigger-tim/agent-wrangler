@@ -50,9 +50,13 @@ trim_log "$AW_LOG_DIR/wrangler.err" "$AW_LOG_MAX_BYTES"
 
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-nvm use --silent default >/dev/null 2>&1 || true
 
 cd "$(dirname "$0")/.." || exit 1
+
+# Prefer the repo's .nvmrc (`nvm use` with no argument reads it from the cwd, hence
+# the cd above); fall back to the nvm default if there's no .nvmrc or that version
+# isn't installed.
+nvm use --silent >/dev/null 2>&1 || nvm use --silent default >/dev/null 2>&1 || true
 
 # Steps back to the pre-update commit when an update from the board has left a
 # server that cannot boot. Before sync-deps, so a failed `npm ci` counts too.
