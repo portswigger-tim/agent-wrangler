@@ -270,6 +270,7 @@ fn supervise_server(win: WebviewWindow, repo: PathBuf, mut child: Child, port: u
                     }
                 }
                 supervise::Decision::GiveUp => {
+                    eprintln!("[agent-wrangler-desktop] server exited ({why}) after {ran_for:?}; too many recent exits, giving up");
                     gave_up.store(true, Ordering::SeqCst);
                     show_failure(&win, &format!(
                         "The Wrangler server keeps exiting ({why}), so I've stopped restarting it.\n\nLast log lines:\n{}",
