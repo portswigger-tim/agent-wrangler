@@ -18,6 +18,12 @@ label="net.portswigger.agent-wrangler"
 app_name="Agent Wrangler"
 data_dir="${AW_DATA_DIR:-$HOME/.agent-wrangler}"
 log_dir="${AW_LOG_DIR:-$HOME/Library/Logs/wrangler}"
+# The clone the desktop app makes when it has no checkout to run the server from.
+if [ "$(uname -s)" = "Darwin" ]; then
+  managed="$HOME/Library/Application Support/Agent Wrangler"
+else
+  managed="${XDG_DATA_HOME:-$HOME/.local/share}/agent-wrangler"
+fi
 
 purge=0 dry=0 yes=0
 for a in "$@"; do
@@ -73,11 +79,11 @@ case "$(uname -s)" in
 esac
 
 # --- a server started by hand or by the desktop app ------------------------
-# Only processes whose working directory is this checkout, so another clone's
+# Only processes whose working directory is this checkout or the app's managed clone, so another clone's
 # (or a dev instance's) server is left alone.
 for pid in $(pgrep -f "node server/index.js" 2>/dev/null); do
   cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')"
-  [ "$cwd" = "$root" ] && act "stopping the server (pid $pid)" kill "$pid"
+  { [ "$cwd" = "$root" ] || [ "$cwd" = "$managed/checkout" ]; } && act "stopping the server (pid $pid)" kill "$pid"
 done
 
 # --- agent tmux sessions ---------------------------------------------------
@@ -95,6 +101,11 @@ if [ -n "$sockets" ] && command -v tmux >/dev/null 2>&1; then
       say "note: $n agent session(s) still running on tmux socket '$s' (tmux -L $s ls). --purge kills them."
     fi
   done
+fi
+
+# --- the app's managed clone ------------------------------------------------
+if [ -d "$managed" ]; then
+  act "removing the desktop app's managed clone ($managed)" rm -rf "$managed"
 fi
 
 # --- data ------------------------------------------------------------------
