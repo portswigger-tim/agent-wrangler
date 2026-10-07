@@ -5,7 +5,7 @@
 // `resolve_repo`). The server is deliberately left running when the window closes —
 // sessions live in tmux and the board keeps watching them.
 //
-// A menu-bar item lists live sessions and goes red when one needs you (see `tray`);
+// A menu-bar item lists live sessions, coloured by their status (see `tray`);
 // closing the window hides it, so the item stays the way back in.
 //
 // A server the app starts itself is supervised: the board's Restart button (and a
@@ -356,18 +356,18 @@ fn build_menu(app: &AppHandle, entries: &[tray::Entry]) -> tauri::Result<Menu<ta
 }
 
 // Reflects the server's session list in the tray. `None` entries = server not
-// reachable: quiet icon, bare menu.
+// reachable: idle icon, bare menu.
 fn update_tray(app: &AppHandle, tray: &TrayIcon, entries: Vec<tray::Entry>) {
     let app2 = app.clone();
     let tray = tray.clone();
     let _ = app.run_on_main_thread(move || {
-        let attention = tray::attention(&entries);
+        let light = tray::light(&entries);
         if let Ok(menu) = build_menu(&app2, &entries) {
             let _ = tray.set_menu(Some(menu));
         }
-        if let Some(icon) = tray::icon(attention) {
+        if let Some(icon) = tray::icon(light) {
             let _ = tray.set_icon(Some(icon));
-            let _ = tray.set_icon_as_template(!attention);
+            let _ = tray.set_icon_as_template(tray::is_template(light));
         }
     });
 }
@@ -433,7 +433,7 @@ fn main() {
                         }
                     }
                 });
-            if let Some(icon) = tray::icon(false) {
+            if let Some(icon) = tray::icon(tray::Light::Idle) {
                 tray = tray.icon(icon).icon_as_template(true);
             }
             watch_sessions(handle, tray.build(app)?, port);

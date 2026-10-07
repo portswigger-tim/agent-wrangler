@@ -175,7 +175,8 @@ tmux renders Unicode correctly, and auto-installs after a dependency change.
 On macOS you can open the board in its own window instead of a browser tab. A thin Tauri shell
 starts the server if it isn't already running (cloning PortSwigger/agent-wrangler first if it has no
 checkout to run it from) and loads the board. A menu-bar hat lists your live sessions
-(pick one to open it) and turns red when one needs you. Closing the window hides it; the server
+(pick one to open it) and takes the board's status colours: red when one needs you, green while one
+is working, and the usual monochrome tint when all are idle. Closing the window hides it; the server
 keeps running, and the menu-bar item brings the window back. Build and install it with `scripts/install-desktop.sh`, and remove everything again
 with `scripts/uninstall.sh`. See [desktop/README.md](desktop/README.md) for details and requirements
 (Rust and the Tauri CLI).
