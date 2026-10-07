@@ -11,3 +11,5 @@ cd desktop && cargo tauri dev     # run without bundling
 ```
 
 The repo path is baked in at build time; set `AW_REPO` to override. Server output from app-started launches goes to `~/Library/Logs/wrangler/wrangler-desktop.log`.
+
+Remove it again with `scripts/uninstall.sh` (see `--help`; `--dry-run` previews).

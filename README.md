@@ -167,8 +167,16 @@ systemctl --user daemon-reload
 systemctl --user enable --now agent-wrangler.service
 ```
 
-Both paths invoke `scripts/wrangler-start.sh`, which resolves Node via nvm, pins a UTF-8 locale so
+Both paths invoke `scripts/wrangler-start.sh`, which resolves Node via nvm (the repo's `.nvmrc`, falling back to your nvm default), pins a UTF-8 locale so
 tmux renders Unicode correctly, and auto-installs after a dependency change.
+
+### Desktop app (experimental)
+
+On macOS you can open the board in its own window instead of a browser tab. A thin Tauri shell
+starts the server if it isn't already running and loads the board; the server keeps running when you
+close the window. Build and install it with `scripts/install-desktop.sh`, and remove everything again
+with `scripts/uninstall.sh`. See [desktop/README.md](desktop/README.md) for details and requirements
+(Rust and the Tauri CLI).
 
 ## Snags
 
