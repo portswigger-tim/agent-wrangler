@@ -8,3 +8,14 @@
   pre { white-space: pre-wrap; color: #f85149; }
 </style>
 <body><div id="msg">Starting Agent Wrangler…</div></body>
+<script>
+  // main.rs sends failures here as #error=<message> when the window is on the board.
+  var m = /^#error=(.*)$/.exec(location.hash);
+  if (m) {
+    var pre = document.createElement('pre');
+    pre.textContent = decodeURIComponent(m[1]);
+    var box = document.getElementById('msg');
+    box.textContent = '';
+    box.appendChild(pre);
+  }
+</script>

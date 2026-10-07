@@ -1,6 +1,6 @@
 # Agent Wrangler desktop
 
-A thin Tauri window onto the local Wrangler server. On launch it checks `127.0.0.1:$AW_PORT` (default 7878); if nothing is listening it kickstarts the launchd service (`net.portswigger.agent-wrangler`), falling back to `scripts/wrangler-start.sh`, then loads the board. Closing the window leaves the server running.
+A thin Tauri window onto the local Wrangler server. On launch it checks `127.0.0.1:$AW_PORT` (default 7878); if nothing is listening it kickstarts the launchd service (`net.portswigger.agent-wrangler`), falling back to `scripts/wrangler-start.sh`, then loads the board. Closing the window leaves the server running. A server the app started itself (the fallback) is supervised while the app is open: the board's Restart button and self-update restarts respawn it, backing off between attempts and giving up (with the last log lines shown in the window) if it keeps crashing. Quitting the app stops the supervision, not the server.
 
 Requires Rust and `cargo install tauri-cli --version "^2" --locked`.
 

@@ -4,13 +4,22 @@
 // window at it. If there is no checkout to run it from, it clones one (see
 // `resolve_repo`). The server is deliberately left running when the window closes —
 // sessions live in tmux and the board keeps watching them.
+//
+// A server the app starts itself is supervised: the board's Restart button (and a
+// self-update restart) make the server exit expecting a supervisor to bring it
+// back, so the app respawns it (see `supervise`). The supervisor lives and dies
+// with the app; quitting leaves the server running.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod supervise;
 
 use std::fs::OpenOptions;
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tauri::{WebviewUrl, WebviewWindow, WebviewWindowBuilder};
@@ -139,7 +148,7 @@ fn kickstart_service() -> bool {
         .unwrap_or(false)
 }
 
-fn spawn_server(repo: &std::path::Path) -> std::io::Result<()> {
+fn spawn_server(repo: &std::path::Path) -> std::io::Result<Child> {
     let mut cmd = Command::new("bash");
     cmd.arg(repo.join("scripts/wrangler-start.sh"))
         .current_dir(repo)
@@ -154,10 +163,10 @@ fn spawn_server(repo: &std::path::Path) -> std::io::Result<()> {
         }
     }
     // Own process group so the server outlives this app.
-    cmd.process_group(0).spawn().map(|_| ())
+    cmd.process_group(0).spawn()
 }
 
-fn ensure_server(win: &WebviewWindow, port: u16) -> Result<(), String> {
+fn ensure_server(win: &WebviewWindow, port: u16, gave_up: &Arc<AtomicBool>) -> Result<(), String> {
     if server_up(port) {
         return Ok(());
     }
@@ -183,12 +192,17 @@ fn ensure_server(win: &WebviewWindow, port: u16) -> Result<(), String> {
         "Starting Agent Wrangler…"
     });
     if !kickstart_service() {
-        spawn_server(&repo).map_err(|e| format!("Couldn't start the Wrangler server: {e}"))?;
+        let child = spawn_server(&repo).map_err(|e| format!("Couldn't start the Wrangler server: {e}"))?;
+        // launchd supervises the service itself; only a server we spawned needs us.
+        supervise_server(win.clone(), repo.clone(), child, port, Arc::clone(gave_up));
     }
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if server_up(port) {
             return Ok(());
+        }
+        if gave_up.load(Ordering::SeqCst) {
+            return Err(String::new()); // the supervisor has already shown why
         }
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -196,6 +210,76 @@ fn ensure_server(win: &WebviewWindow, port: u16) -> Result<(), String> {
         "The Wrangler server didn't come up on port {port} within {}s.\nSee ~/Library/Logs/wrangler/.",
         timeout.as_secs()
     ))
+}
+
+fn log_path() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Logs/wrangler/wrangler-desktop.log"))
+}
+
+fn tail_log(lines: usize) -> String {
+    let text = log_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    let all: Vec<&str> = text.lines().collect();
+    all[all.len().saturating_sub(lines)..].join("\n")
+}
+
+// Percent-encode for a URL fragment.
+fn encode_fragment(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+// Back to the local page with an error to show. The window may be sitting on the
+// board, where there is no page of ours to eval into, so the message travels in
+// the URL fragment and ui/index.html renders it.
+fn show_failure(win: &WebviewWindow, msg: &str) {
+    if let Ok(url) = format!("tauri://localhost/index.html#error={}", encode_fragment(msg)).parse() {
+        let _ = win.navigate(url);
+    }
+}
+
+// Keeps a server the app spawned running: waits on it and respawns it when it
+// exits, backing off and eventually giving up if it can't stay up.
+fn supervise_server(win: WebviewWindow, repo: PathBuf, mut child: Child, port: u16, gave_up: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let mut history = supervise::History::default();
+        loop {
+            let started = Instant::now();
+            let status = child.wait();
+            // Something else is serving the port now (e.g. started by hand), so
+            // there is nothing for us to keep alive.
+            if server_up(port) {
+                return;
+            }
+            let ran_for = started.elapsed();
+            let why = status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
+            match history.on_exit(Instant::now(), ran_for) {
+                supervise::Decision::Respawn(delay) => {
+                    eprintln!("[agent-wrangler-desktop] server exited ({why}) after {ran_for:?}; respawning in {delay:?}");
+                    std::thread::sleep(delay);
+                    match spawn_server(&repo) {
+                        Ok(c) => child = c,
+                        Err(e) => {
+                            gave_up.store(true, Ordering::SeqCst);
+                            show_failure(&win, &format!("Couldn't restart the Wrangler server: {e}"));
+                            return;
+                        }
+                    }
+                }
+                supervise::Decision::GiveUp => {
+                    gave_up.store(true, Ordering::SeqCst);
+                    show_failure(&win, &format!(
+                        "The Wrangler server keeps exiting ({why}), so I've stopped restarting it.\n\nLast log lines:\n{}",
+                        tail_log(15)
+                    ));
+                    return;
+                }
+            }
+        }
+    });
 }
 
 fn show_status(win: &WebviewWindow, msg: &str) {
@@ -257,12 +341,14 @@ fn main() {
                 .build()?;
 
             let origin = origin.clone();
-            std::thread::spawn(move || match ensure_server(&win, port) {
+            let gave_up = Arc::new(AtomicBool::new(false));
+            std::thread::spawn(move || match ensure_server(&win, port, &gave_up) {
                 Ok(()) => {
                     if let Ok(url) = origin.parse() {
                         let _ = win.navigate(url);
                     }
                 }
+                Err(msg) if msg.is_empty() => {}
                 Err(msg) => show_error(&win, &msg),
             });
             Ok(())
