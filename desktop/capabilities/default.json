@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The window only loads the local loading page and the Wrangler server; it needs no IPC.",
+  "windows": ["main"],
+  "permissions": []
+}
