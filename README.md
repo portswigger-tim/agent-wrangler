@@ -173,10 +173,21 @@ tmux renders Unicode correctly, and auto-installs after a dependency change.
 ### Desktop app (experimental)
 
 On macOS you can open the board in its own window instead of a browser tab. A thin Tauri shell
-starts the server if it isn't already running and loads the board; the server keeps running when you
+starts the server if it isn't already running (cloning PortSwigger/agent-wrangler first if it has no
+checkout to run it from) and loads the board; the server keeps running when you
 close the window. Build and install it with `scripts/install-desktop.sh`, and remove everything again
 with `scripts/uninstall.sh`. See [desktop/README.md](desktop/README.md) for details and requirements
 (Rust and the Tauri CLI).
+
+These variables are read by the desktop app and its scripts, not by the server:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `AW_REPO` | the checkout it was built from, else a managed clone | Checkout to run the server from |
+| `AW_REPO_URL` | `https://github.com/PortSwigger/agent-wrangler.git` | Repo the managed clone is made from |
+| `AW_BRANCH` | `main` | Branch the managed clone checks out (only when the clone is made; board self-update only works on `main`) |
+| `AW_PORT` | `7878` | Port the app checks and loads (same variable the server uses) |
+| `AW_APP_DIR` | `~/Applications` | Where `scripts/install-desktop.sh` installs the app |
 
 ## Snags
 

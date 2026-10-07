@@ -10,6 +10,14 @@ scripts/install-desktop.sh        # build, then copy to ~/Applications (AW_APP_D
 cd desktop && cargo tauri dev     # run without bundling
 ```
 
-The repo path is baked in at build time; set `AW_REPO` to override. Server output from app-started launches goes to `~/Library/Logs/wrangler/wrangler-desktop.log`.
+Where the server runs from, in order:
+
+1. `AW_REPO` — a checkout you point it at.
+2. The checkout the app was built from, if it still exists.
+3. A managed clone, made on first launch: `git clone` of `AW_REPO_URL` (default `https://github.com/PortSwigger/agent-wrangler.git`) at `AW_BRANCH` (default `main`) into `~/Library/Application Support/Agent Wrangler/checkout` (`$XDG_DATA_HOME/agent-wrangler/checkout` on Linux). The first start then installs dependencies, which can take a few minutes. `AW_BRANCH` only applies when the clone is made. Board self-update only works on `main`, so a clone of any other branch won't self-update.
+
+It needs `git` for the clone and `tmux` for the server; the window says so if either is missing. Env vars must be visible to the app, so for a Finder/Dock launch use `launchctl setenv`, or run the binary from a shell.
+
+ Server output from app-started launches goes to `~/Library/Logs/wrangler/wrangler-desktop.log`.
 
 Remove it again with `scripts/uninstall.sh` (see `--help`; `--dry-run` previews).
