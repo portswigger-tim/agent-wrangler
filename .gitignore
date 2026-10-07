@@ -26,3 +26,9 @@ docs/*
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Desktop app build output (Tauri/Rust) and bundles
+desktop/target/
+desktop/gen/
+*.app/
+*.dmg
