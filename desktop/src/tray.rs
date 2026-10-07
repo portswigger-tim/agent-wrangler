@@ -1,8 +1,9 @@
 // Menu-bar indicator. Pure helpers (what the server's graph means for the tray, and
 // the tray's icons) live here so they can be tested; main.rs owns the wiring.
 //
-// Simplicity without urgency: one glyph (the app's hat). Quiet is the system's own
-// monochrome tint; when any session needs you the hat turns red. No counts, no sounds.
+// Simplicity without urgency: one glyph (the app's hat) in the board's status colours:
+// red when any session needs you, green while one is working, grey otherwise. No counts,
+// no sounds.
 use serde_json::Value;
 use tauri::image::Image;
 
@@ -14,6 +15,7 @@ pub struct Entry {
     pub id: String,
     pub label: String,
     pub needs_you: bool,
+    pub working: bool,
 }
 
 // Live sessions from a `{type:'graph'}` payload's `graph`, needs-you first. Dormant
@@ -28,7 +30,8 @@ pub fn entries(graph: &Value) -> Vec<Entry> {
         .filter_map(|s| {
             let id = s["sessionId"].as_str()?.to_string();
             let label = s["label"].as_str().filter(|l| !l.trim().is_empty()).unwrap_or(&id).to_string();
-            Some(Entry { id, label, needs_you: s["status"].as_str() == Some("needs-you") })
+            let status = s["status"].as_str();
+            Some(Entry { id, label, needs_you: status == Some("needs-you"), working: status == Some("working") })
         })
         .collect();
     all.sort_by_key(|e| !e.needs_you); // stable: server order within each group
@@ -36,13 +39,30 @@ pub fn entries(graph: &Value) -> Vec<Entry> {
     all
 }
 
-pub fn attention(entries: &[Entry]) -> bool {
-    entries.iter().any(|e| e.needs_you)
+// The tray's colour: the most urgent status among live sessions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Light {
+    NeedsYou,
+    Working,
+    Idle,
+}
+
+pub fn light(entries: &[Entry]) -> Light {
+    if entries.iter().any(|e| e.needs_you) {
+        Light::NeedsYou
+    } else if entries.iter().any(|e| e.working) {
+        Light::Working
+    } else {
+        Light::Idle
+    }
 }
 
 const ICON_PNG: &[u8] = include_bytes!("../icons/icon.png");
 const TRAY_WIDTH: usize = 48;
-const RED: [u8; 3] = [235, 64, 52];
+// The board's --red / --green (dark theme) and a grey that reads on light and dark bars.
+const RED: [u8; 3] = [248, 81, 73];
+const GREEN: [u8; 3] = [63, 185, 80];
+const GREY: [u8; 3] = [139, 148, 158];
 
 // The hat's silhouette from the app icon (blue on near-black), cropped to its bounds
 // and box-downsampled to a menu-bar size. Returns coverage 0..=255 per pixel.
@@ -89,11 +109,14 @@ fn hat_mask() -> Option<(Vec<u8>, usize, usize)> {
     Some((out, ow, oh))
 }
 
-// Quiet: black, drawn as a macOS template image so the system tints it for the bar.
-// Attention: red, drawn as-is (red reads on both light and dark bars).
-pub fn icon(attention: bool) -> Option<Image<'static>> {
+// Drawn in colour, never as a template image, so the system leaves the tint alone.
+pub fn icon(light: Light) -> Option<Image<'static>> {
     let (mask, w, h) = hat_mask()?;
-    let rgb = if attention { RED } else { [0, 0, 0] };
+    let rgb = match light {
+        Light::NeedsYou => RED,
+        Light::Working => GREEN,
+        Light::Idle => GREY,
+    };
     let rgba = mask.iter().flat_map(|a| [rgb[0], rgb[1], rgb[2], *a]).collect();
     Some(Image::new_owned(rgba, w as u32, h as u32))
 }
@@ -113,13 +136,28 @@ mod tests {
         ]});
         let e = entries(&g);
         assert_eq!(e.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["b", "a", "c"]);
-        assert!(attention(&e));
+        assert_eq!(light(&e), Light::NeedsYou);
     }
 
     #[test]
-    fn dormant_needs_you_does_not_raise_attention() {
-        let g = json!({"sessions": [{"sessionId": "a", "status": "needs-you", "managed": false}]});
-        assert!(!attention(&entries(&g)));
+    fn working_is_green_and_otherwise_idle() {
+        let g = json!({"sessions": [
+            {"sessionId": "a", "status": "idle", "managed": true},
+            {"sessionId": "b", "status": "working", "managed": true},
+        ]});
+        assert_eq!(light(&entries(&g)), Light::Working);
+        let g = json!({"sessions": [{"sessionId": "a", "status": "idle", "managed": true}]});
+        assert_eq!(light(&entries(&g)), Light::Idle);
+        assert_eq!(light(&[]), Light::Idle);
+    }
+
+    #[test]
+    fn dormant_sessions_do_not_colour_the_tray() {
+        let g = json!({"sessions": [
+            {"sessionId": "a", "status": "needs-you", "managed": false},
+            {"sessionId": "b", "status": "working", "managed": false},
+        ]});
+        assert_eq!(light(&entries(&g)), Light::Idle);
     }
 
     #[test]
@@ -139,13 +177,13 @@ mod tests {
 
     #[test]
     fn icons_render_with_a_visible_hat() {
-        for attention in [false, true] {
-            let img = icon(attention).expect("icon");
+        for (l, rgb) in [(Light::NeedsYou, RED), (Light::Working, GREEN), (Light::Idle, GREY)] {
+            let img = icon(l).expect("icon");
             let alpha: Vec<u8> = img.rgba().chunks(4).map(|p| p[3]).collect();
             assert!(alpha.iter().any(|a| *a > 200), "solid pixels");
             assert!(alpha.iter().any(|a| *a == 0), "transparent surround");
             let solid = img.rgba().chunks(4).find(|p| p[3] > 200).unwrap();
-            assert_eq!(solid[0..3] == RED, attention);
+            assert_eq!(solid[0..3], rgb);
         }
     }
 }
