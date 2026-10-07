@@ -2,8 +2,8 @@
 // the tray's icons) live here so they can be tested; main.rs owns the wiring.
 //
 // Simplicity without urgency: one glyph (the app's hat) in the board's status colours:
-// red when any session needs you, green while one is working, grey otherwise. No counts,
-// no sounds.
+// red when any session needs you, green while one is working. Idle it is the system's own
+// monochrome tint, like the other menu-bar icons. No counts, no sounds.
 use serde_json::Value;
 use tauri::image::Image;
 
@@ -59,10 +59,9 @@ pub fn light(entries: &[Entry]) -> Light {
 
 const ICON_PNG: &[u8] = include_bytes!("../icons/icon.png");
 const TRAY_WIDTH: usize = 48;
-// The board's --red / --green (dark theme) and a grey that reads on light and dark bars.
+// The board's --red / --green (dark theme).
 const RED: [u8; 3] = [248, 81, 73];
 const GREEN: [u8; 3] = [63, 185, 80];
-const GREY: [u8; 3] = [139, 148, 158];
 
 // The hat's silhouette from the app icon (blue on near-black), cropped to its bounds
 // and box-downsampled to a menu-bar size. Returns coverage 0..=255 per pixel.
@@ -109,13 +108,18 @@ fn hat_mask() -> Option<(Vec<u8>, usize, usize)> {
     Some((out, ow, oh))
 }
 
-// Drawn in colour, never as a template image, so the system leaves the tint alone.
+// Idle: black, drawn as a macOS template image (see `is_template`) so the system tints it
+// for the bar. Otherwise drawn as-is in the status colour.
+pub fn is_template(light: Light) -> bool {
+    light == Light::Idle
+}
+
 pub fn icon(light: Light) -> Option<Image<'static>> {
     let (mask, w, h) = hat_mask()?;
     let rgb = match light {
         Light::NeedsYou => RED,
         Light::Working => GREEN,
-        Light::Idle => GREY,
+        Light::Idle => [0, 0, 0],
     };
     let rgba = mask.iter().flat_map(|a| [rgb[0], rgb[1], rgb[2], *a]).collect();
     Some(Image::new_owned(rgba, w as u32, h as u32))
@@ -177,7 +181,7 @@ mod tests {
 
     #[test]
     fn icons_render_with_a_visible_hat() {
-        for (l, rgb) in [(Light::NeedsYou, RED), (Light::Working, GREEN), (Light::Idle, GREY)] {
+        for (l, rgb) in [(Light::NeedsYou, RED), (Light::Working, GREEN), (Light::Idle, [0, 0, 0])] {
             let img = icon(l).expect("icon");
             let alpha: Vec<u8> = img.rgba().chunks(4).map(|p| p[3]).collect();
             assert!(alpha.iter().any(|a| *a > 200), "solid pixels");

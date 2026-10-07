@@ -356,7 +356,7 @@ fn build_menu(app: &AppHandle, entries: &[tray::Entry]) -> tauri::Result<Menu<ta
 }
 
 // Reflects the server's session list in the tray. `None` entries = server not
-// reachable: grey icon, bare menu.
+// reachable: idle icon, bare menu.
 fn update_tray(app: &AppHandle, tray: &TrayIcon, entries: Vec<tray::Entry>) {
     let app2 = app.clone();
     let tray = tray.clone();
@@ -367,6 +367,7 @@ fn update_tray(app: &AppHandle, tray: &TrayIcon, entries: Vec<tray::Entry>) {
         }
         if let Some(icon) = tray::icon(light) {
             let _ = tray.set_icon(Some(icon));
+            let _ = tray.set_icon_as_template(tray::is_template(light));
         }
     });
 }
@@ -433,7 +434,7 @@ fn main() {
                     }
                 });
             if let Some(icon) = tray::icon(tray::Light::Idle) {
-                tray = tray.icon(icon);
+                tray = tray.icon(icon).icon_as_template(true);
             }
             watch_sessions(handle, tray.build(app)?, port);
             let win = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
