@@ -21,6 +21,7 @@ docs/*
 .claude/skills/*
 !.claude/skills/maintain-product-docs/
 !.claude/skills/maintain-product-docs/SKILL.md
+!.claude/skills/evaluate-model/
 
 # Beads / Dolt files (added by bd init)
 .dolt/
@@ -28,4 +29,8 @@ docs/*
 .beads-credential-key
 .beads/proxieddb/
 
-!.claude/skills/evaluate-model/
+# Desktop app build output (Tauri/Rust) and bundles
+desktop/target/
+desktop/gen/
+*.app/
+*.dmg

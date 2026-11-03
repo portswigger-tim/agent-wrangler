@@ -220,12 +220,31 @@ systemctl --user daemon-reload
 systemctl --user enable --now agent-wrangler.service
 ```
 
-Both paths invoke `scripts/wrangler-start.sh`, which resolves Node via nvm, rolls back an update
-from the board that failed to start, and auto-installs after a dependency change, then runs
-`bin/agent-wrangler`. Because it does those steps, it's the start path that lets the board apply
-updates. The launcher checks the effective character
-locale and, when none is configured, selects an installed UTF-8 `LC_CTYPE` for tmux Unicode
+Both paths invoke `scripts/wrangler-start.sh`, which resolves Node via nvm (the repo's `.nvmrc`,
+falling back to your nvm default), pins a UTF-8 locale so tmux renders Unicode correctly, and auto-installs
+after a dependency change.
 (see the locale guidance above).
+
+### Desktop app (experimental)
+
+On macOS you can open the board in its own window instead of a browser tab. A thin Tauri shell
+starts the server if it isn't already running (cloning PortSwigger/agent-wrangler first if it has no
+checkout to run it from) and loads the board. A menu-bar hat lists your live sessions
+(pick one to open it) and takes the board's status colours: red when one needs you, green while one
+is working, and the usual monochrome tint when all are idle. Closing the window hides it; the server
+keeps running, and the menu-bar item brings the window back. Build and install it with `scripts/install-desktop.sh`, and remove everything again
+with `scripts/uninstall.sh`. See [desktop/README.md](desktop/README.md) for details and requirements
+(Rust and the Tauri CLI).
+
+These variables are read by the desktop app and its scripts, not by the server:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `AW_REPO` | the checkout it was built from, else a managed clone | Checkout to run the server from |
+| `AW_REPO_URL` | `https://github.com/PortSwigger/agent-wrangler.git` | Repo the managed clone is made from |
+| `AW_BRANCH` | `main` | Branch the managed clone checks out (only when the clone is made; board self-update only works on `main`) |
+| `AW_PORT` | `7878` | Port the app checks and loads (same variable the server uses) |
+| `AW_APP_DIR` | `~/Applications` | Where `scripts/install-desktop.sh` installs the app |
 
 ## Snags
 
