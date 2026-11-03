@@ -1,3 +1,5 @@
+import { readLaunchStatus } from '../../runtimes/launch-status.js';
+
 // Read-only board snapshot, caller-aware. Reads the already-maintained graph
 // (no rescan) and resolves each session's current task via taskStore. `caller`
 // is the requesting session's card id (or null when the request carried no
@@ -19,12 +21,17 @@ export const listSessionsTool = {
     + '(often intent-derived, so a session and one it spawned can share the same displayed label; '
     + 'see the `session-hierarchy` skill), so when presenting more than one row pair the label '
     + 'with a short id, e.g. `(<first 8 chars>, "<label>")`, rather than the label alone. '
-    + 'Read-only.',
+    + 'To point the user at a session, write a markdown link to its `link` field in your reply, '
+    + 'e.g. `[label](#session=<id>)`: clicking it selects that session on the board. Use that '
+    + 'bare fragment, never a host:port URL. '
+    + 'A session on a runtime whose launch can fail after it was created (e.g. `cloud`) also '
+    + 'carries `launch` (`state`: ok, failed with `error`, pending or unknown). Read-only.',
   inputSchema: {},
   async handler({ deps, caller }) {
-    const sessions = (deps.graph()?.sessions ?? []).map((s) => ({
+    const rows = (deps.graph()?.sessions ?? []).map((s) => ({
       sessionId: s.sessionId,
       label: s.label ?? null,
+      link: `#session=${s.sessionId}`,
       agent: s.agent ?? null,
       status: s.status ?? null,
       managed: Boolean(s.managed),
@@ -34,6 +41,11 @@ export const listSessionsTool = {
       spawnedBy: s.spawnedBy ?? null,
       autoCompactTokens: s.autoCompactTokens ?? null,
       isCaller: caller != null && s.sessionId === caller,
+    }));
+    // Only on rows whose runtime answers, so every other row keeps its shape.
+    const sessions = await Promise.all(rows.map(async (row) => {
+      const launch = await readLaunchStatus(deps.sessionManager?.entryFor?.(row.sessionId));
+      return launch ? { ...row, launch } : row;
     }));
     const callerRow = sessions.find((s) => s.isCaller);
     const callerBlock = caller == null

@@ -24,6 +24,33 @@ function localMarkdownHref(href, baseDir) {
   return resolveTerminalPath(decoded, baseDir);
 }
 
+const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+// Agents often guess 127.0.0.1 for the board's own localhost address, so two
+// loopback hosts on the same protocol and port count as the same board.
+function sameBoard(u, origin) {
+  if (u.origin === origin) return true;
+  let b;
+  try { b = new URL(origin); } catch { return false; }
+  return LOOPBACK.has(u.hostname) && LOOPBACK.has(b.hostname)
+    && u.protocol === b.protocol && u.port === b.port;
+}
+
+// A link to a board session, `#session=<id>`, as the bare fragment that the app's
+// hashchange handler selects in place. An absolute URL counts only when it is on
+// the board's own origin; anything else is an ordinary external link.
+export function sessionHashHref(href, origin = null) {
+  const h = String(href || '');
+  if (/^#session=[^&]+$/.test(h)) return h;
+  if (!origin) return null;
+  let u;
+  // markdown-it percent-encodes an IPv6 host's brackets; put them back to parse it.
+  const authority = (m) => m.replace(/%5B/gi, '[').replace(/%5D/gi, ']');
+  try { u = new URL(h.replace(/^https?:\/\/[^/?#]*/i, authority)); } catch { return null; }
+  if (!sameBoard(u, origin) || !/^#session=[^&]+$/.test(u.hash)) return null;
+  return u.hash;
+}
+
 // Renderer rules run over a flat token array, so "am I inside a link?" is answered
 // by counting the unclosed link_open tokens before this one. Without it, a path in
 // a link's own label would nest a <button> inside an <a> — invalid, and the inner
@@ -41,13 +68,13 @@ function insideLink(tokens, idx) {
 // hand over one renderer that follows whichever session is on screen). Omit it and
 // nothing changes: the memory preview pane renders exactly as it always has, with
 // no path linkification and no preview buttons.
-export function createRenderer(markdownit, { mdPathBase = null } = {}) {
+export function createRenderer(markdownit, { mdPathBase = null, boardOrigin = null } = {}) {
   const md = markdownit({ html: false, linkify: true, typographer: false, breaks: false });
   const esc = md.utils.escapeHtml;
   const baseOf = () => (typeof mdPathBase === 'function' ? mdPathBase() : mdPathBase) || null;
 
-  // External http(s) links open in a new tab; rel guards the opener from
-  // tabnabbing. A link to a local .md file becomes a preview control instead (see
+  // External http(s) and protocol-relative (`//host`) links open in a new tab; rel
+  // guards the opener from tabnabbing. A link to a local .md file becomes a preview control instead (see
   // localMarkdownHref). Relative / in-repo links to anything else (e.g.
   // `src/token.js`) and any other scheme are left to the default rule untouched —
   // they stay same-tab and markdown-it has already dropped unsafe schemes by this
@@ -57,7 +84,12 @@ export function createRenderer(markdownit, { mdPathBase = null } = {}) {
   md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
     const token = tokens[idx];
     const href = token.attrGet('href') || '';
-    if (/^https?:\/\//i.test(href)) {
+    const sessionHash = sessionHashHref(href, boardOrigin);
+    if (sessionHash) {
+      token.attrSet('href', sessionHash);
+      return defaultLinkOpen(tokens, idx, options, env, self);
+    }
+    if (/^(?:https?:)?\/\//i.test(href)) {
       token.attrSet('target', '_blank');
       token.attrSet('rel', 'noopener noreferrer');
       return defaultLinkOpen(tokens, idx, options, env, self);
@@ -78,6 +110,20 @@ export function createRenderer(markdownit, { mdPathBase = null } = {}) {
       token.attrSet('title', mdPath);
     }
     return defaultLinkOpen(tokens, idx, options, env, self);
+  };
+
+  // An <img> is fetched the moment the page renders, with no click, so an image URL
+  // an agent wrote (or was steered into writing by something it read) could carry
+  // data off the machine. Show it as a link to the image instead. An inline `data:`
+  // image loads nothing (validateLink only lets raster types through) and is kept.
+  const defaultImage = md.renderer.rules.image;
+  md.renderer.rules.image = (tokens, idx, options, env, self) => {
+    const token = tokens[idx];
+    const src = token.attrGet('src') || '';
+    if (/^data:/i.test(src)) return defaultImage(tokens, idx, options, env, self);
+    const label = esc(self.renderInlineAsText(token.children || [], options, env) || src);
+    if (insideLink(tokens, idx)) return label;
+    return `<a href="${esc(src)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
   };
 
   // Bare paths in prose and in inline code. Inline code is the common case, not an

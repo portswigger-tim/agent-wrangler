@@ -25,12 +25,85 @@ test('HOST_API_VERSION is a real semver version', () => {
 // 1.18.0 the `links.normalise` hook and the `link.chip` slot,
 // 1.19.0 the `runtimes` manifest key, `links:write` and the `worktree` dispatch field,
 // 1.20.0 the `dispatch.field` `open(el, ctx)` hook,
-// and 1.21.0 per-item `pattern`/`maxLength` on a `list` setting,
+// 1.21.0 per-item `pattern`/`maxLength` on a `list` setting,
+// 1.22.0 the runtime `launchStatus` hook,
+// 1.23.0 `tasks:archive` and the client `api.ui.notify`,
+// 1.24.0 the client `api.openTask`,
+// 1.25.0 the client `api.agents`,
+// 1.26.0 the manifest `keybindings` and client `api.keys.bind`,
+// 1.27.0 the client `api.openDiff`,
+// 1.28.0 node `effort`, `api.dispatch.submit` and the `quickLaunch` field,
+// 1.29.0 the runtime `cost` hook and fork `parentId` on `wrapLaunch`,
+// 1.30.0 the runtime `validateModel` hook,
+// 1.31.0 `images:keep`, `spawn({ images })` and the client `api.images.stage`,
+// 1.32.0 the `session.prepare` hook,
+// 1.33.0 `runtime` on `api.dispatch.submit` and runtime `ownsModel`,
+// 1.34.0 the runtime `liveByTmux` flag,
+// 1.35.0 `notification.cue`, `api.onConnect` and handler `reply`,
+// 1.36.0 `cwd` and `images` on the client `api.openDispatch`,
+// 1.37.0 the runtime `agents` list,
+// 1.38.0 `files:view`, the client `api.openFile` and `api.files`,
+// and 1.39.0 `earlyAdopter`, the client `api.earlyAdopter` and `api.onThemeChange`,
+// and 1.40.0 the `file.open` slot and `files:open`,
+// and 1.41.0 `offBoard` on `sessions.spawn`,
+// and 1.42.0 the client `api.mountSession`,
+// and 1.43.0 the manifest `themes`,
+// and 1.44.0 the client `api.themeButtonHtml`,
+// and 1.45.0 `view: 'diff'` on `api.mountSession`,
+// and 1.46.0 `theme` on a toggle setting def,
+// and 1.47.0 prepare context, launch refusal/fork parent, runtime ownLaunch and dispatch validation,
+// and 1.48.0 spawn extension data, hosted dispatch fields and headless launch environments,
+// and 1.49.0 `autoEffort` on the client `api.agents()` models,
+// and 1.50.0 dialog presentation, title and key on terminals.create, and terminals.alive,
+// and 1.51.0 launch-context `refuseIfSet` and login config trust,
+// and 1.52.0 the client `session.inputGate` slot and `api.refreshInputGates`,
+// and 1.53.0 board.tray ownership and atomic client setMinimisedTasks,
+// and 1.54.0 launch-context `codexConfig`,
+// and 1.55.0 `remoteControl` on sessions.spawn,
+// and 1.56.0 the client modelFront data and maths,
 // and a manifest declaring any of those
 // ranges is saying it needs that surface to exist. An additive change bumps the
 // minor and keeps every ^1.0.0 manifest served by the same builders.
-test('the served version is 1.21.0, and every 1.x manifest range it can honour passes', () => {
-  assert.equal(HOST_API_VERSION, '1.21.0');
+test('the served version is 1.57.0, and every 1.x manifest range it can honour passes', () => {
+  assert.equal(HOST_API_VERSION, '1.57.0');
+  assert.equal(servesRange('^1.47.0'), true);
+  assert.equal(servesRange('^1.48.0'), true);
+  assert.equal(servesRange('^1.49.0'), true);
+  assert.equal(servesRange('^1.50.0'), true);
+  assert.equal(servesRange('^1.51.0'), true);
+  assert.equal(servesRange('^1.52.0'), true);
+  assert.equal(servesRange('^1.53.0'), true);
+  assert.equal(servesRange('^1.54.0'), true);
+  assert.equal(servesRange('^1.55.0'), true);
+  assert.equal(servesRange('^1.56.0'), true);
+  assert.equal(servesRange('^1.57.0'), true);
+  assert.equal(servesRange('^1.58.0'), false);
+  assert.equal(servesRange('^1.46.0'), true);
+  assert.equal(servesRange('^1.45.0'), true);
+  assert.equal(servesRange('^1.44.0'), true);
+  assert.equal(servesRange('^1.43.0'), true);
+  assert.equal(servesRange('^1.42.0'), true);
+  assert.equal(servesRange('^1.41.0'), true);
+  assert.equal(servesRange('^1.40.0'), true);
+  assert.equal(servesRange('^1.39.0'), true);
+  assert.equal(servesRange('^1.38.0'), true);
+  assert.equal(servesRange('^1.37.0'), true);
+  assert.equal(servesRange('^1.36.0'), true);
+  assert.equal(servesRange('^1.35.0'), true);
+  assert.equal(servesRange('^1.34.0'), true);
+  assert.equal(servesRange('^1.33.0'), true);
+  assert.equal(servesRange('^1.32.0'), true);
+  assert.equal(servesRange('^1.31.0'), true);
+  assert.equal(servesRange('^1.30.0'), true);
+  assert.equal(servesRange('^1.29.0'), true);
+  assert.equal(servesRange('^1.28.0'), true);
+  assert.equal(servesRange('^1.28.0'), true);
+  assert.equal(servesRange('^1.27.0'), true);
+  assert.equal(servesRange('^1.26.0'), true);
+  assert.equal(servesRange('^1.25.0'), true);
+  assert.equal(servesRange('^1.24.0'), true);
+  assert.equal(servesRange('^1.23.0'), true);
+  assert.equal(servesRange('^1.22.0'), true);
   assert.equal(servesRange('^1.21.0'), true);
   assert.equal(servesRange('^1.20.0'), true);
   assert.equal(servesRange('^1.19.0'), true);

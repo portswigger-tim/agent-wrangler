@@ -1,13 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { listSessionsTool } from './list-sessions.js';
+import { registerRuntime, unregisterRuntimesFor } from '../../runtimes/index.js';
 
 function deps() {
   return {
     graph: () => ({
       sessions: [
         {
-          sessionId: 'CARD1', label: 'Alpha', agent: 'claude', status: 'idle', cwd: '/a', managed: true,
+          sessionId: 'CARD1', label: 'Alpha', link: '#session=CARD1', agent: 'claude', status: 'idle', cwd: '/a', managed: true,
           parentSession: 'ORCH', spawnedBy: null, autoCompactTokens: 120000,
         },
         {
@@ -29,7 +30,7 @@ test('list_sessions maps the board and flags the caller', async () => {
   assert.equal(out.structuredContent.sessions.length, 2);
   const alpha = out.structuredContent.sessions.find((s) => s.sessionId === 'CARD1');
   assert.deepEqual(alpha, {
-    sessionId: 'CARD1', label: 'Alpha', agent: 'claude', status: 'idle', managed: true, cwd: '/a',
+    sessionId: 'CARD1', label: 'Alpha', link: '#session=CARD1', agent: 'claude', status: 'idle', managed: true, cwd: '/a',
     task: { id: 'T1', name: 'Login' }, parentSession: 'ORCH', spawnedBy: null, autoCompactTokens: 120000, isCaller: true,
   });
   const beta = out.structuredContent.sessions.find((s) => s.sessionId === 'CARD2');
@@ -51,4 +52,17 @@ test('list_sessions yields a null caller block when the request had no identity'
 test('list_sessions tolerates an empty/absent graph', async () => {
   const out = await listSessionsTool.handler({ deps: { graph: () => null, taskStore: { taskFor: () => null } }, caller: 'X' });
   assert.deepEqual(out.structuredContent.sessions, []);
+});
+
+test('list_sessions adds launch only to rows whose runtime answers', async () => {
+  registerRuntime({ id: 'toyrt', label: 'Toy', wrapLaunch: async ({ inner }) => inner, launchStatus: () => ({ state: 'failed', error: 'nope' }) }, 'toy');
+  try {
+    const d = { ...deps(), sessionManager: { entryFor: (sid) => (sid === 'CARD2' ? { runtime: 'toyrt' } : {}) } };
+    const out = await listSessionsTool.handler({ deps: d, caller: 'CARD1' });
+    const [alpha, beta] = ['CARD1', 'CARD2'].map((id) => out.structuredContent.sessions.find((s) => s.sessionId === id));
+    assert.equal('launch' in alpha, false);
+    assert.deepEqual(beta.launch, { state: 'failed', error: 'nope' });
+  } finally {
+    unregisterRuntimesFor('toy');
+  }
 });

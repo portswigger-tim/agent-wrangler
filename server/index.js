@@ -1,7 +1,10 @@
 #!/usr/bin/env node
+// First, before any other module runs: captures the install-scoped signals
+// (AW_SUPERVISED, AW_INSTALL_MANAGER, AW_GIT_UPDATES, ...) and removes them from
+// process.env, so no tmux server or child process started later inherits them.
+import { INSTALL_ENV } from './install-env.js';
 import os from 'node:os';
 import fs from 'node:fs';
-import crypto from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import openModule from 'open';
 
@@ -13,12 +16,12 @@ import { worktreeStatus } from './worktree.js';
 import { TaskStore } from './task-store.js';
 import { ScheduleStore } from './schedule-store.js';
 import { MailboxStore, UNREAD_TTL_MS } from './mailbox-store.js';
-import { primeExtensions, assertGraphKeys, extensionsForGraph, createSkillGate, createCodexPolicyResolver, createToolFilter, createTaskDeleteNotifier, quarantineExtension, registerExtension, unregisterExtension, hookPayloadFor } from './extensions/index.js';
+import { primeExtensions, assertGraphKeys, extensionsForGraph, createSkillGate, createCodexPolicyResolver, createToolFilter, createTaskDeleteNotifier, quarantineExtension, registerExtension, unregisterExtension, hookPayloadFor, themeSources } from './extensions/index.js';
 import { buildHostApi, buildExtSettings } from './host-api/index.js';
 import { HOST_API_VERSION } from './host-api/version.js';
 import { TOOLS } from './mcp/tools/index.js';
 import { CONTROL_HANDLERS } from './control/handlers/index.js';
-import { createMailSettleSweeper } from './mail-runner.js';
+import { createMailSettleSweeper, createDeferralTracker } from './mail-runner.js';
 import { runDispatch } from './dispatch-runner.js';
 import { runSessionAction } from './session-action-runner.js';
 import { deliverPrNudge } from './pr-nudge-runner.js';
@@ -30,19 +33,23 @@ import { setTmuxBin, sendText, sendKeys } from './tmux-scraper.js';
 import { createPaneDeferral } from './pane-deferral.js';
 import { fetchPrStatus, mergePr, fetchUnresolvedThreadCount } from './pr-status.js';
 import { normalisePr, linkMatches } from './mcp/links.js';
-import { shouldOpenBrowser, prStatusPollSeconds, autoAttachPrEnabled, subagentsExpandedByDefault, trustCodexLaunchCwd, childFullViewByDefault, autoFixPrChecksDefault, archiveReviewEnabled, chatViewDefault, defaultSessionCwd, readConfig, extensionSettings, applyRetiredFlagMigrations, autoUpdateMode, refreshSessionsAfterUpdate } from './config-store.js';
+import { shouldOpenBrowser, prStatusPollSeconds, autoAttachPrEnabled, subagentsExpandedByDefault, trustCodexLaunchCwd, trustClaudeLaunchCwd, childFullViewByDefault, autoFixPrChecksDefault, archiveReviewEnabled, mailWakesDormant, prModelFooterEnabled, chatViewDefault, defaultSessionCwd, defaultRuntime, readConfig, extensionSettings, applyRetiredFlagMigrations, autoUpdateMode, refreshSessionsAfterUpdate } from './config-store.js';
 import { listStyles } from './styles.js';
-import { availableAgents, modelsWithDefault, validateDefaultModel } from './agents/index.js';
+import { availableAgents, modelsWithDefault, validateDefaultModel, providerMetadata, registeredAgents } from './agents/index.js';
 import { createMcpRequestHandler, extractCaller } from './mcp/server.js';
+import { createPrModelHandler } from './pr-model-handler.js';
 import { createMessageThrottle } from './mcp/message-throttle.js';
 import { bindHost } from './runtime.js';
 import { isAllowedOrigin, isAllowedHost } from './origin-check.js';
 import { createHttpServer } from './http-handler.js';
 import { resolveMarkdownPath } from './file-preview.js';
+import { createExtFiles } from './ext-files.js';
 import { attachPtyChannel, ensurePtyHelperExecutable } from './pty-channel.js';
 import { TerminalRegistry } from './terminal-registry.js';
-import { createShellSession } from './shell-session.js';
+import { createShellSession, tmuxSessionAlive } from './shell-session.js';
+import { createExtTerminalOpener } from './ext-terminals.js';
 import { archiveCascade, descendantsOf } from './control/handlers/archive.js';
+import { archiveTaskCascade } from './control/handlers/tasks.js';
 import { createTargets } from './control/targets.js';
 import { routeControlMessage, invalidateHandlerMap } from './control/router.js';
 import { acquireInstanceLock, InstanceLockError } from './instance-lock.js';
@@ -54,21 +61,29 @@ import { startFdWatchdog } from './fd-watchdog.js';
 import { startHeapWatchdog } from './heap-watchdog.js';
 import { sendGuarded } from './ws-backpressure.js';
 import { createHistoryGate } from './history-gate.js';
+import { createGraphFrameGate } from './graph-frame-gate.js';
 import { runArchiveReview } from './archive-review-runner.js';
 import { createEventBus } from './events.js';
 import { collectLaunchContext } from './launch-context.js';
+import { collectPrepare } from './session-prepare.js';
 import { createLinkNormaliser } from './mcp/links.js';
 import { createExtDeliver } from './ext-deliver.js';
 import { sweepStaging } from './extensions/external.js';
-import { log, logError } from './log.js';
+import { log, logWarn, logError } from './log.js';
 import { installShutdownLog } from './shutdown-log.js';
 import { restartSupported } from './control/handlers/restart.js';
 import { startPriceCatalogRefresh, onPriceCatalogChange } from './price-catalog.js';
 import { startCodexCatalogRefresh, onCodexCatalogChange } from './agents/codex-catalog.js';
-import { readCodeVersion, clearRollbackMarker, readRolledBack } from './self-update.js';
-import { createUpdateService } from './update-service.js';
+import { withAutoEffort, watchAutoEffortSources } from './agents/auto-effort.js';
+import { readInstall, clearRollbackMarker, readRolledBack } from './self-update.js';
+import { createUpdateService, updateSupport, installDriftStatus } from './update-service.js';
+import { createExtensionUpdateCheck, currentExtensionUpdates } from './extensions/update-check.js';
+import { autoUpdateExtension } from './control/handlers/extensions-install.js';
+import { createInstallDriftWatch } from './install-root.js';
 import { nextSessionToRefresh } from './session-refresh.js';
 import { headlessRunsInFlight } from './headless-claude.js';
+import { startupStyle, bannerLines, listenErrorMessage } from './startup-output.js';
+import { VERSION } from './version.js';
 
 const open = openModule.default || openModule;
 
@@ -177,19 +192,35 @@ const storesFor = (id) => Object.fromEntries(
 sessionManager._extLaunchSkills = createSkillGate(ext, hostApiFor, logError);
 // Per-launch Codex sandbox/approval policy (the _extCodexPolicy seam).
 sessionManager._extCodexPolicy = createCodexPolicyResolver(ext, hostApiFor, logError);
+// An upgrade that repointed AW_INSTALL_ROOT under this running server (see
+// install-root.js): checked at every launch, since that is when a session picks
+// up the new version's hook and skills, and on a timer in main(). Shown in
+// Settings › Updates through the config frame and `install-drift`.
+const installDrift = createInstallDriftWatch({ onChange: () => broadcast({ type: 'install-drift', drift: installDriftNotice() }) });
+const installDriftNotice = () => installDriftStatus(installDrift.current(), { manager: INSTALL_ENV.installManager, runningVersion: VERSION });
 // Per-launch env and directory grants from the enabled extensions (the
 // `session.launchContext` hook, server/launch-context.js): dispatch/resume/fork
 // await it before building the command. `_taskFor` is how session-manager asks
 // "which task is this session on" without knowing the task store.
-sessionManager._launchContext = (ctx) => collectLaunchContext(ctx, { ext, hostApiFor, onError: logError });
+sessionManager._launchContext = (ctx) => {
+  installDrift.poll();
+  return collectLaunchContext(ctx, { ext, hostApiFor, onError: logError });
+};
 sessionManager._taskFor = (sid) => taskStore.taskFor(sid);
+// `session.prepare` (server/session-prepare.js): runs before a new dispatch's
+// worktree exists; its warnings are toasted, an abort is thrown by dispatch.
+sessionManager._prepare = async (payload) => {
+  const res = await collectPrepare(payload, { ext, hostApiFor, onError: logError });
+  if (res.warnings.length) broadcast({ type: 'prepare-warnings', warnings: res.warnings });
+  return res;
+};
 // Bind the archive-review seam (default no-op in the class, see session-manager.js)
 // to the real runner with the event bus injected — the review publishes its
 // result as `archive-review:completed` and whichever extension cares (task-memory)
 // writes it; keeps SessionManager itself free of that dependency, and every test
 // that doesn't stub _archiveReview stays a no-op by construction.
 sessionManager._archiveReview = (sessionId, entry, task, extraDeps = {}) =>
-  runArchiveReview(sessionId, entry, task, { events: coreEvents, ...extraDeps });
+  runArchiveReview(sessionId, entry, task, { events: coreEvents, launchContext: sessionManager._launchContext, ...extraDeps });
 const scheduleStore = new ScheduleStore();
 const mailStore = new MailboxStore();
 // Bind the archive-mail-prune seam (default no-op in the class) — archive drops
@@ -221,7 +252,7 @@ const { sessionFromGraph, tmuxFor, socketFor } = createTargets(sessionManager, (
 const paneDeferral = createPaneDeferral({
   tmuxFor,
   socketFor,
-  agentFor: (id) => sessionManager.entryFor(id)?.agent || 'claude',
+  agentFor: (id) => sessionManager.entryFor(id)?.agent ?? 'claude',
   statusFor: (id) => lastGraph?.sessions?.find((s) => s.sessionId === id)?.status ?? null,
   sendText,
 });
@@ -233,11 +264,15 @@ const paneDeferral = createPaneDeferral({
 //
 // The wiring bag every builder draws from. Only host-api/v1.js touches these; an
 // extension sees whatever subset its `requires` declared and nothing else.
-// `archiveSession` and `createTerminal` are composed here rather than in a
+// `archiveSession` and `extTerminals` are composed here rather than in a
 // builder so host-api/ stays a thin bind layer and does not pull the control
 // handlers and the shell plumbing in behind it.
+// The paths extensions have registered through `host.files` (`files:view`); the
+// viewer route below reads only from here.
+const extFiles = createExtFiles();
 const extWiring = {
   core: extCore,
+  extFiles,
   events: coreEvents,
   // `memory.*` is provided by the task-memory extension's store while it is
   // active (host-api/v1.js degrades to "not available" when this is null).
@@ -262,6 +297,11 @@ const extWiring = {
     await rebuild();
     return { archived: ids, ...result };
   },
+  archiveTask: async (taskId) => {
+    const result = await archiveTaskCascade(taskId, archiveCascadeCtx);
+    await rebuild();
+    return result ? { archived: true, sessionIds: result.sessionIds, unclean: result.unclean } : { archived: false, sessionIds: [], unclean: false };
+  },
   // `sessions:interrupt`: the same Escape the interrupt control handler sends,
   // minus its composer restore (there is no chat view waiting on a reply).
   interruptSession: async (sessionId) => {
@@ -270,13 +310,13 @@ const extWiring = {
     await sendKeys(target, ['Escape'], socketFor(sessionId) || '');
     return true;
   },
-  createTerminal: async ({ cwd, command = '' } = {}) => {
-    const terminalId = `t_${crypto.randomBytes(4).toString('hex')}`;
-    const tmuxName = await createShellSession(cwd, sessionManager.socket, sessionManager.tmuxBin, command);
-    terminalRegistry.set(terminalId, { tmuxName, socket: sessionManager.socket, cwd });
-    broadcast({ type: 'open-terminal', terminalId, command, sessionId: null });
-    return { terminalId };
-  },
+  extTerminals: createExtTerminalOpener({
+    createShellSession: (cwd, socket, command) => createShellSession(cwd, socket, sessionManager.tmuxBin, command),
+    socket: () => sessionManager.socket,
+    terminalRegistry,
+    broadcast,
+    isAlive: ({ tmuxName, socket }) => tmuxSessionAlive(sessionManager.tmuxBin, socket, tmuxName),
+  }),
 };
 // What archiveCascade reads off its ctx — the same shape the board handler and
 // the archive_session tool hand it.
@@ -386,14 +426,19 @@ function activateExtension(id, { startSweeps = true } = {}) {
       registerRuntime({
         id: rt.id,
         label: rt.label,
+        ...(rt.agents === undefined ? {} : { agents: [...rt.agents] }),
         ...(rt.resumable === undefined ? {} : { resumable: rt.resumable }),
         skipsHostResumeGuard: Boolean(rt.skipsHostResumeGuard),
+        liveByTmux: Boolean(rt.liveByTmux),
         preflight: bind(rt.preflight, () => `The "${rt.label}" runtime needs the "${id}" extension, which is not active.`),
         wrapLaunch: bind(rt.wrapLaunch, notActive),
         buildLaunch: bind(rt.buildLaunch, notActive),
         deliver: bind(rt.deliver, notActive),
         readLive: bind(rt.readLive, () => null),
         analyze: bind(rt.analyze, () => null),
+        cost: bind(rt.cost, () => null),
+        launchStatus: bind(rt.launchStatus, () => null),
+        validateModel: bind(rt.validateModel, () => `The "${rt.label}" runtime needs the "${id}" extension, which is not active.`),
       }, id);
     }
     // Lifecycle: where a store's watcher or an event subscription is started.
@@ -445,6 +490,7 @@ function deactivateExtension(id) {
     logError(`[ext:${id}] deactivate failed`, err);
   }
   coreEvents.offOwner(id);
+  extFiles.clear(id);
   // Here rather than beside the loader's unregister, so the runtime registry
   // agrees with the loader whichever of the two runs first and a live disable
   // takes the runtime away with no restart. A card already launched on it
@@ -522,6 +568,11 @@ const extBag = {
 // connects (or reconnects/reloads) while it's active, since a WS broadcast alone
 // only reaches tabs already open at the moment it fires.
 let fdWarning = null;
+
+// `{ socket }` when this install's tmux server is in an old macOS login session
+// (gui-session.js), else null. Checked once at startup: a logout stops this
+// service, so the next login always comes through here again.
+let staleGuiSession = null;
 
 // When the last control client was connected/active — drives the dev-instance
 // idle self-shutdown. Seeded to start time so a dev server launched and never
@@ -715,7 +766,15 @@ async function fireSchedule(id, { manual = false } = {}) {
   try {
     const { sessionId } = await performScheduleAction(snap.action, now);
     scheduleStore.markFired(id, { at, sessionId }, now, { advance: !manual });
-    broadcast({ type: 'schedule-fired', id, name: snap.name, sessionId });
+    // A one-off that fired cleanly has nothing left to show; delete it so agents'
+    // self-scheduled wake-ups don't pile up as dead rows. A failed one stays (below).
+    if (!manual && snap.when.kind === 'once') scheduleStore.delete(id);
+    let label = sessionId.slice(0, 8);
+    try {
+      const e = sessionManager.entryFor(sessionId);
+      label = sessionLabel({ agent: e?.agent, names: [e?.name, e?.lastLabel], intent: e?.intent, cwd: e?.cwd, fallback: label });
+    } catch {}
+    broadcast({ type: 'schedule-fired', id, name: snap.name, sessionId, label, focus: snap.action.kind === 'session' && snap.action.focus === true });
   } catch (err) {
     scheduleStore.markFired(id, { at, sessionId: null }, now, { advance: !manual });
     broadcast({ type: 'schedule-error', id, name: snap.name, message: String(err?.message || err) });
@@ -739,7 +798,8 @@ async function fireDueSchedules() {
   let any = false;
   for (const s of scheduleStore.due(now)) {
     if (s.when.kind === 'once' && now - Date.parse(s.when.runAt) > STALE_MS) {
-      scheduleStore.markMissed(s.id);
+      // Missed one-offs are deleted too: the schedule-missed toast is the only record wanted.
+      scheduleStore.delete(s.id);
       broadcast({ type: 'schedule-missed', id: s.id, name: s.name });
       any = true;
       continue;
@@ -788,8 +848,9 @@ const fireDueSnoozeWakesTick = createSnoozeWakeSweeper({
 // report to (the send already returned queued:true) and Phase 1 tracks no
 // deliveryFailed state — the mail pill's unreadInfo age fallback is what still
 // surfaces it to a human, so this just logs rather than broadcasting a toast.
+const mailDeferrals = createDeferralTracker();
 const fireMailSettlesTick = createMailSettleSweeper({
-  mailStore, sessionManager, tmuxFor, socketFor, paneDeferral,
+  mailStore, deferrals: mailDeferrals, sessionManager, tmuxFor, socketFor, paneDeferral, wakesDormant: mailWakesDormant,
   onError: (to, err) => logError(`[mail] delivery failed for ${to}:`, err?.message || err),
 });
 
@@ -820,6 +881,13 @@ async function prAttachHandler(req, res) {
     if (!res.headersSent) res.writeHead(500).end('error');
   }
 }
+
+const prModelHandler = createPrModelHandler({
+  graph: () => lastGraph,
+  entryFor: (id) => sessionManager.entryFor(id),
+  enabled: () => prModelFooterEnabled(),
+  logError,
+});
 
 // GET /file?path=… — read a markdown file for the click-to-preview modal.
 // Localhost posture like the static routes; the response carries NO CORS header
@@ -856,10 +924,31 @@ async function fileHandler(req, res) {
   }
 }
 
+// GET /ext-file?ext=<id>&path=… — what api.openFile reads. Same localhost posture
+// as /file (no CORS header). Answers 200 { ok, … } either way: a refusal is
+// { ok:false, reason }, and only the registry (host.files) decides what opens.
+async function extFileHandler(req, res) {
+  const json = (status, body) => {
+    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(body));
+  };
+  try {
+    if (!isAllowedHost(req.headers.host, PORT)) return json(403, { ok: false, reason: 'forbidden' });
+    const q = new URL(req.url, 'http://localhost').searchParams;
+    const id = q.get('ext');
+    const r = hostApis.has(id) ? await extFiles.open(id, q.get('path')) : { ok: false, reason: 'not-permitted' };
+    json(200, r);
+  } catch (err) {
+    logError('[ext-file]', err);
+    if (!res.headersSent) json(200, { ok: false, reason: 'error' });
+  }
+}
+
 // spawn_session creates a full board session, mirroring the /ws dispatch path:
 // dispatch (mints the card id, collects the launch context pre-launch) → assign →
 // rebuild.
 const mcpRequestHandler = createMcpRequestHandler({
+  agents: dispatchAgents,
   taskStore,
   graph: () => lastGraph,
   // list_tasks folds out scratch cwds when picking a task's bestFolder.
@@ -898,8 +987,9 @@ const mcpRequestHandler = createMcpRequestHandler({
 // /ext/<id>/* resolves ONLY through the loader's `dirs`, which holds enabled
 // extensions alone — so a disabled extension's client is a 404, never served.
 const server = createHttpServer({
-  port: PORT, mcpRequestHandler, prAttachHandler, fileHandler,
+  port: PORT, mcpRequestHandler, prAttachHandler, prModelHandler, fileHandler, extFileHandler,
   extensionAssets: (id) => (Object.hasOwn(ext.dirs, id) ? ext.dirs[id] : null),
+  extensionThemes: () => themeSources(ext.themeDirs),
 });
 
 // --- WebSocket: control channel (graph + actions) and pty channel ---
@@ -928,7 +1018,7 @@ server.on('upgrade', (req, socket, head) => {
 let lastStylesKey = null;
 
 function broadcastStylesIfChanged() {
-  const styles = listStyles();
+  const styles = listStyles(themeSources(ext.themeDirs));
   const key = JSON.stringify(styles);
   if (key === lastStylesKey) return;
   lastStylesKey = key;
@@ -936,10 +1026,15 @@ function broadcastStylesIfChanged() {
 }
 
 // The dispatch dialog's agent/model/effort lists — sent on connect, and again to
-// every board whenever a model or price catalog refresh changes them.
-async function agentsMessage() {
+// every board whenever a model or price catalog refresh, or a settings file that
+// decides a model's Auto effort (`autoEffort`), changes them.
+async function dispatchAgents() {
   const list = await availableAgents();
-  return JSON.stringify({ type: 'agents', agents: list.map((a) => ({ id: a.id, label: a.label, models: modelsWithDefault(a), efforts: a.efforts || [] })) });
+  return list.map((a) => ({ ...providerMetadata(a), models: withAutoEffort(a.id, modelsWithDefault(a)), efforts: a.efforts || [] }));
+}
+
+async function agentsMessage() {
+  return JSON.stringify({ type: 'agents', agents: await dispatchAgents(), providers: registeredAgents().map(providerMetadata) });
 }
 
 function broadcastAgents() {
@@ -949,7 +1044,10 @@ function broadcastAgents() {
 }
 
 function broadcast(obj) {
-  const msg = JSON.stringify(obj);
+  broadcastMessage(JSON.stringify(obj));
+}
+
+function broadcastMessage(msg) {
   // readyState alone is not enough: a client that stops reading stays OPEN
   // forever, so every snapshot we send it is queued in our own heap until the
   // process OOMs. sendGuarded drops such a peer instead — see ws-backpressure.js
@@ -960,6 +1058,7 @@ function broadcast(obj) {
 // Module-scope so its "have I already sent this?" memory spans every rebuild, not
 // one call — the whole saving is across ticks.
 const wireGraph = createHistoryGate();
+const graphFrame = createGraphFrameGate();
 
 // Wrapped below in createRebuildCoalescer — see there for why an overlapping call
 // must trail rather than skip or race.
@@ -973,16 +1072,20 @@ async function rebuildOnce() {
     task: taskStore.taskFor(sid),
     label: lastGraph?.sessions?.find((s) => s.sessionId === sid)?.label,
   }));
-  const graph = await buildGraph(sessionManager, (sid, opts) => analyze(sid, undefined, opts), { mailStore });
+  const graph = await buildGraph(sessionManager, (sid, opts) => analyze(sid, undefined, opts), { mailStore, mailDraftBlocked: (sid, now) => mailDeferrals.draftBlocked(sid, now) });
   graph.tasks = taskStore.snapshot();
   graph.schedules = scheduleStore.snapshot(); // drives the Schedules panel off the live rebuild
   graph.subagentsExpandedByDefault = subagentsExpandedByDefault();
   graph.trustCodexLaunchCwd = trustCodexLaunchCwd();
+  graph.trustClaudeLaunchCwd = trustClaudeLaunchCwd();
   graph.childFullViewByDefault = childFullViewByDefault();
   graph.autoFixPrChecksDefault = autoFixPrChecksDefault();
   graph.archiveReviewEnabled = archiveReviewEnabled();
+  graph.mailWakesDormant = mailWakesDormant();
+  graph.prModelFooter = prModelFooterEnabled();
   graph.chatViewDefault = chatViewDefault();
   graph.defaultSessionCwd = defaultSessionCwd();
+  graph.defaultRuntime = defaultRuntime();
   graph.autoUpdate = autoUpdateMode();
   graph.refreshSessionsAfterUpdate = refreshSessionsAfterUpdate();
   graph.codeVersion = codeVersion;
@@ -996,6 +1099,8 @@ async function rebuildOnce() {
   // rather than the connect announcement so the banner survives a reconnect the
   // same way fdWarning's re-send does. A handful of short ids at most.
   graph.quarantinedBuiltins = quarantinedBuiltinIds();
+  // Boot-fixed too, and carried the same way for the same reason.
+  graph.staleGuiSession = staleGuiSession;
   // Each enabled extension's graph contribution. Only enabled ones are in the
   // list, keys were checked against the core's at boot — and no logging here: this is the 4s rebuild.
   for (const { id, contribute } of ext.graphContributors) Object.assign(graph, contribute({ host: hostApiFor(id), graph }));
@@ -1013,13 +1118,19 @@ async function rebuildOnce() {
   // The wire graph, not `lastGraph`: history is omitted while unchanged, which is
   // almost every tick. See history-gate.js — and note the connect path above sends
   // `lastGraph` itself, so a fresh socket is always served the full list.
-  broadcast({ type: 'graph', graph: wireGraph(graph) });
+  // graphFrame then drops the tick altogether when nothing but generatedAt moved
+  // (see graph-frame-gate.js), which on an idle server is every one of them.
+  const frame = graphFrame(wireGraph(graph));
+  if (frame) broadcastMessage(frame);
   broadcastStylesIfChanged();
   return graph;
 }
 
 const rebuild = createRebuildCoalescer(rebuildOnce);
 let codeVersion = null;
+// codeVersion as a log shows it: a checkout's short commit, a package's whole
+// version (slicing "10.10.10" to seven characters would name another release).
+let codeVersionLabel = null;
 let updates = null;
 const UPDATE_CHECK_MS = (Number(process.env.AW_UPDATE_CHECK_MINUTES) || 60) * 60 * 1000;
 const ROLLBACK_CLEAR_AFTER_MS = 30000;
@@ -1067,7 +1178,7 @@ async function refreshNextStaleSession() {
     return;
   }
   if (sessionManager.entryFor(s.sessionId)?.archivedAt) return;
-  log(`[agent-wrangler] restarting idle session ${s.sessionId} onto ${codeVersion.slice(0, 7)}`);
+  log(`[agent-wrangler] restarting idle session ${s.sessionId} onto ${codeVersionLabel}`);
   memoryStore.bindSession(s.sessionId, taskStore.taskFor(s.sessionId)?.id || null);
   try {
     await sessionManager.resume(s.sessionId, dir, { reason: 'update-refresh' });
@@ -1083,7 +1194,7 @@ controlWss.on('connection', (ws) => {
   // `canRestart` gates the board's own "Restart the wrangler" button: a restart
   // is an exit that only comes back under a supervisor (see control/handlers/
   // restart.js), so the client must never offer it otherwise.
-  ws.send(JSON.stringify({ type: 'config', sessionsDir: SESSIONS_DIR, homeDir: os.homedir(), canRestart: restartSupported(), codeVersion, update: updates?.latest() || null, updateRolledBack: updates?.rolledBack() || null }));
+  ws.send(JSON.stringify({ type: 'config', sessionsDir: SESSIONS_DIR, homeDir: os.homedir(), canRestart: restartSupported(), codeVersion, update: updates?.latest() || null, extensionUpdates: currentExtensionUpdates(updates?.extensions()), updateUnavailable: updates?.unavailable() || null, updateRolledBack: updates?.rolledBack() || null, installDrift: installDriftNotice() }));
   // Which enabled extensions ship a client module (served under /ext/<id>/),
   // each with the control types its browser half may send (slots.js binds its
   // `send` to them and fails closed until it has heard this or a graph), plus
@@ -1123,7 +1234,10 @@ controlWss.on('connection', (ws) => {
     // reads exactly like the hard kill a missing reason is supposed to mean. The
     // small delay lets the ack reach the browser before the socket dies with us.
     restart: () => exitForRestart('restart requested from the board'),
+    canRestart: restartSupported(),
     updates,
+    staleGuiSession: () => staleGuiSession,
+    recheckGuiSession: async () => { staleGuiSession = await sessionManager.checkGuiSession(); },
   };
   ws.on('message', (raw) => { lastControlActivity = Date.now(); routeControlMessage(raw, ctx); });
 });
@@ -1172,21 +1286,48 @@ async function main() {
   // in-memory. After the lock, so a duplicate instance never sweeps the running
   // one's in-flight staging dir out from under it.
   sweepStaging();
-  codeVersion = await readCodeVersion();
+  // A package-managed install never runs Git, even to read a version: its
+  // identity is the package version it was built from.
+  const install = INSTALL_ENV.installManager ? { checkout: false, codeVersion: VERSION } : await readInstall();
+  codeVersion = install.codeVersion;
+  codeVersionLabel = install.checkout && codeVersion ? codeVersion.slice(0, 7) : codeVersion;
   sessionManager.codeVersion = codeVersion;
   updates = createUpdateService({
-    supervised: restartSupported,
+    support: updateSupport({
+      installManager: INSTALL_ENV.installManager,
+      checkout: install.checkout,
+      supervised: INSTALL_ENV.supervised,
+      gitUpdates: INSTALL_ENV.gitUpdates,
+      dev: Boolean(process.env.AW_DEV),
+    }),
     mode: () => autoUpdateMode(),
     isQuiet: wranglerIsQuiet,
     rolledBack: readRolledBack(),
     onStatus: (status) => broadcast({ type: 'update-status', ...status }),
     onApplied: (result) => {
+      if (result.extensions) {
+        broadcast({ type: 'update-applied', extensions: result.extensions });
+        exitForRestart(`auto-updated ${result.extensions.join(', ')}`);
+        return;
+      }
       broadcast({ type: 'update-applied', head: result.head });
       exitForRestart(`updated to ${result.head}`);
     },
+    // Auto-update runs with the same core-owned bag a control frame gets; only
+    // its outcome is broadcast (see autoUpdateExtension).
+    checkExtensions: createExtensionUpdateCheck({
+      list: () => ext.list,
+      autoUpdate: (id) => autoUpdateExtension(id, { ext: extBag, rebuild, broadcast }),
+    }),
+    onExtensions: (summary) => broadcast({ type: 'ext-update-status', ...summary }),
+    canRestart: restartSupported(),
     log,
   });
   await sessionManager.init();
+  await sessionManager.refreshTmuxPath();
+  await sessionManager.clearInstallEnv();
+  staleGuiSession = await sessionManager.checkGuiSession();
+  if (staleGuiSession) logWarn(`[gui-session] tmux server on socket ${staleGuiSession.socket} is in an old macOS login session; windows its agents open can't be focused`);
   setTmuxBin(sessionManager.tmuxBin);
   // Re-run the launch context for every active session before the first build
   // (reason `adopt`): extensions repair per-session state that went stale while
@@ -1245,14 +1386,31 @@ async function main() {
   validateDefaultModel();
   onPriceCatalogChange(broadcastAgents);
   onCodexCatalogChange(broadcastAgents);
+  watchAutoEffortSources(broadcastAgents);
   startPriceCatalogRefresh();
   startCodexCatalogRefresh();
 
+  // A failed bind must end the process. Without this listener the error reaches
+  // the last-resort uncaughtException guard above, which only logs — leaving a
+  // process that holds the instance lock and serves nothing, which a supervisor's
+  // KeepAlive never notices. The lock is released by its own exit handler.
+  // Detached once listening: the server also emits 'error' for a failed accept
+  // (EMFILE under fd pressure), which must stay a logged, survivable event.
+  const onListenError = (err) => {
+    logError(listenErrorMessage(err, PORT));
+    process.exit(1);
+  };
+  server.once('error', onListenError);
   server.listen(PORT, HOST, () => {
+    server.off('error', onListenError);
     // Loopback presents as "localhost"; any other bind prints its actual host.
     const host = (HOST === '127.0.0.1' || HOST === '::1') ? 'localhost' : HOST;
     const url = `http://${host}:${PORT}`;
-    log(`[agent-wrangler] running at ${url} (pid ${process.pid})`);
+    if (startupStyle({ isTTY: process.stdout.isTTY, supervised: INSTALL_ENV.supervised }) === 'banner') {
+      console.log(bannerLines({ version: VERSION, commit: install.checkout ? codeVersion : null, url, dataDir: DATA_DIR }).join('\n'));
+    } else {
+      log(`[agent-wrangler] running at ${url} (pid ${process.pid})`);
+    }
     if (shouldOpenBrowser()) open(url).catch(() => {});
     setTimeout(() => clearRollbackMarker(), ROLLBACK_CLEAR_AFTER_MS).unref();
   });
@@ -1261,6 +1419,7 @@ async function main() {
     setTimeout(() => updates.tick(), 60 * 1000).unref();
     setInterval(() => updates.tick(), UPDATE_CHECK_MS).unref();
   }
+  setInterval(() => installDrift.poll(), 60 * 1000).unref();
   setInterval(() => refreshOneStaleSession().catch((err) => logError('[agent-wrangler] session refresh failed:', err?.message || err)), 60 * 1000).unref();
 
   // Background PR check-status poll. setInterval fires on a fixed cadence regardless

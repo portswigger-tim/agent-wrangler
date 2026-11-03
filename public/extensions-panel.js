@@ -1,4 +1,5 @@
-import { COPY_ICON, CHECK_ICON, PROMOTE_ICON, RESTART_ICON } from './icons.js';
+import { COPY_ICON, CHECK_ICON, PROMOTE_ICON, RESTART_ICON, GITHUB_ICON, STAR_ICON, ATTACH_ICON, SEARCH_ICON } from './icons.js';
+import { changesText } from './update-panel.js';
 
 // The Extensions settings tab and the install/update consent modal. Pure DOM
 // builders with no app state, like toast.js and system-banner.js: settings.js
@@ -42,6 +43,17 @@ export const MAX_TEXTAREA_LENGTH = 20000;
 
 export const RESTART_NOTE = 'Restart the wrangler to finish.';
 
+// An auto-applied update's toast where the wrangler can restart itself: it
+// does, once idle (update-service.js), so asking for a restart would be wrong.
+export const AUTO_RESTART_NOTE = 'The wrangler restarts to load it once it is idle.';
+
+// What turning auto-update on gives away, shown in the confirm before it is
+// on. Like TRUST_STATEMENT, not to be softened: the repository's owner, or
+// whoever compromises it, decides what runs next, and nobody reads it first.
+export const AUTO_UPDATE_WARNING = 'New commits pushed to this extension\'s repository — by its owner, or by anyone who gains control of it — will be installed and run inside the wrangler with this extension\'s capabilities and full access to this machine, without you reviewing the code first. Only an update that asks for no new capabilities and passes the lockfile and host API checks is applied; anything else still waits for you. The wrangler restarts itself to load updated code once it is idle, where it can restart; otherwise the code loads at the next restart.';
+
+export const AUTO_UPDATE_HELP = 'Install new commits at the update check when they ask for no new capabilities. Runs only while Settings › Updates is on Notify or Auto; the wrangler restarts to load it once idle, or, where it cannot restart itself, at the next restart.';
+
 // An uninstall gets its OWN note, because "to finish" would be a lie there: the
 // row, tools, handlers, stores, sweeps and client asset are all gone already and
 // the reader can see that. The only thing left is the module Node cannot unload
@@ -59,6 +71,8 @@ function el(tag, className, text) {
 // Plain-language descriptions for capabilities a name alone does not explain,
 // shown as the chip's tooltip, and as a line under the chips in the consent dialog.
 export const CAPABILITY_DESCRIPTIONS = {
+  'files:view': 'Open local files the extension names (markdown and images) in a viewer panel when you click them. Only files it registers can be opened, and nothing is changed.',
+  'files:open': 'Open the file links you click in a session\'s chat or terminal itself, instead of the board\'s preview.',
   'cards:hideChips': 'Hide chips in the session cards\' meta row (presentation only; nothing is removed).',
 };
 
@@ -134,7 +148,10 @@ const nameOf = (entry) => entry.label || entry.id;
 
 // Only an extension whose last check found a newer commit, and that is still
 // here to update.
-const hasUpdate = (entry, status, removing) => Boolean(entry.external && entry.origin && status?.behind && !removing);
+// `incompatible` is the server's refusal of that update (ext-install-incompatible):
+// the newer commit needs a host API this wrangler does not serve, so offering
+// the button again would only clone it to be refused a second time.
+const hasUpdate = (entry, status, removing) => Boolean(entry.external && entry.origin && status?.behind && !status.incompatible && !removing);
 
 // One entry in the left pane: a status dot (filled = enabled, hollow =
 // disabled) and the name, plus — when the last check found a newer commit — a
@@ -152,6 +169,8 @@ export function extensionListItemEl(entry, { selected, status, pendingRemoval, o
   pick.addEventListener('click', () => onSelect?.(entry.id));
   row.append(pick);
   if (hasUpdate(entry, status, pendingRemoval)) {
+    // Only the background check counts changes; Check all's ls-remote cannot.
+    if (status.commits) row.append(el('span', 'ext-update-count', changesText(status.commits, status.capped)));
     row.append(iconButtonEl('ext-btn ext-btn-dark ext-btn-square', PROMOTE_ICON, `Update ${nameOf(entry)}`, () => onUpdate?.(entry)));
   }
   return row;
@@ -193,7 +212,7 @@ function sourceEl(entry) {
 // settings.js's delegated click handler already drives (and where it puts its
 // flip note), so the enable switch has no second flip path.
 export function extensionDetailEl(entry, {
-  status, pendingRemoval, settings, onUninstall,
+  status, pendingRemoval, settings, onUninstall, onAutoUpdate,
 } = {}) {
   const pane = el('div', 'ext-detail-body');
   const head = el('div', 'setting-row ext-detail-head');
@@ -235,25 +254,82 @@ export function extensionDetailEl(entry, {
   if (pendingRemoval) pane.append(noteEl('ext-row-note', `Uninstalled. ${UNINSTALL_RESTART_NOTE}`));
   else if (status) pane.append(noteEl('ext-row-note', updateStatusText(status)));
 
+  // Only an extension with a recorded origin has anything to update from: a
+  // builtin ships with the wrangler and a hand-placed one has no record.
+  if (entry.external && entry.origin && !pendingRemoval) section(pane, 'Updates', autoUpdateRowEl(entry, onAutoUpdate));
   section(pane, 'Source', sourceEl(entry));
   if (settings && !pendingRemoval) section(pane, 'Settings', settings);
   return pane;
 }
 
-// The install-by-git-URL form "+ Add extension" opens in the detail pane.
-function addExtensionEl({ busy, onInstall }) {
+// The per-extension auto-update switch. No `data-id`, so settings.js's
+// delegated toggle handler cannot see it (see extensionSettingRowsEl). It does
+// not move itself: turning it on waits for the caller's confirm, and the
+// graph's `autoUpdate` redraws the pane either way.
+function autoUpdateRowEl(entry, onAutoUpdate) {
+  const row = el('div', 'ext-auto-update');
+  const copy = el('div', 'setting-copy');
+  copy.append(el('div', 'setting-label', 'Auto-update'));
+  copy.append(el('div', 'setting-help', AUTO_UPDATE_HELP));
+  const actions = el('div', 'ext-row-actions');
+  const on = Boolean(entry.autoUpdate);
+  const toggle = el('button', `setting-toggle${on ? ' on' : ''}`);
+  toggle.type = 'button';
+  toggle.setAttribute('role', 'switch');
+  toggle.setAttribute('aria-checked', on ? 'true' : 'false');
+  toggle.setAttribute('aria-label', `Auto-update ${nameOf(entry)}`);
+  toggle.append(el('span', 'setting-knob'));
+  toggle.addEventListener('click', () => onAutoUpdate?.(entry, !on));
+  actions.append(toggle);
+  row.append(copy, actions);
+  return row;
+}
+
+// "+ Add extension" in the detail pane: a Browse GitHub | Git URL switch, with
+// Browse the default — public repositories carrying the extension topic, as
+// cards. A card's Install… sends its clone URL down the same `onInstall` as the
+// URL form, so it gets the same clone, disclosure and consent modal; nothing is
+// skipped for having been found here. The mode and the search text are the
+// caller's state, like the list's filter, so a remount keeps them.
+function addExtensionEl({ busy, onInstall, browse, installedOrigins, onBrowse, addMode, onAddMode, query, onQuery }) {
   const pane = el('div', 'ext-detail-body');
   const head = el('div', 'ext-detail-head');
   const copy = el('div', 'setting-copy');
   copy.append(el('div', 'ext-detail-name', 'Add extension'));
-  copy.append(el('div', 'setting-help', 'Paste an https:// or ssh:// git URL. The wrangler fetches it and shows you what it asks for before anything is installed.'));
+  copy.append(el('div', 'setting-help', 'Pick a tagged repository from GitHub, or install from any git URL. The wrangler fetches it and shows you what it asks for before anything is installed.'));
   head.append(copy);
   pane.append(head);
+  const browsing = addMode !== 'url';
+  const modes = el('div', 'ext-mode-row');
+  const seg = el('div', 'chat-seg');
+  seg.setAttribute('role', 'group');
+  seg.setAttribute('aria-label', 'How to add');
+  for (const [mode, label, icon] of [['browse', 'Browse GitHub', GITHUB_ICON], ['url', 'Git URL', ATTACH_ICON]]) {
+    const on = (mode === 'url') !== browsing;
+    const btn = el('button', `chat-seg-btn${on ? ' on' : ''}`);
+    btn.type = 'button';
+    btn.innerHTML = icon;
+    btn.append(el('span', null, label));
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.addEventListener('click', () => { if (!on) onAddMode?.(mode); });
+    seg.append(btn);
+  }
+  modes.append(seg);
+  pane.append(modes);
+  if (!browsing) pane.append(urlInstallEl({ busy, onInstall }));
+  else if (browse) pane.append(githubBrowserEl({ browse, busy, installedOrigins, onInstall, onBrowse, query, onQuery }));
+  return pane;
+}
+
+function urlInstallEl({ busy, onInstall }) {
+  const pane = el('div', 'ext-url-pane');
+  pane.append(el('div', 'setting-help', 'Paste an https:// or ssh:// git URL. It goes through the same fetch and consent step as a card.'));
   const form = el('div', 'ext-install-form');
   const input = el('input', 'ext-install-url');
   input.type = 'text';
   input.placeholder = 'https://github.com/…';
   input.setAttribute('aria-label', 'Extension git URL');
+  input.dataset.refocus = 'url';
   const go = el('button', 'ext-btn ext-btn-primary', 'Install…');
   go.type = 'button';
   go.disabled = busy;
@@ -266,6 +342,231 @@ function addExtensionEl({ busy, onInstall }) {
   form.append(input, go);
   pane.append(form);
   return pane;
+}
+
+// The add pane's text boxes carry `data-refocus`, so a remount (a Refresh, the
+// browse reply landing, any graph) can put the caret back where it was.
+export function focusedFieldState(container, doc = document) {
+  const active = doc.activeElement;
+  if (!active || !container.contains(active) || !active.dataset?.refocus) return null;
+  return { key: active.dataset.refocus, start: active.selectionStart, end: active.selectionEnd };
+}
+
+export function restoreFocusedField(container, state) {
+  if (!state) return;
+  const field = container.querySelector(`[data-refocus="${state.key}"]`);
+  if (!field) return;
+  field.focus({ preventScroll: true });
+  if (state.start != null) field.setSelectionRange(state.start, state.end);
+}
+
+export const EXTENSION_TOPIC = 'agent-wrangler-extension';
+
+// The browser's own warning, and like TRUST_STATEMENT not to be softened: a
+// topic is something any repository owner sets on their own repository, so
+// being listed here says nothing about who wrote it or what it does.
+export const BROWSE_NOTICE = 'Anyone can tag a public repository with this topic, so nothing listed here has been reviewed or endorsed. Read the code and check who wrote it before installing — making sure an extension is safe is up to you.';
+
+// One comparable form for a git remote, so a card can tell it is already
+// installed whether the origin was recorded as https, with .git, or as git@.
+export function normalizeRepoUrl(url) {
+  return String(url || '').trim().toLowerCase()
+    .replace(/^git@([^:]+):/, 'https://$1/')
+    .replace(/^ssh:\/\/git@/, 'https://')
+    .replace(/\/+$/, '')
+    .replace(/\.git$/, '');
+}
+
+const RELATIVE_UNITS = [['year', 365 * 86400], ['month', 30 * 86400], ['week', 7 * 86400], ['day', 86400], ['hour', 3600], ['minute', 60]];
+
+// "Updated 3 days ago" — how alive a repository is matters more than when.
+export function updatedAgoText(iso, now = Date.now()) {
+  const then = Date.parse(iso);
+  if (!Number.isFinite(then)) return '';
+  const secs = Math.max(0, (now - then) / 1000);
+  for (const [unit, size] of RELATIVE_UNITS) {
+    const n = Math.floor(secs / size);
+    if (n >= 1) return `Updated ${n} ${unit}${n === 1 ? '' : 's'} ago`;
+  }
+  return 'Updated just now';
+}
+
+function compactCount(n) {
+  return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1).replace(/\.0$/, '')}k` : String(n);
+}
+
+function avatarEl(repo) {
+  // The initial is underneath the image, so a blocked or failed avatar still
+  // leaves something in the circle rather than a broken-image glyph.
+  const box = el('div', 'ext-gh-avatar');
+  box.append(el('span', 'ext-gh-avatar-initial', (repo.owner || repo.name || '?').slice(0, 1).toUpperCase()));
+  if (repo.avatarUrl) {
+    const img = el('img');
+    img.src = `${repo.avatarUrl}${repo.avatarUrl.includes('?') ? '&' : '?'}s=80`;
+    img.alt = '';
+    img.loading = 'lazy';
+    img.referrerPolicy = 'no-referrer';
+    img.addEventListener('error', () => img.remove());
+    box.append(img);
+  }
+  return box;
+}
+
+function repoCardEl(repo, { busy, installed, onInstall }) {
+  const card = el('div', `ext-gh-card${installed ? ' installed' : ''}`);
+  card.append(avatarEl(repo));
+  const body = el('div', 'ext-gh-body');
+  const title = el('a', 'ext-gh-title');
+  title.href = repo.htmlUrl;
+  title.target = '_blank';
+  title.rel = 'noreferrer noopener';
+  title.title = `Open ${repo.fullName} on GitHub`;
+  if (repo.owner) title.append(el('span', 'ext-gh-owner', `${repo.owner} / `));
+  title.append(el('span', 'ext-gh-name', repo.name || repo.fullName));
+  body.append(title);
+  body.append(el('div', `ext-gh-desc${repo.description ? '' : ' empty'}`, repo.description || 'No description.'));
+  const meta = el('div', 'ext-gh-meta');
+  const stars = el('span', 'ext-gh-stars');
+  stars.innerHTML = STAR_ICON;
+  stars.append(el('span', null, compactCount(repo.stars)));
+  stars.title = `${repo.stars} star${repo.stars === 1 ? '' : 's'}`;
+  meta.append(stars);
+  if (repo.language) {
+    const lang = el('span', 'ext-gh-lang');
+    const dot = el('span', 'ext-gh-lang-dot');
+    dot.dataset.lang = repo.language;
+    lang.append(dot, el('span', null, repo.language));
+    meta.append(lang);
+  }
+  const ago = updatedAgoText(repo.pushedAt);
+  if (ago) meta.append(el('span', 'ext-gh-updated', ago));
+  body.append(meta);
+  card.append(body);
+
+  const action = el('div', 'ext-gh-action');
+  if (installed) {
+    const badge = el('span', 'ext-gh-installed');
+    badge.innerHTML = CHECK_ICON;
+    badge.append(el('span', null, 'Installed'));
+    action.append(badge);
+  } else {
+    const btn = el('button', 'ext-btn ext-btn-primary', 'Install…');
+    btn.type = 'button';
+    btn.disabled = busy;
+    btn.setAttribute('aria-label', `Install ${repo.fullName}`);
+    btn.addEventListener('click', () => onInstall?.(repo.cloneUrl));
+    action.append(btn);
+  }
+  card.append(action);
+  return card;
+}
+
+function skeletonCardEl() {
+  const card = el('div', 'ext-gh-card ext-gh-skeleton');
+  card.setAttribute('aria-hidden', 'true');
+  card.append(el('div', 'ext-gh-avatar'));
+  const body = el('div', 'ext-gh-body');
+  body.append(el('div', 'ext-gh-bar wide'), el('div', 'ext-gh-bar'), el('div', 'ext-gh-bar short'));
+  card.append(body);
+  return card;
+}
+
+// `browse` is `{ loading, error, repos }`, owned by app.js so a remount keeps
+// it. Installed repositories sink below the rest: the point of the list is
+// what you could add. The search box filters the fetched list in place — never
+// another GitHub search, which is rate limited per IP — and stays up through a
+// Refresh so typing there keeps focus.
+function githubBrowserEl({ browse, busy, installedOrigins = [], onInstall, onBrowse, query = '', onQuery }) {
+  const wrap = el('div', 'ext-gh');
+  const head = el('div', 'ext-gh-head');
+  const heading = el('div', 'ext-gh-heading');
+  heading.innerHTML = GITHUB_ICON;
+  heading.append(el('span', null, 'Browse GitHub'));
+  const repos = browse.repos || [];
+  if (!browse.loading && repos.length) heading.append(el('span', 'ext-gh-count', String(repos.length)));
+  head.append(heading);
+  const topic = el('a', 'ext-gh-topic', EXTENSION_TOPIC);
+  topic.href = `https://github.com/topics/${EXTENSION_TOPIC}`;
+  topic.target = '_blank';
+  topic.rel = 'noreferrer noopener';
+  topic.title = 'The GitHub topic this list is built from';
+  head.append(topic);
+  const refresh = el('button', 'ext-btn ext-btn-sm ext-gh-refresh');
+  refresh.type = 'button';
+  refresh.innerHTML = RESTART_ICON;
+  refresh.append(el('span', null, browse.loading ? 'Searching…' : 'Refresh'));
+  refresh.setAttribute('aria-label', 'Search GitHub again');
+  refresh.disabled = Boolean(browse.loading);
+  refresh.addEventListener('click', () => onBrowse?.());
+  head.append(refresh);
+  wrap.append(head);
+
+  const notice = el('div', 'ext-gh-notice');
+  notice.setAttribute('role', 'note');
+  notice.append(el('span', 'ext-gh-notice-lead', 'Community extensions are unvetted.'), document.createTextNode(` ${BROWSE_NOTICE}`));
+  wrap.append(notice);
+
+  let meta = null;
+  let applySearch = () => {};
+  if (repos.length) {
+    const row = el('div', 'ext-gh-search');
+    const field = el('div', 'ext-gh-search-field');
+    field.innerHTML = SEARCH_ICON;
+    const search = el('input', 'ext-gh-search-input');
+    search.type = 'text';
+    search.placeholder = 'Search tagged extensions';
+    search.setAttribute('aria-label', 'Search tagged extensions');
+    search.autocomplete = 'off';
+    search.value = query;
+    search.dataset.refocus = 'gh-search';
+    search.addEventListener('input', () => { applySearch(search.value); onQuery?.(search.value); });
+    field.append(search);
+    meta = el('span', 'ext-gh-search-meta');
+    row.append(field, meta);
+    wrap.append(row);
+  }
+
+  const list = el('div', 'ext-gh-list');
+  list.setAttribute('aria-busy', browse.loading ? 'true' : 'false');
+  if (browse.loading) {
+    for (let i = 0; i < 3; i += 1) list.append(skeletonCardEl());
+  } else if (browse.error) {
+    list.append(el('div', 'ext-gh-empty ext-gh-error', `Could not search GitHub: ${browse.error}`));
+  } else if (!repos.length) {
+    const empty = el('div', 'ext-gh-empty');
+    empty.append(el('div', 'ext-gh-empty-lead', 'Nothing tagged yet.'));
+    empty.append(el('div', null, `Add the ${EXTENSION_TOPIC} topic to a public extension repository to list it here.`));
+    list.append(empty);
+  } else {
+    const have = new Set(installedOrigins.map(normalizeRepoUrl));
+    const isInstalled = (r) => have.has(normalizeRepoUrl(r.htmlUrl));
+    const ordered = [...repos.filter((r) => !isInstalled(r)), ...repos.filter(isInstalled)];
+    const cards = ordered.map((repo) => {
+      const card = repoCardEl(repo, { busy, installed: isInstalled(repo), onInstall });
+      list.append(card);
+      return { card, text: [repo.owner, repo.name, repo.fullName, repo.description].filter(Boolean).join('\n').toLowerCase() };
+    });
+    const noMatch = el('div', 'ext-gh-empty ext-gh-no-match');
+    list.append(noMatch);
+    applySearch = (value) => {
+      const q = value.trim().toLowerCase();
+      let shown = 0;
+      for (const { card, text } of cards) {
+        card.hidden = Boolean(q) && !text.includes(q);
+        if (!card.hidden) shown += 1;
+      }
+      meta.textContent = q ? `${shown} of ${cards.length}` : '';
+      noMatch.hidden = shown > 0;
+      noMatch.textContent = '';
+      if (!shown) {
+        noMatch.append(el('div', 'ext-gh-empty-lead', `No tagged extension matches “${value.trim()}”.`));
+        noMatch.append(el('div', null, 'Try other words, or switch to Git URL to install it directly.'));
+      }
+    };
+    applySearch(query);
+  }
+  wrap.append(list);
+  return wrap;
 }
 
 // One row per declared setting, for ONE extension — the Settings section of
@@ -549,9 +850,9 @@ function defaultSettingsEl(entry, onSettingChange) {
 // The whole Extensions tab: a list pane (filter, Core and Installed groups,
 // "+ Add extension") beside a detail pane for the selected extension. Built as
 // one element per mount (settings.js's `extensionsBridge.mount`, and app.js on
-// every state change) rather than patched in place. Selection, the filter text
-// and the add form are the caller's state, passed back in, so a remount keeps
-// them.
+// every state change) rather than patched in place. Selection, the filter text,
+// the add pane's mode and search text are the caller's state, passed back in,
+// so a remount keeps them.
 //
 // `settingsEl(entry)` lets the caller supply the Settings section (app.js adds
 // the extension's own settings.panel contributions); without it the manifest
@@ -559,16 +860,18 @@ function defaultSettingsEl(entry, onSettingChange) {
 export function extensionsPanelEl({
   entries = [], statuses = {}, checking = false, progress = '', busy = false,
   pendingRemoval = [], pendingInstall = '', canRestart = false, restarting = false,
-  selectedId = '', filter = '', adding = false,
-  onSelect, onFilter, onAdd, onInstall, onUninstall, onUpdate, onUpdateAll,
-  onCheckUpdates, onRestart, onSettingChange, settingsEl,
+  selectedId = '', filter = '', adding = false, browse = null, addMode = 'browse', browseQuery = '',
+  onSelect, onFilter, onAdd, onAddMode, onBrowseQuery, onInstall, onBrowse, onUninstall, onUpdate, onUpdateAll,
+  onCheckUpdates, onRestart, onSettingChange, onAutoUpdate, settingsEl,
 } = {}) {
   const wrap = el('div', 'ext-split');
   const removing = new Set(pendingRemoval);
   const statusOf = (entry) => (checking && entry.external && entry.origin ? { checking: true } : statuses[entry.id]);
   const core = entries.filter((e) => !e.external);
   const installed = entries.filter((e) => e.external);
-  const selected = adding ? null : (entries.find((e) => e.id === selectedId) || entries[0] || null);
+  // Nothing selected (or the selection since uninstalled) shows the add pane,
+  // which is also where the tab opens.
+  const selected = adding ? null : (entries.find((e) => e.id === selectedId) || null);
 
   // ── List pane ──
   const list = el('div', 'ext-list');
@@ -634,7 +937,7 @@ export function extensionsPanelEl({
   applyFilter(filter);
   search.addEventListener('input', () => { applyFilter(search.value); onFilter?.(search.value); });
 
-  const add = el('button', `ext-btn ext-add-btn${adding ? ' selected' : ''}`, '+ Add extension');
+  const add = el('button', `ext-btn ext-add-btn${selected ? '' : ' selected'}`, '+ Add extension');
   add.type = 'button';
   add.addEventListener('click', () => onAdd?.());
   list.append(add);
@@ -653,7 +956,11 @@ export function extensionsPanelEl({
   if (notices.childNodes.length) detail.append(notices);
 
   if (adding || !selected) {
-    detail.append(addExtensionEl({ busy, onInstall }));
+    const installedOrigins = installed.map((e) => e.origin).filter(Boolean);
+    detail.append(addExtensionEl({
+      busy, onInstall, browse, installedOrigins, onBrowse,
+      addMode, onAddMode, query: browseQuery, onQuery: onBrowseQuery,
+    }));
   } else {
     const settings = settingsEl ? settingsEl(selected) : defaultSettingsEl(selected, onSettingChange);
     detail.append(extensionDetailEl(selected, {
@@ -661,24 +968,40 @@ export function extensionsPanelEl({
       pendingRemoval: removing.has(selected.id),
       settings,
       onUninstall,
+      onAutoUpdate,
     }));
   }
   wrap.append(detail);
   return wrap;
 }
 
-// The line an ext-check-updates reply (or the wait for one) adds to a row.
-// Nothing is fetched on a schedule, so this only ever appears around a press of
-// the button — which is why it is a per-row note rather than a badge the row is
-// built with, and why app.js clears the settled ones again after a few seconds:
-// "Up to date." describes a check that happened, not a standing property.
+// The line a check adds to a row: an ext-check-updates reply (or the wait for
+// one), or the core update tick's background check in Notify or Auto mode.
+// app.js clears Check all's settled ones again after a few seconds, since "Up
+// to date." describes a check that happened; the background result underneath
+// stands until the next tick replaces it.
 export function updateStatusText(status) {
   if (!status) return '';
   if (status.checking) return 'Checking…';
   if (!status.updatable) return 'No origin recorded — this one was placed here by hand, so there is nothing to check.';
   if (status.error) return `Could not reach the origin: ${status.error}`;
+  if (status.incompatible) return status.incompatible;
   if (!status.sha) return 'No installed commit recorded.';
-  return status.behind ? `A newer commit is available (${status.remoteSha.slice(0, 8)}).` : 'Up to date.';
+  if (!status.behind) return 'Up to date.';
+  const newer = `A newer commit is available (${status.remoteSha.slice(0, 8)}).`;
+  // Auto-update is on but left this one for the human, and says why.
+  return status.autoUpdateBlocked ? `${newer} Not updated automatically: ${status.autoUpdateBlocked}.` : newer;
+}
+
+// The consent modal's approve buttons. Updated code only loads on a restart,
+// so where the wrangler can restart itself an update's primary button does both
+// and `later` keeps the plain update; an install goes live without one.
+export function consentButtonLabels(payload, canRestart) {
+  if (payload.update && canRestart) {
+    return { ok: payload.reconsentNeeded ? 'Approve, update & restart' : 'Update & restart', later: 'Update without restarting' };
+  }
+  const ok = payload.reconsentNeeded ? (payload.update ? 'Approve & update' : 'Approve & install') : (payload.update ? 'Update' : 'Install');
+  return { ok, later: null };
 }
 
 // What the consent modal shows, in this order: the trust statement, then the
@@ -686,48 +1009,83 @@ export function updateStatusText(status) {
 // the caller's Approve/Cancel. An UPDATE shows CHANGES only — the decision on
 // an update is what changed, and the full list is noise that hides it.
 export function consentBodyEl(payload) {
-  const wrap = el('div', 'ext-consent');
+  return payload.update ? updateConsentEl(payload) : installConsentEl(payload);
+}
+
+function trustEl(lead) {
   const trust = el('div', 'ext-consent-trust');
   trust.setAttribute('role', 'note');
-  trust.append(el('div', 'ext-consent-trust-lead', payload.update
-    ? `Update ${payload.label || payload.id}?`
-    : `Install ${payload.label || payload.id}?`));
+  trust.append(el('div', 'ext-consent-trust-lead', lead));
   trust.append(el('div', 'ext-consent-trust-body', TRUST_STATEMENT));
-  wrap.append(trust);
+  return trust;
+}
 
+const NPM_SCRIPTS_NOTE = 'Dependencies are installed with npm install scripts disabled. That stops install-time hooks only — every dependency\'s code still runs inside the wrangler once the extension loads.';
+
+function installConsentEl(payload) {
+  const wrap = el('div', 'ext-consent');
+  wrap.append(trustEl(`Install ${payload.label || payload.id}?`));
   // The commit and author are dropped from the installed row but kept HERE: on
   // the row they were unactionable clutter, while this is the one screen where
   // "which code exactly, and whose" is the decision being made.
   const id = el('div', 'ext-consent-meta');
   if (payload.author) id.append(el('span', 'ext-row-author', payload.author));
   if (payload.sha) id.append(el('span', 'ext-row-sha', payload.sha.slice(0, 8)));
-  if (payload.update && payload.priorSha) id.append(el('span', 'ext-row-sha', `was ${payload.priorSha.slice(0, 8)}`));
   const home = originNode(payload.homepage);
   if (home) id.append(home);
   if (id.childNodes.length) wrap.append(id);
   if (payload.description) wrap.append(el('div', 'ext-row-desc', payload.description));
+  section(wrap, 'Capabilities requested', (payload.capabilities || []).length
+    ? capabilitiesEl(payload.capabilities)
+    : el('div', 'ext-consent-none', 'None — it asks the wrangler for nothing.'));
+  const deps = el('div');
+  if ((payload.dependencies || []).length) deps.append(chipsEl(payload.dependencies, 'ext-chip ext-chip-dep'));
+  deps.append(el('div', 'ext-consent-note', dependencyCountText(payload)));
+  section(wrap, 'Dependencies', deps);
+  wrap.append(el('div', 'ext-consent-note', NPM_SCRIPTS_NOTE));
+  return wrap;
+}
 
-  if (payload.update) {
-    const added = payload.addedCapabilities || [];
-    const removed = payload.removedCapabilities || [];
-    if (added.length || removed.length) {
-      section(wrap, 'Capabilities changed');
-      if (added.length) wrap.append(chipsEl(added.map((c) => `+ ${c}`), 'ext-chip ext-chip-add'));
-      if (removed.length) wrap.append(chipsEl(removed.map((c) => `− ${c}`), 'ext-chip ext-chip-remove'));
-    } else {
-      section(wrap, 'Capabilities unchanged', el('div', 'ext-consent-none', 'It asks for nothing it was not already granted.'));
+// An update is a decision about what CHANGED: the commits it brings in, then
+// any capability or dependency change. The trust statement and npm note were
+// read at install, so they come back only when the update asks for something
+// new and the consent itself is being re-made.
+function updateConsentEl(payload) {
+  const wrap = el('div', 'ext-consent');
+  const name = payload.label || payload.id;
+  // The modal title already says "Update extension"; the name rides on the sha line.
+  if (payload.reconsentNeeded) wrap.append(trustEl(`Update ${name}?`));
+  const id = el('div', 'ext-consent-meta');
+  if (!payload.reconsentNeeded) id.append(el('strong', null, name));
+  if (payload.priorSha) id.append(el('span', 'ext-row-sha', payload.priorSha.slice(0, 8)), document.createTextNode(' → '));
+  if (payload.sha) id.append(el('span', 'ext-row-sha', payload.sha.slice(0, 8)));
+  const home = originNode(payload.homepage);
+  if (home) id.append(home);
+  if (id.childNodes.length) wrap.append(id);
+
+  const commits = payload.commits || [];
+  if (commits.length) {
+    const list = el('ul', 'update-commits');
+    for (const { sha, subject } of commits) {
+      const item = el('li');
+      item.append(el('span', 'ext-row-sha', sha), document.createTextNode(` ${subject}`));
+      list.append(item);
     }
-    section(wrap, 'Dependencies changed', dependencyDiffEl(payload));
-  } else {
-    section(wrap, 'Capabilities requested', (payload.capabilities || []).length
-      ? capabilitiesEl(payload.capabilities)
-      : el('div', 'ext-consent-none', 'None — it asks the wrangler for nothing.'));
-    const deps = el('div');
-    if ((payload.dependencies || []).length) deps.append(chipsEl(payload.dependencies, 'ext-chip ext-chip-dep'));
-    deps.append(el('div', 'ext-consent-note', dependencyCountText(payload)));
-    section(wrap, 'Dependencies', deps);
+    if (payload.commitsTruncated) list.append(el('li', 'ext-consent-note', 'Older commits not shown.'));
+    section(wrap, `${commits.length}${payload.commitsTruncated ? '+' : ''} new commit${commits.length === 1 && !payload.commitsTruncated ? '' : 's'}`, list);
   }
-  wrap.append(el('div', 'ext-consent-note', 'Dependencies are installed with npm install scripts disabled. That stops install-time hooks only — every dependency\'s code still runs inside the wrangler once the extension loads.'));
+
+  const added = payload.addedCapabilities || [];
+  const removed = payload.removedCapabilities || [];
+  if (added.length || removed.length) {
+    section(wrap, 'Capabilities changed');
+    if (added.length) wrap.append(chipsEl(added.map((c) => `+ ${c}`), 'ext-chip ext-chip-add'));
+    if (removed.length) wrap.append(chipsEl(removed.map((c) => `− ${c}`), 'ext-chip ext-chip-remove'));
+  }
+  const depsChanged = (payload.addedCount ?? (payload.addedDependencies || []).length) || (payload.removedCount ?? (payload.removedDependencies || []).length);
+  if (depsChanged) section(wrap, 'Dependencies changed', dependencyDiffEl(payload));
+  if (!added.length && !removed.length && !depsChanged) wrap.append(el('div', 'ext-consent-none', 'No new capabilities or dependencies.'));
+  if (payload.reconsentNeeded) wrap.append(el('div', 'ext-consent-note', NPM_SCRIPTS_NOTE));
   return wrap;
 }
 

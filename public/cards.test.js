@@ -1,3 +1,6 @@
+import { setProviderMetadata } from './provider-metadata.js';
+import { registeredAgents, providerMetadata } from '../server/agents/index.js';
+setProviderMetadata(registeredAgents().map(providerMetadata));
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -5,7 +8,7 @@ import {
   STATUS_WORDS, PR_DOT_TITLE,
   linkChipsHtml, drawableLinks, visibleTaskLinkCount, sessionCardHtml, devcontainerChip, workerStatusWord, workerRowHtml,
   workflowBoxHtml, renderTileCards, snoozedRowHtml, taskBodyHostHtml,
-  tileHtml, ghostHtml, mailBadgeHtml, modelPillHtml, compactPillHtml, tokenChipHtml, cardPillHostHtml,
+  tileHtml, ghostHtml, mailBadgeHtml, mailBlockedHtml, modelPillHtml, compactPillHtml, tokenChipHtml, cardPillHostHtml,
   visibleSubAgents, SUBAGENT_RECENT_MS, subagentZoneHtml, subagentPillHtml, subagentRowHtml,
   subagentDividerHtml, CORE_CHIPS,
 } from './cards.js';
@@ -21,6 +24,7 @@ function ctx(over = {}) {
     selectedNewSlot: null,
     flashingPr: new Set(),
     collapsedWorkflows: new Set(),
+    collapsedSnoozed: new Set(),
     activitySortedTasks: new Set(),
     justFinished: new Set(),
     cardState: (s) => s.status || 'idle',
@@ -315,6 +319,28 @@ test('workerRowHtml: carries data-sid and the status word as the dot tooltip, no
   assert.doesNotMatch(html, /worker-status/);
 });
 
+test('workerRowHtml: a workflow-run child gets the violet wf-child box with the workflow symbol leading the row', () => {
+  const html = workerRowHtml(sess({ label: 'w', workflow: { phase: 'build' } }), ctx());
+  assert.match(html, /worker-row [^"]*wf-child/);
+  assert.ok(html.indexOf('wf-ico') < html.indexOf('worker-dot'), 'symbol comes before the status dot and name');
+  assert.doesNotMatch(html, />Workflow</);
+  assert.doesNotMatch(workerRowHtml(sess({ label: 'w' }), ctx()), /wf-child|wf-ico/);
+});
+
+test('renderTileCards: a full-view workflow-run child keeps the violet box and frame, without the Workflow header', () => {
+  const parent = sess({ sessionId: 'p1', label: 'parent' });
+  const child = sess({ sessionId: 'c1', label: 'run', parentSession: 'p1', childFullView: true, workflow: { phase: 'plan' } });
+  const html = renderTileCards([parent, child], ctx({ isChildFullView: (s) => s.childFullView === true }));
+  assert.match(html, /class="spine-full-row wf-child" data-child-sid="c1" data-depth="0" data-parent-sid="p1" draggable="true"><span class="wf-ico"/);
+  assert.match(html, /session-card [^"]*wf-orchestrator[^"]*" data-sid="c1"/);
+  assert.doesNotMatch(html, /wf-title/);
+});
+
+test('workerRowHtml: is its own drag unit, tagged with data-child-sid so app.js tells it from a top-level card', () => {
+  const html = workerRowHtml(sess({ label: 'w' }), ctx());
+  assert.match(html, /data-child-sid="s1" data-depth="0" data-parent-sid="" draggable="true"/);
+});
+
 test('workerRowHtml: renders a trailing worker-ring element as the halo — not row-level outline/box-shadow, which the join line paints over', () => {
   const html = workerRowHtml(sess({ label: 'w', status: 'working' }), ctx());
   assert.match(html, /<span class="worker-ring" aria-hidden="true"><\/span>\s*<\/div>$/);
@@ -325,6 +351,44 @@ test('workerRowHtml: marks selection like a top-level card, suppressed by a slot
   assert.match(selected, /worker-row [^"]*selected/);
   const slotted = workerRowHtml(sess(), ctx({ selectedSessionId: 's1', selectedNewSlot: 'adhoc' }));
   assert.doesNotMatch(slotted, /worker-row [^"]*\bselected\b/);
+});
+
+test('workerRowHtml: automatic completion keeps the done dot but suppresses its halo', () => {
+  const html = workerRowHtml(sess({ status: 'idle' }), ctx({
+    justFinished: new Set(['s1']),
+    cardState: () => 'just-finished',
+  }));
+  assert.match(html, /worker-row just-finished done-quiet/);
+  assert.match(html, /worker-dot" title="done"/);
+});
+
+test('workerRowHtml: manual unread keeps its halo even when the child also just finished', () => {
+  for (const justFinished of [new Set(), new Set(['s1'])]) {
+    const html = workerRowHtml(sess({ status: 'idle' }), ctx({
+      justFinished, unread: new Set(['s1']), cardState: () => 'just-finished',
+    }));
+    assert.match(html, /worker-row just-finished/);
+    assert.doesNotMatch(html, /done-quiet/);
+  }
+});
+
+test('workerRowHtml: completion suppression preserves selection and snooze alarms', () => {
+  const html = workerRowHtml(sess({ status: 'idle' }), ctx({
+    justFinished: new Set(['s1']), selectedSessionId: 's1',
+    cardState: () => 'just-finished snooze-alarm',
+  }));
+  assert.match(html, /worker-row just-finished snooze-alarm done-quiet selected/);
+});
+
+test('renderTileCards: full-view children retain their completion halo', () => {
+  const parent = sess({ sessionId: 'p1' });
+  const child = sess({ sessionId: 'c1', parentSession: 'p1', childFullView: true, status: 'idle' });
+  const html = renderTileCards([parent, child], ctx({
+    justFinished: new Set(['c1']),
+    cardState: (s) => s.sessionId === 'c1' ? 'just-finished' : 'working',
+  }));
+  assert.match(html, /session-card just-finished/);
+  assert.doesNotMatch(html, /done-quiet/);
 });
 
 test('workerRowHtml: cost renders as a card-tag pill with the dollar icon, matching the full card, codex still gets the ~ prefix', () => {
@@ -354,6 +418,8 @@ test('workerRowHtml: no links → no card-meta-links span', () => {
   assert.doesNotMatch(workerRowHtml(sess(), ctx()), /card-meta-links/);
 });
 
+const asRows = (sessions) => sessions.map((session, i) => ({ session, depth: 0, indent: 0, more: i < sessions.length - 1, guides: [] }));
+
 test('workflowBoxHtml: solo run shows no chevron and no spine', () => {
   const html = workflowBoxHtml(sess({ sessionId: 'orch' }), [], ctx());
   assert.match(html, /wf-count">solo/);
@@ -363,7 +429,7 @@ test('workflowBoxHtml: solo run shows no chevron and no spine', () => {
 
 test('workflowBoxHtml: workers render a spine; collapsed hides it but keeps the chevron', () => {
   const orch = sess({ sessionId: 'orch' });
-  const workers = [sess({ sessionId: 'w1', label: 'w1' }), sess({ sessionId: 'w2', label: 'w2' })];
+  const workers = asRows([sess({ sessionId: 'w1', label: 'w1' }), sess({ sessionId: 'w2', label: 'w2' })]);
   const open = workflowBoxHtml(orch, workers, ctx());
   assert.match(open, /wf-count">2 workers/);
   assert.match(open, /workflow-spine/);
@@ -434,38 +500,51 @@ test('renderTileCards: a solo parent (no children) is NOT wrapped in a .child-gr
   assert.doesNotMatch(html, /child-group/);
 });
 
-test('renderTileCards: a chained grandchild is never dropped — nesting is one level deep, so it promotes to its own top-level card', () => {
+test('renderTileCards: a grandchild draws inside its root\'s workflow spine, stepped in one level', () => {
   const orch = sess({ sessionId: 'orch', workflow: { issue: 'ENT-1' } });
   const worker = sess({ sessionId: 'w1', label: 'w1', parentSession: 'orch' });
   const grandchild = sess({ sessionId: 'gc1', label: 'gc1', parentSession: 'w1' });
   const html = renderTileCards([orch, worker, grandchild], ctx());
-  // w1 is absorbed into orch's box (unchanged).
   assert.equal(html.match(/data-sid="w1"/g).length, 1);
-  assert.match(html, /workflow-box/);
-  // gc1's immediate parent (w1) is itself nested, so gc1 renders as its own
-  // top-level card (not a compact worker-row) rather than being silently lost.
-  assert.equal(html.match(/data-sid="gc1"/g).length, 1);
+  assert.equal(html.match(/data-sid="gc1"/g).length, 1, 'gc1 renders exactly once, as a row — not promoted to a card');
   const gc1Row = html.split('\n').find((line) => line.includes('data-sid="gc1"'));
-  assert.match(gc1Row, /session-card/);
-  assert.doesNotMatch(gc1Row, /worker-row/);
+  assert.match(gc1Row, /worker-row/);
+  assert.match(gc1Row, /--indent:1/);
+  const w1Row = html.split('\n').find((line) => line.includes('data-sid="w1"'));
+  assert.doesNotMatch(w1Row, /--indent/);
+  assert.equal(html.match(/class="workflow-spine"/g).length, 1, 'one spine holds the whole subtree');
 });
 
-test('renderTileCards: a 3-level chain nests the great-grandchild under the (promoted) grandchild\'s own spine', () => {
-  const orch = sess({ sessionId: 'orch', workflow: { issue: 'ENT-1' } });
-  const worker = sess({ sessionId: 'w1', label: 'w1', parentSession: 'orch' });
-  const grandchild = sess({ sessionId: 'gc1', label: 'gc1', parentSession: 'w1' });
-  const greatGrandchild = sess({ sessionId: 'ggc1', label: 'ggc1', parentSession: 'gc1' });
-  const html = renderTileCards([orch, worker, grandchild, greatGrandchild], ctx());
-  // w1/ggc1 render exactly once — folded into a spine, only the compact row
-  // carries their data-sid. orch and gc1 are the two top-level parents here
-  // (gc1 promoted, plus its own child), so each carries its data-sid on BOTH
-  // the wrapper (.workflow-box / .child-group — the drag/reorder unit) and its
-  // nested, non-draggable card — the same split, deliberate for both.
-  for (const id of ['w1', 'ggc1']) {
-    assert.equal(html.match(new RegExp(`data-sid="${id}"`, 'g'))?.length, 1, `${id} should render exactly once`);
+test('renderTileCards: a deep chain under a plain parent is one flat spine, each row one level further in', () => {
+  const root = sess({ sessionId: 'r', label: 'r' });
+  const chain = [1, 2, 3].map((n) => sess({ sessionId: `c${n}`, label: `c${n}`, parentSession: n === 1 ? 'r' : `c${n - 1}` }));
+  const html = renderTileCards([root, ...chain], ctx());
+  assert.equal(html.match(/class="child-spine"/g).length, 1);
+  for (const [id, indent] of [['c1', null], ['c2', 1], ['c3', 2]]) {
+    const row = html.split('\n').find((line) => line.includes(`data-sid="${id}"`) && line.includes('worker-row'));
+    assert.match(row, indent == null ? /^(?!.*--indent)/ : new RegExp(`--indent:${indent}`));
   }
-  assert.equal(html.match(/data-sid="gc1"/g)?.length, 2, 'gc1 renders on both its .child-group wrapper and its nested card');
-  assert.match(html, /child-spine/); // ggc1 nests under gc1's own plain spine
+});
+
+test('renderTileCards: a sibling after a subtree keeps its trunk running through it, via spine-more and a guide', () => {
+  const root = sess({ sessionId: 'r', label: 'r' });
+  const a = sess({ sessionId: 'a', label: 'a', parentSession: 'r' });
+  const a1 = sess({ sessionId: 'a1', label: 'a1', parentSession: 'a' });
+  const b = sess({ sessionId: 'b', label: 'b', parentSession: 'r' });
+  const html = renderTileCards([root, a, a1, b], ctx());
+  const rowOf = (id) => html.split('\n').find((line) => line.includes(`data-sid="${id}"`) && line.includes('worker-row'));
+  assert.match(rowOf('a'), /spine-more/);
+  assert.match(rowOf('a1'), /spine-guide/);
+  assert.doesNotMatch(rowOf('b'), /spine-more/);
+});
+
+test('renderTileCards: a full-view child with children of its own is followed by their rows', () => {
+  const root = sess({ sessionId: 'r', label: 'r' });
+  const mid = sess({ sessionId: 'm', label: 'm', parentSession: 'r', childFullView: true });
+  const leaf = sess({ sessionId: 'l', label: 'l', parentSession: 'm' });
+  const html = renderTileCards([root, mid, leaf], ctx());
+  assert.match(html, /spine-full-row/);
+  assert.equal(html.match(/data-sid="l"/g).length, 1);
 });
 
 test('renderTileCards: a "full view" child (ctx.isChildFullView) draws a real .session-card in the spine, not a .worker-row', () => {
@@ -478,8 +557,10 @@ test('renderTileCards: a "full view" child (ctx.isChildFullView) draws a real .s
   const c1Row = html.split('\n').find((line) => line.includes('data-sid="c1"'));
   assert.match(c1Row, /session-card/);
   assert.doesNotMatch(c1Row, /worker-row/);
-  // Non-draggable — the enclosing .child-group is the actual drag unit.
+  // The card is non-draggable; its .spine-full-row wrapper is the child's own
+  // drag unit, so dragging it moves the child, not the whole parent group.
   assert.match(c1Row, /session-card [^"]*" data-sid="c1" draggable="false"/);
+  assert.match(html, /class="spine-full-row" data-child-sid="c1" data-depth="0" data-parent-sid="p1" draggable="true"/);
 });
 
 test('renderTileCards: a full-view child falls back to a compact row via the server-wide default when no per-session override is set', () => {
@@ -494,7 +575,7 @@ test('renderTileCards: a full-view child falls back to a compact row via the ser
 
 test('workflowBoxHtml: a full-view worker draws in the workflow spine too, wrapped the same way', () => {
   const orch = sess({ sessionId: 'orch' });
-  const workers = [sess({ sessionId: 'w1', label: 'w1', childFullView: true }), sess({ sessionId: 'w2', label: 'w2' })];
+  const workers = asRows([sess({ sessionId: 'w1', label: 'w1', childFullView: true }), sess({ sessionId: 'w2', label: 'w2' })]);
   const html = workflowBoxHtml(orch, workers, ctx());
   assert.match(html, /workflow-spine/);
   assert.match(html, /spine-full-row/);
@@ -570,6 +651,9 @@ test('tileHtml: carries the restored-task halo class only when this tile is the 
   assert.match(tileHtml(tile, ctx({ restoredTaskId: 'T1' })), /task-cell task-restored-flash"/);
   assert.doesNotMatch(tileHtml(tile, ctx({ restoredTaskId: 'T2' })), /task-restored-flash/);
   assert.doesNotMatch(tileHtml(tile, ctx()), /task-restored-flash/);
+  const notask = { kind: 'notask', col: 0, rowStart: 0, span: 1, sessions: [] };
+  assert.match(tileHtml(notask, ctx({ restoredTaskId: 'adhoc' })), /task-cell no-task task-restored-flash"/);
+  assert.doesNotMatch(tileHtml(notask, ctx({ restoredTaskId: 'T1' })), /task-restored-flash/);
 });
 
 test('tileHtml: both tile kinds carry the actions kebab (sort/focus/minimise/memory/delete now live in its menu)', () => {
@@ -588,6 +672,18 @@ test('tileHtml: asleep sessions sink under a snoozed divider', () => {
   const html = tileHtml(tile, ctx());
   assert.match(html, /snooze-divider/);
   assert.match(html, /snoozed-row/);
+});
+
+test('tileHtml: a collapsed snoozed block keeps the toggle pill but drops the rows', () => {
+  const tile = {
+    kind: 'task', col: 0, rowStart: 0, span: 1,
+    sessions: [sess({ sessionId: 'a', snooze: { until: 1 } })],
+    task: { id: 'T1', name: 'T', links: [] },
+  };
+  const html = tileHtml(tile, ctx({ collapsedSnoozed: new Set(['T1']) }));
+  assert.match(html, /snooze-toggle/);
+  assert.match(html, /data-tile="T1"/);
+  assert.doesNotMatch(html, /snoozed-row/);
 });
 
 test('ghostHtml: an empty grid cell renders the new-task drop target', () => {
@@ -701,16 +797,43 @@ test('sessionCardHtml: a card.cost ceiling reads $spent / $ceiling, even before 
 const chipKeys = (html) => [...html.matchAll(/data-chip="([^"]+)"/g)].map((m) => m[1]);
 
 test('the sample session renders every core chip, each keyed, and CORE_CHIPS matches the markup', () => {
-  const html = sessionCardHtml(SAMPLE_SESSION, ctx({ linkChip: () => null, isOnOlderCode: () => true }), { expanded: true });
+  const html = sessionCardHtml(SAMPLE_SESSION, ctx({ linkChip: () => null }), { expanded: true });
   assert.deepEqual(chipKeys(html), CORE_CHIPS.map((c) => c.key));
   assert.doesNotMatch(html, / hidden[ >]/);
 });
 
 test('ctx.hiddenChips hides exactly those keys, keeps the pill host, and keys the PR and extension link chips separately', () => {
   const hiddenChips = new Set(['core:cost', 'core:pr']);
-  const html = sessionCardHtml(SAMPLE_SESSION, ctx({ hiddenChips, isOnOlderCode: () => true }), { expanded: true });
+  const html = sessionCardHtml(SAMPLE_SESSION, ctx({ hiddenChips }), { expanded: true });
   const hidden = [...html.matchAll(/data-chip="([^"]+)" hidden/g)].map((m) => m[1]);
   assert.deepEqual(hidden, ['core:cost', 'core:pr']);
   assert.match(html, /<span class="card-meta-ext"><\/span>/);
   assert.match(html, /data-chip="jira:jira">/);
+});
+
+
+test('tileHtml: a drag placeholder preserves the tall task height', () => {
+  const html = tileHtml({ kind: 'placeholder', col: 0, rowStart: 1, span: 1, placeholderHeight: 617 }, ctx());
+  assert.match(html, /height:617px/);
+});
+
+test('tileHtml: a snoozed child is not listed under the snoozed divider with its snoozed parent', () => {
+  const tile = {
+    kind: 'task', col: 0, rowStart: 0, span: 1,
+    sessions: [
+      sess({ sessionId: 'p', snooze: { until: 1 } }),
+      sess({ sessionId: 'k', parentSession: 'p', snooze: { until: 1 } }),
+    ],
+    task: { id: 'T1', name: 'T', links: [] },
+  };
+  const html = tileHtml(tile, ctx());
+  assert.equal((html.match(/class="snoozed-row/g) || []).length, 1);
+  assert.match(html, /snoozed 1</);
+});
+
+test('mailBlockedHtml: only unread mail held by a draft shows the notice', () => {
+  assert.equal(mailBlockedHtml(sess({ mail: null })), '');
+  assert.equal(mailBlockedHtml(sess({ mail: { unread: 1 } })), '');
+  assert.equal(mailBlockedHtml(sess({ mail: { unread: 0, draftBlocked: true } })), '');
+  assert.match(mailBlockedHtml(sess({ mail: { unread: 1, draftBlocked: true } })), /Mail waiting: an unsent draft in the prompt box is blocking it/);
 });

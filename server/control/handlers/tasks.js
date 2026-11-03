@@ -31,25 +31,40 @@ export const taskRenameHandler = {
 // (matches exactly how the live board buckets a task's tile, see app.js's byTask);
 // a nested child that isn't itself assigned to this task is unaffected — it just
 // stops rendering nested and reappears as its own top-level card.
+// Shared with the `tasks:archive` host capability (server/index.js). Returns null
+// when there was nothing to archive (unknown or already archived).
+export async function archiveTaskCascade(taskId, ctx) {
+  if (!ctx.taskStore.archiveTask(taskId)) return null;
+  const { assignments } = ctx.taskStore.snapshot();
+  const sessionIds = Object.entries(assignments)
+    .filter(([, tid]) => tid === taskId)
+    .map(([sid]) => sid)
+    .filter((sid) => !ctx.sessionManager.isArchived(sid));
+  const { unclean } = await archiveCascade(sessionIds, ctx, { viaTaskArchive: taskId });
+  return { sessionIds, unclean };
+}
+
 export const taskArchiveHandler = {
   type: 'task-archive',
   async handler(msg, ctx) {
-    if (!ctx.taskStore.archiveTask(msg.taskId)) {
+    const result = await archiveTaskCascade(msg.taskId, ctx);
+    if (!result) {
       await ctx.rebuild();
       return;
     }
-    const { assignments } = ctx.taskStore.snapshot();
-    const sessionIds = Object.entries(assignments)
-      .filter(([, tid]) => tid === msg.taskId)
-      .map(([sid]) => sid)
-      .filter((sid) => !ctx.sessionManager.isArchived(sid));
-    const { unclean } = await archiveCascade(sessionIds, ctx, { viaTaskArchive: msg.taskId });
+    const { sessionIds, unclean } = result;
     ctx.reply({ type: 'task-archived', taskId: msg.taskId, unclean, archivedSessions: sessionIds.length });
     // Delayed like archive.js's own cascade rebuild: panes just got killed above,
     // so an immediate rebuild risks broadcasting a still-dying tree mid-teardown.
     setTimeout(() => ctx.rebuild().catch(() => {}), 600);
   },
 };
+
+export function cascadedSessionIds(taskId, sessionManager) {
+  return sessionManager.archivedEntries()
+    .filter((e) => e.viaTaskArchive === taskId)
+    .map((e) => e.sessionId);
+}
 
 export const taskUnarchiveHandler = {
   type: 'task-unarchive',
@@ -72,10 +87,7 @@ export const taskUnarchiveHandler = {
     // isn't double-resumed. Sequential, not parallel — mirrors archiveCascade's own
     // one-at-a-time teardown, avoiding a burst of simultaneous tmux launches.
     if (msg.restoreSessions) {
-      const cascaded = ctx.sessionManager.archivedEntries()
-        .filter((e) => e.viaTaskArchive === msg.taskId)
-        .map((e) => e.sessionId);
-      for (const sessionId of cascaded) {
+      for (const sessionId of cascadedSessionIds(msg.taskId, ctx.sessionManager)) {
         await resumeSession(sessionId, ctx);
       }
     }
@@ -110,7 +122,7 @@ export const taskAssignHandler = {
 export const taskReorderHandler = {
   type: 'task-reorder',
   async handler(msg, ctx) {
-    ctx.taskStore.reorderTask(msg.taskId, msg.targetId || null);
+    ctx.taskStore.reorderTask(msg.taskId, msg.targetId || null, { move: msg.mode === 'move', after: msg.after === true });
     await ctx.rebuild();
   },
 };

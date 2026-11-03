@@ -1,3 +1,4 @@
+import { providerMetadataFor } from './provider-metadata.js';
 // Inline SVG glyphs shared across the board UI. All theme via currentColor and
 // share the `.icon` sizing so a row of them reads at one weight (mixing these
 // with variable-width unicode/emoji looked ragged). Pure strings — this module
@@ -70,6 +71,9 @@ export const PROMOTE_ICON =
 // Lucide "link" — the Attach action (nest a session under another).
 export const ATTACH_ICON =
   '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>';
+// Lucide "search" — the add pane's search box over the GitHub browser.
+export const SEARCH_ICON =
+  '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>';
 // Lucide "chevron-right" — the disclosure arrow on a context-menu row that
 // opens a flyout submenu (e.g. "Attach to…") rather than running an action.
 export const CHEVRON_RIGHT_ICON =
@@ -152,8 +156,8 @@ const AGENT_ICONS = { claude: CLAUDE_ICON, codex: CODEX_ICON };
 // A mapping entry with no `agent` is Claude (the registry default); any unknown
 // agent falls back to the generic chip rather than masquerading as Claude.
 export function agentIcon(agent) {
-  if (!agent) return CLAUDE_ICON;
-  return AGENT_ICONS[agent] || AGENT_FALLBACK_ICON;
+  if (agent == null) return CLAUDE_ICON;
+  return AGENT_ICONS[providerMetadataFor(agent).presentation?.icon] || AGENT_FALLBACK_ICON;
 }
 
 // Lucide "copy" — two overlapping sheets; the copy-to-clipboard affordance.
@@ -163,3 +167,7 @@ export const COPY_ICON =
 // Lucide "settings" — the gear; identical to the nav-rail settings button's glyph.
 export const SETTINGS_ICON =
   '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>';
+
+// Lucide "star" — a GitHub repository's star count in the extension browser.
+export const STAR_ICON =
+  '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11.525 2.295a.53.53 0 0 1 .95 0l2.31 4.679a2.123 2.123 0 0 0 1.595 1.16l5.166.756a.53.53 0 0 1 .294.904l-3.736 3.638a2.123 2.123 0 0 0-.611 1.878l.882 5.14a.53.53 0 0 1-.771.56l-4.618-2.428a2.122 2.122 0 0 0-1.973 0L6.396 21.01a.53.53 0 0 1-.77-.56l.881-5.139a2.122 2.122 0 0 0-.611-1.879L2.16 9.795a.53.53 0 0 1 .294-.906l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z"/></svg>';

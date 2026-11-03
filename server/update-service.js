@@ -7,6 +7,41 @@ export class UpdateBusyError extends Error {
   }
 }
 
+const NOT_STARTED_BY_SERVICE = 'This wrangler was not started by the checkout service (scripts/wrangler-start.sh under launchd or systemd), which rolls back a failed update and installs new dependencies. Pull and restart it the way you launched it.';
+
+function managedReason(manager) {
+  if (manager === 'homebrew') return 'This install is managed by Homebrew. Update it with `brew upgrade agent-wrangler`, then `brew services restart agent-wrangler` if it runs as a service.';
+  return `This install is managed by ${manager}. Update it with ${manager}, not from the board.`;
+}
+
+function restartHint(manager) {
+  if (manager === 'homebrew') return 'If it runs as a service, restart it with `brew services restart agent-wrangler`. Otherwise stop and start it the way you launched it.';
+  return 'Stop and start it the way you launched it.';
+}
+
+// What the board is told about an upgrade that repointed AW_INSTALL_ROOT under
+// this running server (install-root.js installRootDrift), or null for none. The
+// hint is how to restart by hand, for a board that can't restart itself
+// (canRestart false); the client decides which of the two to offer.
+export function installDriftStatus(drift, { manager = null, runningVersion = null } = {}) {
+  return drift && { ...drift, runningVersion, restartHint: restartHint(manager) };
+}
+
+// What the board's Git updater may do in this process, decided once at startup.
+// `available` gates every check (manual or scheduled); `canApply` additionally
+// gates every apply, manual or automatic. Restart support is a separate
+// question: a supervised process can be restarted without being able to apply
+// an update, because applying one also needs a start path that rolls back a
+// failed update and syncs dependencies. Only scripts/wrangler-start.sh provides
+// that, and only it sets AW_GIT_UPDATES. A dev instance (AW_DEV) never applies,
+// whatever it inherited from the pane it was started in.
+export function updateSupport({ installManager = null, checkout = false, supervised = false, gitUpdates = false, dev = false } = {}) {
+  if (installManager) return { available: false, canApply: false, reason: managedReason(installManager) };
+  if (!checkout) return { available: false, canApply: false, reason: 'This install is not a Git checkout of agent-wrangler, so it cannot update from the board.' };
+  const canApply = supervised && gitUpdates && !dev;
+  return { available: true, canApply, reason: canApply ? null : NOT_STARTED_BY_SERVICE };
+}
+
 export function canAutoApply(status, rolledBack) {
   if (!status || status.behind <= 0 || status.blocked || !status.canApply) return false;
   return !(rolledBack && rolledBack.target === status.remote);
@@ -17,16 +52,39 @@ export function createUpdateService({
   apply = applyUpdate,
   writeMarker = writeRollbackMarker,
   clearMarker = clearRollbackMarker,
-  supervised = () => false,
+  support = { available: true, canApply: false, reason: NOT_STARTED_BY_SERVICE },
   mode = () => 'notify',
   isQuiet = () => true,
   rolledBack = null,
   onStatus = () => {},
+  // The one way out for a restart, called at most once per process: with the
+  // apply result after a wrangler update, or with `{ extensions }` (the ids
+  // auto-applied) when only extension updates are waiting to load.
   onApplied = () => {},
+  // Installed extensions ride the same tick, notify only unless an extension
+  // opted in to auto-update itself, in either mode (see
+  // extensions/update-check.js); this tick's Auto applies the wrangler only.
+  checkExtensions = null,
+  onExtensions = () => {},
+  // Whether anything brings this process back after it exits (restart.js
+  // restartSupported). Without it an auto-applied extension update loads
+  // whenever a human next restarts the wrangler.
+  canRestart = false,
+  // How long a restart waiting for the wrangler to go quiet sleeps between
+  // looks, and the timer it sleeps on (replaced in tests).
+  restartRetryMs = 60 * 1000,
+  later = (fn, ms) => { const t = setTimeout(fn, ms); t.unref?.(); return t; },
   log = () => {},
 } = {}) {
   let busy = false;
   let latest = null;
+  let latestExtensions = null;
+  let checkingExtensions = false;
+  // Ids of extensions auto-applied in this process: on disk, but the code
+  // running is still the old one until the restart.
+  const awaitingRestart = new Set();
+  let restartArmed = false;
+  let restartTimer = null;
 
   async function exclusive(fn) {
     if (busy) throw new UpdateBusyError();
@@ -35,17 +93,18 @@ export function createUpdateService({
   }
 
   function publish(status) {
-    latest = { ...status, canApply: supervised(), rolledBack, checkedAt: Date.now() };
+    latest = { ...status, canApply: support.canApply, rolledBack, checkedAt: Date.now() };
     onStatus(latest);
     return latest;
   }
 
-  const runCheck = () => exclusive(async () => publish(await check()));
+  const runCheck = () => exclusive(async () => {
+    if (!support.available) throw new Error(support.reason);
+    return publish(await check());
+  });
 
   const runApply = ({ automatic = false } = {}) => exclusive(async () => {
-    if (!supervised()) {
-      throw new Error('This wrangler was not started by a supervisor, so it cannot restart onto new code. Pull and restart it the way you launched it.');
-    }
+    if (!support.canApply) throw new Error(support.reason);
     let markerWritten = false;
     let result;
     try {
@@ -59,25 +118,70 @@ export function createUpdateService({
       return result;
     }
     log(`[agent-wrangler] ${automatic ? 'auto-updated' : 'updated from the board'} to ${result.head}; restarting`);
+    // The same restart loads any extension update waiting for one.
+    restartArmed = true;
     onApplied(result);
     return result;
   });
 
+  // An auto-applied extension update loads only at a restart, and gets one on
+  // the wrangler's own auto-apply terms: only where something brings the
+  // process back, and only while it is quiet. While it is not, the restart is
+  // kept pending and looked at again every `restartRetryMs` rather than at the
+  // next hourly tick. However many extensions are waiting, and whether or not
+  // a wrangler update restarts first, onApplied is called once.
+  function restartForExtensions() {
+    restartTimer = null;
+    if (restartArmed || !canRestart || awaitingRestart.size === 0) return;
+    if (busy || !isQuiet()) {
+      restartTimer = later(restartForExtensions, restartRetryMs);
+      return;
+    }
+    restartArmed = true;
+    const extensions = [...awaitingRestart];
+    log(`[agent-wrangler] auto-updated extension${extensions.length === 1 ? '' : 's'} ${extensions.join(', ')}; restarting to load ${extensions.length === 1 ? 'it' : 'them'}`);
+    onApplied({ extensions });
+  }
+
+  async function tickExtensions() {
+    if (!checkExtensions || checkingExtensions) return;
+    checkingExtensions = true;
+    try {
+      const { autoApplied = [], ...summary } = await checkExtensions();
+      for (const { id } of autoApplied) awaitingRestart.add(id);
+      latestExtensions = { ...summary, checkedAt: Date.now() };
+      onExtensions(latestExtensions);
+    } catch (err) {
+      log(`[agent-wrangler] extension update check failed: ${err?.message || err}`);
+    } finally {
+      checkingExtensions = false;
+    }
+  }
+
   async function tick() {
+    // An unavailable updater makes no check at all: a Notify or Auto mode
+    // carried over in config.json must not fetch, and must not log a failed
+    // check every interval.
+    if (!support.available) return null;
     const current = mode();
     if (current === 'off' || busy) return null;
-    let status;
+    let status = null;
     try {
       status = await runCheck();
     } catch (err) {
       log(`[agent-wrangler] update check failed: ${err?.message || err}`);
-      return null;
     }
-    if (current !== 'auto' || !canAutoApply(status, rolledBack) || !isQuiet()) return status;
+    // Before any auto-apply, which restarts the process.
+    await tickExtensions();
+    if (!status || current !== 'auto' || !canAutoApply(status, rolledBack) || !isQuiet()) {
+      if (!restartTimer) restartForExtensions();
+      return status;
+    }
     try {
       return await runApply({ automatic: true });
     } catch (err) {
       log(`[agent-wrangler] auto-update failed: ${err?.message || err}`);
+      if (!restartTimer) restartForExtensions();
       return null;
     }
   }
@@ -87,6 +191,8 @@ export function createUpdateService({
     apply: runApply,
     tick,
     latest: () => latest,
+    extensions: () => latestExtensions,
+    unavailable: () => (support.available ? null : support.reason),
     rolledBack: () => rolledBack,
   };
 }

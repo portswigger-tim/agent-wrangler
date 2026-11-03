@@ -1,3 +1,4 @@
+import { agentError } from '../agents/index.js';
 import { local } from './local.js';
 import { devcontainer } from './devcontainer.js';
 
@@ -14,11 +15,18 @@ import { devcontainer } from './devcontainer.js';
 //                `runtime === 'local' ? undefined : runtime`), so back-compat holds.
 //   label        (required) what the dispatch dialog's Runtime select shows, and
 //                what a refusal names the runtime by.
-//   wrapLaunch   async ({ inner, cwd, sessionId, worktree, workflow, launchContext })
+//   agents       (optional, default ['claude']) the agent ids that may run on it.
+//                Dispatch and spawn_session refuse any other agent, and the
+//                dialog disables the option for one. `local` takes every agent;
+//                devcontainer leaves it out, since its status and cost hooks read
+//                Claude paths. See runtimeAgentError.
+//   wrapLaunch   async ({ inner, cwd, sessionId, parentId, worktree, workflow, launchContext })
 //                → the command tmux actually runs. Receives the agent's already-built
 //                inner command and returns it decorated (local: identity;
 //                devcontainer: a `devcontainer up && docker cp && exec` script).
-//                `workflow` is absent on fork (forks don't carry it).
+//                `workflow` is absent on fork (forks don't carry it). `parentId` is
+//                present on fork ONLY: the parent card's id, so a runtime can find
+//                state it keyed by the parent (onFork fires after the launch).
 //   buildLaunch  async ({ phase, intent, cwd, sessionId, model, ext }) → the WHOLE
 //                pane command, replacing the agent adapter's (for a runtime whose
 //                agent is not a local process at all, e.g. a hand-off to a remote
@@ -39,6 +47,15 @@ import { devcontainer } from './devcontainer.js';
 //                runtime's own slice by its binding (null when none was sent), and
 //                the whole bag for a built-in. A runtime that doesn't care ignores
 //                them, as devcontainer does.
+//   validateModel (optional) async ({ agent, model, coreModelError }) → a human-facing
+//                error string, or null when `model` is acceptable. A runtime that
+//                defines it OWNS the model vocabulary for its sessions (Bifrost takes
+//                OpenAI ids the Claude adapter has never heard of): spawn_session
+//                skips core's per-agent model check, asks this instead, and hands the
+//                accepted model to the runtime as `ext.<extId>.model` rather than to
+//                the agent CLI's `--model`. `coreModelError(agent, model)` is core's own
+//                check, for a runtime that wants to accept the agent's models too.
+//                Absent ⇒ core validates against the agent's models as before.
 //   resumable    (optional, default true) false ⇒ resume and fork are refused up
 //                front (relaunchRefusal) and the graph tick never adopts a live
 //                conversation id for the card (noteLiveSessionId).
@@ -48,6 +65,12 @@ import { devcontainer } from './devcontainer.js';
 //                can't see it, e.g. devcontainer). A runtime whose transcript lands
 //                host-side (e.g. via a bind-mount) leaves this FALSE and keeps the
 //                guard — copying devcontainer's `true` blindly would drop protection.
+//   liveByTmux   (optional, default falsey) when true, an owned tmux that is alive
+//                but not discovered as an agent still reads as a LIVE card
+//                (state-reader's tmux-liveness fallback), as a buildLaunch runtime's
+//                always does. For a wrapLaunch runtime whose pane runs a wrapper that
+//                hides the agent from process discovery (e.g. `sbx exec … sh -lc`).
+//                Without it such a card reads as dormant while it runs.
 //   readLive     (optional) async ({ entry, tmuxName, socket }) → a live-status blob
 //                { liveSid, status, rawStatus, waitingFor, name, updatedAt } or null.
 //                Overrides the host liveState/pane-scrape when the status file is
@@ -55,6 +78,12 @@ import { devcontainer } from './devcontainer.js';
 //   analyze      (optional) async ({ entry, liveSid }) → a cost/token enrichment or
 //                null. Overrides host transcript costing when the transcript is
 //                in-container. Absent ⇒ state-reader costs the host transcript.
+//   cost         (optional) async ({ entry, liveSid }) → { usd } or null. A finite,
+//                non-negative `usd` replaces ONLY the card's `usd` (after analyze /
+//                transcript costing); tokens, subAgents, lastActivity etc. stand.
+//                null, a throw or an off-shape answer keeps the transcript figure.
+//                Called on every graph tick for every live and dormant card on the
+//                runtime, so it must be cheap (cache per tick).
 //   deliver      (optional) async ({ entry, from, text }) → { ok: true } |
 //                { ok: false, error } — how a peer message (send_message) reaches a
 //                card whose agent has no local pane to paste into. `from` is the
@@ -63,6 +92,15 @@ import { devcontainer } from './devcontainer.js';
 //                agent has no wrangler MCP to reply with). A runtime with `deliver` stores its cards as
 //                `mailCapable: false`, so send_message routes them here (see
 //                mcp/tools/send-message.js).
+//   launchStatus (optional) ({ entry }) → { state, error?, url? } or null —
+//                whether the card's launch got its agent running, for a runtime
+//                whose launch can fail AFTER dispatch has returned (a hand-off to a
+//                remote service that refuses it). `state` is 'pending' (no outcome
+//                yet), 'ok', 'failed' (with `error`, the human-facing reason) or
+//                'unknown' (the runtime gave up watching). Must be cheap: spawn_session
+//                polls it for a few seconds so the caller learns a failed launch in
+//                the tool result, and list_sessions reads it for every row.
+//                Normalised by launch-status.js. Absent ⇒ no row says anything.
 //
 // Per-runtime POLICY (comms severing, teardown timing) is deliberately NOT in the
 // contract yet: no current runtime needs it, so adding it now would be dead code.
@@ -121,12 +159,32 @@ export function findRuntime(id) {
 }
 
 // Every runtime a dispatch can name right now, for spawn_session's validation
-// (and its error, which lists them). `extId` only on an extension's.
+// (and its error, which lists them). `agents` is runtimeAgents' answer (null
+// for local); `extId` only on an extension's.
 export function knownRuntimes() {
   return [
-    ...ALL.map(({ id, label }) => ({ id, label })),
-    ...[...registered.values()].map(({ id, label, extId }) => ({ id, label, extId })),
+    ...ALL.map((rt) => ({ id: rt.id, label: rt.label, agents: runtimeAgents(rt) })),
+    ...[...registered.values()].map((rt) => ({ id: rt.id, label: rt.label, agents: runtimeAgents(rt), extId: rt.extId })),
   ];
+}
+
+// The agents a runtime takes: null for local (every agent), else its own
+// `agents`, defaulting to Claude-only — the one agent every runtime before the
+// field existed was built and tested for.
+export function runtimeAgents(rt) {
+  if (!rt || rt === local) return null;
+  return Array.isArray(rt.agents) ? rt.agents : ['claude'];
+}
+
+// Null when `agent` may run on `rt`, else the human-facing refusal. Checked by
+// dispatch itself, so a stale dialog selection, a schedule or a scripted
+// request can't bypass what the dialog's Runtime select disables.
+export function runtimeAgentError(rt, agent = 'claude') {
+  const invalid = agentError(agent);
+  if (invalid) return invalid;
+  const agents = runtimeAgents(rt);
+  if (!agents || agents.includes(agent)) return null;
+  return `The "${rt.label || rt.id}" runtime can't run ${agent} sessions (it supports: ${agents.join(', ')}).`;
 }
 
 // Null when a resume or fork of this card may proceed, else the human-facing

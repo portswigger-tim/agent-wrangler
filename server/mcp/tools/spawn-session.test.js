@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { adapterFor } from '../../agents/index.js';
 import { spawnSessionTool } from './spawn-session.js';
 import { registerRuntime, unregisterRuntimesFor } from '../../runtimes/index.js';
 
@@ -49,12 +50,84 @@ test('spawn_session passes a registered extension runtime through to dispatch', 
   }
 });
 
+test('spawn_session asks a runtime that owns its models, and hands the model over as ext', async () => {
+  const seen = [];
+  registerRuntime({
+    id: 'toyrt', label: 'Toy', wrapLaunch: async ({ inner }) => inner,
+    validateModel: ({ agent, model, coreModelError }) => { seen.push({ agent, model, core: typeof coreModelError }); return model === 'bad' ? 'Toy: no such model' : null; },
+  }, 'toy');
+  try {
+    const d = deps();
+    const out = await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, { intent: 'x', runtime: 'toyrt', model: 'gpt-6-sol' });
+    assert.equal(out.isError, undefined);
+    assert.deepEqual(seen, [{ agent: 'claude', model: 'gpt-6-sol', core: 'function' }]);
+    assert.deepEqual(d.calls.dispatch[0].ext, { toy: { model: 'gpt-6-sol' } });
+    assert.equal(d.calls.dispatch[0].model, undefined);
+
+    const bad = deps();
+    const refused = await spawnSessionTool.handler({ deps: bad, caller: 'CARD1' }, { intent: 'x', runtime: 'toyrt', model: 'bad' });
+    assert.equal(refused.isError, true);
+    assert.equal(refused.content[0].text, 'Toy: no such model');
+    assert.equal(bad.calls.dispatch.length, 0);
+
+    // No model given: the caller's own model is not inherited into a runtime that owns its own.
+    const none = deps();
+    await spawnSessionTool.handler({ deps: none, caller: 'CARD1' }, { intent: 'x', runtime: 'toyrt' });
+    assert.equal(none.calls.dispatch[0].model, undefined);
+    assert.equal(none.calls.dispatch[0].ext, undefined);
+  } finally {
+    unregisterRuntimesFor('toy');
+  }
+});
+
+test('spawn_session still checks the agent\'s models for a runtime without validateModel', async () => {
+  registerRuntime({ id: 'toyrt', label: 'Toy', wrapLaunch: async ({ inner }) => inner }, 'toy');
+  try {
+    const d = deps();
+    const out = await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, { intent: 'x', runtime: 'toyrt', model: 'gpt-6-sol' });
+    assert.equal(out.isError, true);
+    assert.equal(d.calls.dispatch.length, 0);
+  } finally {
+    unregisterRuntimesFor('toy');
+  }
+});
+
 test('spawn_session refuses an unknown runtime, listing the known ones, without dispatching', async () => {
   const d = deps();
   const out = await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, { intent: 'x', runtime: 'toyrt' });
   assert.equal(out.isError, true);
   assert.equal(out.content[0].text, 'Unknown runtime "toyrt". Known runtimes: local, devcontainer.');
   assert.equal(d.calls.dispatch.length, 0);
+});
+
+test('spawn_session refuses an agent the runtime does not list, without dispatching', async () => {
+  const d = deps();
+  const out = await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, { intent: 'x', runtime: 'devcontainer', agent: 'codex' });
+  assert.equal(out.isError, true);
+  assert.equal(out.content[0].text, 'The "Devcontainer" runtime can\'t run codex sessions (it supports: claude).');
+  registerRuntime({ id: 'toyrt', label: 'Toy', agents: ['codex'], wrapLaunch: async ({ inner }) => inner }, 'toy');
+  try {
+    const claude = await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, { intent: 'x', runtime: 'toyrt' });
+    assert.equal(claude.content[0].text, 'The "Toy" runtime can\'t run claude sessions (it supports: codex).');
+    assert.equal(d.calls.dispatch.length, 0);
+    const codex = await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, { intent: 'x', runtime: 'toyrt', agent: 'codex' });
+    assert.equal(codex.isError, undefined);
+    assert.equal(d.calls.dispatch[0].runtime, 'toyrt');
+  } finally {
+    unregisterRuntimesFor('toy');
+  }
+});
+
+test('spawn_session\'s runtime description names the runtimes registered when it is read', () => {
+  const describe = () => spawnSessionTool.inputSchema.runtime.description;
+  assert.equal(describe(), 'Where the new session runs. Valid values — `local` (default), `devcontainer`.');
+  registerRuntime({ id: 'toyrt', label: 'Toy', wrapLaunch: async ({ inner }) => inner }, 'toy');
+  try {
+    assert.equal(describe(), 'Where the new session runs. Valid values — `local` (default), `devcontainer`, `toyrt` (extension).');
+  } finally {
+    unregisterRuntimesFor('toy');
+  }
+  assert.equal(describe(), 'Where the new session runs. Valid values — `local` (default), `devcontainer`.');
 });
 
 test('spawn_session with no runtime stays local (dispatch default)', async () => {
@@ -74,6 +147,7 @@ test('spawn_session joins the caller’s current task by default', async () => {
   assert.deepEqual(d.calls.assign, [{ sid: 'NEWCARD', taskId: 'T1' }]);
   assert.equal(d.calls.rebuild, 1);
   assert.equal(out.structuredContent.sessionId, 'NEWCARD');
+  assert.equal(out.structuredContent.link, '#session=NEWCARD');
   assert.deepEqual(out.structuredContent.task, { id: 'T1', name: 'Login' });
   assert.equal(out.content[0].type, 'text');
 });
@@ -118,12 +192,12 @@ test('spawn_session falls back to Ad-hoc for a null caller with no `into`', asyn
 test('spawn_session passes agent, model, cwd and worktree options through to dispatch', async () => {
   const d = deps();
   await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, {
-    intent: 'x', agent: 'codex', model: 'gpt-5.5', cwd: '/repo',
+    intent: 'x', agent: 'codex', model: 'gpt-6-sol', cwd: '/repo',
     worktree: true, worktree_branch: 'feat', worktree_folder_name: 'wt', worktree_auto: true,
   });
   const opts = d.calls.dispatch[0];
   assert.equal(opts.agent, 'codex');
-  assert.equal(opts.model, 'gpt-5.5');
+  assert.equal(opts.model, 'gpt-6-sol');
   assert.equal(opts.cwd, '/repo');
   assert.equal(opts.worktree, true);
   assert.equal(opts.worktreeBranch, 'feat');
@@ -219,16 +293,11 @@ test('spawn_session tags parentSession = caller only when nest: true is explicit
   assert.equal(d.calls.dispatch[0].workflow, undefined); // never sets workflow — orchestrator-only
 });
 
-// Nesting only ever renders one level deep — CARD1 is already nested under
-// ORCH here, so nesting a new spawn under CARD1 would land it at depth 2,
-// which the board can't draw. Refused before dispatch, not silently chained.
-test('spawn_session refuses nest:true when the caller is itself already nested (would create depth 2)', async () => {
+test('spawn_session nests under a caller that is itself already nested (no depth limit)', async () => {
   const d = deps({ entries: { CARD1: { agent: 'claude', model: 'sonnet', parentSession: 'ORCH' } } });
   const out = await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, { intent: 'x', nest: true });
-  assert.equal(out.isError, true);
-  assert.match(out.content[0].text, /itself nested/);
-  assert.equal(d.calls.dispatch.length, 0);
-  assert.equal(d.calls.rebuild, 0);
+  assert.notEqual(out.isError, true);
+  assert.equal(d.calls.dispatch[0].parentSession, 'CARD1');
 });
 
 test('spawn_session sets no parentSession for a null caller, even with nest: true (nothing to nest under)', async () => {
@@ -311,4 +380,148 @@ test('spawn_session still inherits a caller model the adapter no longer offers',
 
   assert.equal(out.isError, undefined);
   assert.equal(d.calls.dispatch[0].model, 'opus-legacy');
+});
+
+// A cloud-like runtime whose launch outcome arrives after dispatch returns.
+function withLaunchRuntime(launchStatus, fn) {
+  registerRuntime({ id: 'toyrt', label: 'Toy', wrapLaunch: async ({ inner }) => inner, launchStatus }, 'toy');
+  return fn().finally(() => unregisterRuntimesFor('toy'));
+}
+const launchDeps = () => deps({
+  entries: { CARD1: { agent: 'claude', model: 'sonnet' }, NEWCARD: { runtime: 'toyrt' } },
+  deps: { launchWait: { sleep: async () => {} } },
+});
+
+test('spawn_session returns a failed launch as an error that keeps the new session id', () => withLaunchRuntime(
+  () => ({ state: 'failed', error: 'no GitHub remote was detected' }),
+  async () => {
+    const out = await spawnSessionTool.handler({ deps: launchDeps(), caller: 'CARD1' }, { intent: 'x', runtime: 'toyrt' });
+    assert.equal(out.isError, true);
+    assert.match(out.content[0].text, /^The session was created but its launch failed: no GitHub remote was detected/);
+    assert.equal(out.structuredContent.sessionId, 'NEWCARD');
+    assert.deepEqual(out.structuredContent.launch, { state: 'failed', error: 'no GitHub remote was detected' });
+  },
+));
+
+test('spawn_session waits for a pending launch and reports the outcome', () => {
+  let calls = 0;
+  return withLaunchRuntime(
+    () => (++calls < 3 ? { state: 'pending' } : { state: 'ok', url: 'https://claude.ai/code/session_1' }),
+    async () => {
+      const out = await spawnSessionTool.handler({ deps: launchDeps(), caller: 'CARD1' }, { intent: 'x', runtime: 'toyrt' });
+      assert.equal(out.isError, undefined);
+      assert.deepEqual(out.structuredContent.launch, { state: 'ok', url: 'https://claude.ai/code/session_1' });
+      assert.equal(calls, 3);
+    },
+  );
+});
+
+test('spawn_session with wait: false does not ask the runtime', () => {
+  let asked = false;
+  return withLaunchRuntime(
+    () => { asked = true; return { state: 'failed', error: 'x' }; },
+    async () => {
+      const out = await spawnSessionTool.handler({ deps: launchDeps(), caller: 'CARD1' }, { intent: 'x', runtime: 'toyrt', wait: false });
+      assert.equal(out.isError, undefined);
+      assert.equal(out.structuredContent.launch, undefined);
+      assert.equal(asked, false);
+    },
+  );
+});
+
+test('spawn_session on a runtime without launchStatus has no launch field', async () => {
+  const d = deps({ entries: { CARD1: { agent: 'claude' }, NEWCARD: {} } });
+  const out = await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, { intent: 'x' });
+  assert.equal(out.structuredContent.launch, undefined);
+});
+
+test('spawn_session validates permission_mode before dispatch and passes valid modes', async () => {
+  for (const permission_mode of ['auto', 'manual', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions']) {
+    const d = deps();
+    const out = await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, { intent: 'x', permission_mode });
+    assert.equal(out.isError, undefined);
+    assert.equal(d.calls.dispatch[0].permissionMode, permission_mode);
+  }
+  for (const args of [{ permission_mode: 'invalid' }, { permission_mode: 'default' }, { agent: 'codex', permission_mode: 'bypassPermissions' }]) {
+    const d = deps();
+    const out = await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, { intent: 'x', ...args });
+    assert.equal(out.isError, true);
+    assert.match(out.content[0].text, /permission mode/i);
+    assert.equal(d.calls.dispatch.length, 0);
+  }
+  const d = deps();
+  await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, { intent: 'x', agent: 'codex', permission_mode: 'auto' });
+  assert.equal(d.calls.dispatch.length, 1);
+});
+
+test('spawn_session rejects a non-auto permission mode for a runtime supplying its own command', async () => {
+  registerRuntime({ id: 'permission-cloud', label: 'Cloud', resumable: false, buildLaunch: async () => '' }, 'permission-cloud');
+  try {
+    const d = deps();
+    const out = await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, { intent: 'x', runtime: 'permission-cloud', permission_mode: 'bypassPermissions' });
+    assert.equal(out.isError, true);
+    assert.match(out.content[0].text, /own launch command/);
+    assert.equal(d.calls.dispatch.length, 0);
+  } finally {
+    unregisterRuntimesFor('permission-cloud');
+  }
+});
+
+for (const [label, callerAgent, agent] of [
+  ['explicit Claude', 'claude', 'claude'],
+  ['default Claude', 'claude', undefined],
+  ['default Claude from a Codex caller', 'codex', undefined],
+]) {
+  test(`spawn_session Remote Control reaches dispatch for ${label}`, async () => {
+    const d = deps({ entries: { CARD1: { agent: callerAgent, model: callerAgent === 'codex' ? 'gpt-6-sol' : 'sonnet', effort: callerAgent === 'codex' ? 'ultra' : 'high' } } });
+    const out = await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, { intent: 'x', agent, remote_control: ' Phone ' });
+    assert.equal(out.isError, undefined);
+    assert.equal(d.calls.dispatch[0].agent, 'claude');
+    assert.deepEqual(d.calls.dispatch[0].remoteControl, { name: 'Phone' });
+    assert.equal(d.calls.dispatch[0].model, callerAgent === 'codex' ? undefined : 'sonnet');
+    assert.equal(d.calls.dispatch[0].effort, callerAgent === 'codex' ? undefined : 'high');
+  });
+}
+
+test('spawn_session omitted remote_control is absent even when the caller has Remote Control', async () => {
+  const d = deps({ entries: { CARD1: { agent: 'claude', remoteControl: { name: 'Parent phone' } } } });
+  const out = await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, { intent: 'x' });
+  assert.equal(out.isError, undefined);
+  assert.equal('remoteControl' in d.calls.dispatch[0], false);
+});
+
+for (const remote_control of ['', '  ', 'a\nb', 'a\rb', 'a\tb', 'a\x00b', 'a\x7fb', ' --help', null, 42, {}]) {
+  test(`spawn_session refuses invalid remote_control ${JSON.stringify(remote_control)} without dispatch/assign/rebuild`, async () => {
+    const d = deps();
+    const out = await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, { intent: 'x', remote_control });
+    assert.equal(out.isError, true);
+    assert.match(out.content[0].text, /remote_control/);
+    assert.deepEqual(d.calls, { dispatch: [], assign: [], rebuild: 0 });
+  });
+}
+
+for (const agent of ['codex', 'future-agent']) {
+  test(`spawn_session Remote Control names unsupported agent ${agent} without dispatch/assign/rebuild`, async () => {
+    const d = deps();
+    const out = await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, { intent: 'x', agent, remote_control: 'Phone', worktree: true, cwd: '/no/such/repo' });
+    assert.equal(out.isError, true);
+    assert.match(out.content[0].text, new RegExp(agent));
+    assert.match(out.content[0].text, /does not support Remote Control/);
+    assert.deepEqual(d.calls, { dispatch: [], assign: [], rebuild: 0 });
+  });
+}
+
+test('spawn_session Remote Control refuses default Claude with missing capability before dispatch/assign/rebuild', async () => {
+  const adapter = adapterFor('claude');
+  const prev = adapter.supportsRemoteControl;
+  delete adapter.supportsRemoteControl;
+  try {
+    const d = deps();
+    const out = await spawnSessionTool.handler({ deps: d, caller: 'CARD1' }, { intent: 'x', remote_control: 'Phone' });
+    assert.equal(out.isError, true);
+    assert.match(out.content[0].text, /claude.*does not support Remote Control/);
+    assert.deepEqual(d.calls, { dispatch: [], assign: [], rebuild: 0 });
+  } finally {
+    adapter.supportsRemoteControl = prev;
+  }
 });

@@ -1,3 +1,4 @@
+import { collectLaunchContext } from './launch-context.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -151,7 +152,7 @@ test('forkEntry: inherits parent intent/model, records provenance, no custom nam
   assert.deepEqual(entry, {
     short: 'abcd1234', tmux: 'cc_abcd1234', cwd: '/repo',
     agent: 'claude',
-    intent: 'fix the bug', name: undefined, model: 'sonnet',
+    intent: 'fix the bug', name: undefined, model: 'sonnet', permissionMode: 'auto',
     createdAt: 123, forkedFrom: 'parent-O', liveSessionId: undefined, runtime: undefined, runtimeExt: undefined,
     mailCapable: true,
   });
@@ -160,6 +161,11 @@ test('forkEntry: inherits parent intent/model, records provenance, no custom nam
 test('forkEntry inherits the parent auto-compaction threshold', () => {
   const entry = forkEntry({ short: 'x', tmux: 'cc_x', cwd: '/c', parentEntry: { autoCompactTokens: 250000 }, parentId: 'p', createdAt: 1 });
   assert.equal(entry.autoCompactTokens, 250000);
+});
+
+test('forkEntry never inherits Remote Control: two sessions under one name would race for the phone', () => {
+  const entry = forkEntry({ short: 'x', tmux: 'cc_x', cwd: '/c', parentEntry: { remoteControl: { name: 'Phone' } }, parentId: 'p', createdAt: 1 });
+  assert.equal('remoteControl' in entry, false);
 });
 
 test('forkEntry: a provided title sets a trimmed custom name', () => {
@@ -341,7 +347,7 @@ test('resumeLaunchPlan: transcript found but launch dir unknown falls back to th
   );
 });
 
-test('resumeEntry carries workflow, worktree, forkedFrom, spawnedBy, parentSession, links, PR-automation toggles, childFullView, and nameInherited across the rebuild', () => {
+test('resumeEntry carries workflow, worktree, forkedFrom, spawnedBy, parentSession, links, PR-automation toggles, childFullView, offBoard, and nameInherited across the rebuild', () => {
   const prev = {
     intent: 'fix', name: 'My run', model: 'sonnet', createdAt: 100,
     forkedFrom: 'P', spawnedBy: 'SPAWNER1',
@@ -353,7 +359,9 @@ test('resumeEntry carries workflow, worktree, forkedFrom, spawnedBy, parentSessi
     autoFixPrChecks: false,
     autoMergeOnPass: true,
     childFullView: true,
+    offBoard: 'jobs',
     autoCompactTokens: 250000,
+    remoteControl: { name: 'Phone' },
     nameInherited: true,
     priorLiveSessionIds: ['CLEARED1'],
   };
@@ -371,7 +379,9 @@ test('resumeEntry carries workflow, worktree, forkedFrom, spawnedBy, parentSessi
   assert.equal(e.autoFixPrChecks, false); // an explicit opt-out must not silently revert to the on-default
   assert.equal(e.autoMergeOnPass, true); // ditto for an explicit opt-in surviving a workflow run's idle-suspend
   assert.equal(e.childFullView, true); // ditto for a child's full-view override
+  assert.equal(e.offBoard, 'jobs'); // an extension-hosted card must not land on the board after resume
   assert.equal(e.autoCompactTokens, 250000);
+  assert.deepEqual(e.remoteControl, { name: 'Phone' }); // every relaunch must pass --remote-control again
   assert.equal(e.nameInherited, true); // the [FORK] marker must survive on a still-unnamed fork
   assert.equal(e.liveSessionId, 'L');
   assert.equal(e.intent, 'fix');
@@ -467,6 +477,117 @@ test('reconcileExitedSessions leaves a pane that died right after its resume for
   sm.killForSession = async () => { throw new Error('must not kill'); };
   assert.deepEqual(await sm.reconcileExitedSessions(), []);
   assert.equal(sm.isArchived('s1'), false);
+});
+
+for (const [label, relaunchedAt] of [['fresh dispatch', undefined], ['resume outside startup grace', 4_820_000]]) {
+  test(`reconcileExitedSessions preserves a completed Codex update after ${label}`, async () => {
+    const sm = new SessionManager();
+    sm._save = () => {};
+    sm.map.set('s1', { tmux: 'cx_update', agent: 'codex', socket: 'update-test', relaunchedAt });
+    sm.dead = new Set(['cx_update']);
+    sm.deadStatus = new Map([['cx_update', 0]]);
+    sm.deadTime = new Map([['cx_update', 5_000_000]]);
+    sm._tmux = async (socket, args) => {
+      assert.equal(socket, 'update-test');
+      assert.equal(args[0], 'capture-pane');
+      assert.equal(args[args.indexOf('-t') + 1], 'cx_update');
+      return { stdout: '🎉 Update ran successfully! Please restart Codex.\nPane is dead (status 0, Thu Oct 8 10:19:02 2026)' };
+    };
+    const killed = [];
+    sm.killForSession = async (id) => { killed.push(id); return ['cx_update']; };
+    assert.deepEqual(await sm.reconcileExitedSessions(), []);
+    assert.equal(sm.isArchived('s1'), false);
+    assert.equal(sm.deadTmuxNameFor('s1'), 'cx_update');
+    assert.deepEqual(killed, []);
+  });
+}
+
+test('reconcileExitedSessions preserves recognized updater output with a custom dead-pane trailer', async () => {
+  const sm = new SessionManager();
+  sm._save = () => {};
+  sm.map.set('s1', { tmux: 'cx_update', agent: 'codex' });
+  sm.dead = new Set(['cx_update']);
+  sm.deadStatus = new Map([['cx_update', 0]]);
+  sm._tmux = async () => ({ stdout: 'Updating Codex via `brew upgrade --cask codex`...\n🎉 Update ran successfully! Please restart Codex.\nProcess finished (exit 0)' });
+  sm.killForSession = async () => { throw new Error('must not kill'); };
+  assert.deepEqual(await sm.reconcileExitedSessions(), []);
+  assert.equal(sm.isArchived('s1'), false);
+  assert.equal(sm.deadTmuxNameFor('s1'), 'cx_update');
+});
+
+test('reconcileExitedSessions still archives an ordinary clean Codex exit', async () => {
+  const sm = new SessionManager();
+  sm._save = () => {};
+  sm.map.set('s1', { tmux: 'cx_exit', agent: 'codex', socket: 'exit-test' });
+  sm.dead = new Set(['cx_exit']);
+  sm.deadStatus = new Map([['cx_exit', 0]]);
+  sm._tmux = async () => ({ stdout: 'Bye!\nPane is dead (status 0, Thu Oct 8 10:19:02 2026)' });
+  const killed = [];
+  sm.killForSession = async (id) => { killed.push(id); return ['cx_exit']; };
+  assert.deepEqual(await sm.reconcileExitedSessions(), ['s1']);
+  assert.equal(sm.isArchived('s1'), true);
+  assert.deepEqual(killed, ['s1']);
+});
+
+test('reconcileExitedSessions does not archive a replacement launched during the exit capture', async () => {
+  const sm = new SessionManager();
+  sm._save = () => {};
+  sm.map.set('s1', { tmux: 'cx_old', agent: 'codex' });
+  sm.dead = new Set(['cx_old']);
+  sm.deadStatus = new Map([['cx_old', 0]]);
+  sm._tmux = async () => {
+    sm.map.set('s1', { tmux: 'cx_new', agent: 'codex' });
+    return { stdout: 'Bye!' };
+  };
+  const killed = [];
+  sm.killForSession = async (id) => { killed.push(id); return []; };
+  assert.deepEqual(await sm.reconcileExitedSessions(), []);
+  assert.equal(sm.entryFor('s1').tmux, 'cx_new');
+  assert.equal(sm.isArchived('s1'), false);
+  assert.deepEqual(killed, []);
+});
+
+for (const [label, output, archived] of [
+  ['update exit', '🎉 Update ran successfully! Please restart Codex.', []],
+  ['ordinary exit', 'Bye!', ['s1']],
+]) {
+  test(`reconcileExitedSessions defers a failed capture and retries the ${label}`, async () => {
+    const sm = new SessionManager();
+    sm._save = () => {};
+    sm.map.set('s1', { tmux: 'cx_capture', agent: 'codex' });
+    sm.dead = new Set(['cx_capture']);
+    sm.deadStatus = new Map([['cx_capture', 0]]);
+    let captures = 0;
+    sm._tmux = async () => {
+      if (++captures === 1) throw new Error('tmux socket unavailable');
+      return { stdout: output };
+    };
+    const killed = [];
+    sm.killForSession = async (id) => { killed.push(id); return ['cx_capture']; };
+    assert.deepEqual(await sm.reconcileExitedSessions(), []);
+    assert.equal(sm.isArchived('s1'), false);
+    assert.deepEqual(killed, []);
+    assert.deepEqual(await sm.reconcileExitedSessions(), archived);
+    assert.equal(sm.isArchived('s1'), archived.length > 0);
+    assert.deepEqual(killed, archived);
+  });
+}
+
+test('reconcileExitedSessions leaves a resume in flight alone after capture', async () => {
+  const sm = new SessionManager();
+  sm._save = () => {};
+  sm.map.set('s1', { tmux: 'cx_resuming', agent: 'codex' });
+  sm.dead = new Set(['cx_resuming']);
+  sm.deadStatus = new Map([['cx_resuming', 0]]);
+  sm._tmux = async () => {
+    sm._resuming.set('s1', Promise.resolve());
+    return { stdout: 'Bye!' };
+  };
+  const killed = [];
+  sm.killForSession = async (id) => { killed.push(id); return []; };
+  assert.deepEqual(await sm.reconcileExitedSessions(), []);
+  assert.equal(sm.isArchived('s1'), false);
+  assert.deepEqual(killed, []);
 });
 
 test('refreshAlive records each dead pane\'s death time from pane_dead_time', async () => {
@@ -725,6 +846,27 @@ test('fork: a devcontainer parent forks into a devcontainer-wrapped launch', asy
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('fork: wrapLaunch receives the parent card id; dispatch does not', async () => {
+  const sm = new SessionManager();
+  sm.map.clear();
+  sm._save = () => {};
+  sm.refreshAlive = async () => {};
+  sm._newSession = async () => {};
+  const seen = [];
+  await withRuntime({ id: 'toyrt', label: 'Toy', wrapLaunch: async (args) => { seen.push(args); return args.inner; } }, 'toy', async () => {
+    const { sessionId } = await sm.fork({ sourceId: 'L0', parentId: 'PARENT', parentEntry: { agent: 'claude', runtime: 'toyrt' }, cwd: os.tmpdir() });
+    assert.equal(seen[0].parentId, 'PARENT');
+    assert.equal(seen[0].sessionId, sessionId);
+  });
+  const sd = smForDispatch();
+  sd._newSession = async () => {};
+  seen.length = 0;
+  await withRuntime({ id: 'toyrt', label: 'Toy', wrapLaunch: async (args) => { seen.push(args); return args.inner; } }, 'toy', async () => {
+    await sd.dispatch({ cwd: os.tmpdir(), intent: 'x', runtime: 'toyrt' });
+  });
+  assert.equal(seen[0].parentId, undefined);
+});
+
 test('fork() re-threads the parent entry\'s effort into buildFork', async () => {
   const sm = new SessionManager();
   let captured = '';
@@ -938,6 +1080,76 @@ test('_doResume: devcontainer skips the host transcript guard and wraps in a dev
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+for (const agent of ['codex', 'future-agent']) {
+  test(`resume Remote Control checks inherited target ${agent} before kill or launch`, async () => {
+    const sm = smForDispatch();
+    const prev = { agent, cwd: os.tmpdir(), remoteControl: { name: 'Phone' } };
+    sm.map.set('rc', prev);
+    const effects = [];
+    sm.killForSession = async () => { effects.push('kill'); return []; };
+    sm._newSession = async () => { effects.push('launch'); };
+    await assert.rejects(() => sm._doResume('rc', os.tmpdir(), {}), new RegExp(`${agent}.*does not support Remote Control`));
+    assert.deepEqual(effects, []);
+    assert.equal(sm.map.get('rc'), prev);
+  });
+}
+
+test('_doResume relaunches a Remote Control session with --remote-control, and a plain one without', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aw-rc-resume-'));
+  const sm = new SessionManager();
+  sm.map.clear();
+  sm.killForSession = async () => [];
+  sm._save = () => {};
+  sm.refreshAlive = async () => {};
+  const inners = [];
+  sm._newSession = async (_tmux, _dir, inner) => { inners.push(inner); };
+  // devcontainer skips the host transcript guard, so no ~/.claude transcript is needed.
+  sm.map.set('rc', { agent: 'claude', runtime: 'devcontainer', liveSessionId: '00000000-0000-4000-8000-000000000001', cwd: dir, remoteControl: { name: 'Phone' } });
+  sm.map.set('plain', { agent: 'claude', runtime: 'devcontainer', liveSessionId: '00000000-0000-4000-8000-000000000002', cwd: dir });
+  await sm._doResume('rc', dir, {});
+  await sm._doResume('plain', dir, {});
+  assert.match(inners[0], /--remote-control\W+Phone\W/);
+  assert.deepEqual(sm.map.get('rc').remoteControl, { name: 'Phone' }, 'still stored for the next resume');
+  assert.doesNotMatch(inners[1], /--remote-control/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('_doResume: automatic discards a relaunch when the card was archived mid-launch', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aw-keep-arch-'));
+  const sm = new SessionManager();
+  sm.map.clear();
+  sm.killForSession = async () => [];
+  const tmuxCalls = [];
+  sm._tmux = async (socket, args) => { tmuxCalls.push(args); };
+  sm._save = () => {};
+  sm.refreshAlive = async () => {};
+  let launched;
+  sm._newSession = async (tmux) => { launched = tmux; sm.map.get('c1').archivedAt = 5; };
+  sm.map.set('c1', { agent: 'claude', runtime: 'devcontainer', liveSessionId: '00000000-0000-4000-8000-000000000000', cwd: dir });
+  await assert.rejects(() => sm._doResume('c1', dir, { automatic: true }), /archived or snoozed during resume/);
+  assert.equal(sm.map.get('c1').archivedAt, 5);
+  assert.deepEqual(tmuxCalls.filter((a) => a[0] !== 'list-panes'), [['kill-session', '-t', launched]]);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('_doResume: automatic discards a relaunch when a snooze appeared mid-launch and keeps it', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aw-keep-snz-'));
+  const sm = new SessionManager();
+  sm.map.clear();
+  sm.killForSession = async () => [];
+  const tmuxCalls = [];
+  sm._tmux = async (socket, args) => { tmuxCalls.push(args); };
+  sm._save = () => {};
+  sm.refreshAlive = async () => {};
+  const snooze = { until: Date.now() + 3600_000, createdAt: 1, comment: 'recheck' };
+  sm._newSession = async () => { sm.map.get('c1').snooze = snooze; };
+  sm.map.set('c1', { agent: 'claude', runtime: 'devcontainer', liveSessionId: '00000000-0000-4000-8000-000000000000', cwd: dir });
+  await assert.rejects(() => sm._doResume('c1', dir, { automatic: true }), /archived or snoozed during resume/);
+  assert.deepEqual(sm.map.get('c1').snooze, snooze);
+  assert.equal(tmuxCalls.filter((a) => a[0] === 'kill-session').length, 1);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('_doResume: a devcontainer workflow session resumes with the issue-to-pr skill copied in', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aw-dc-wf-resume-'));
   const sm = new SessionManager();
@@ -997,6 +1209,193 @@ function codexSessionsFixture() {
     fs.utimesSync(file, mtimeMs / 1000, mtimeMs / 1000);
   };
   return { root, proj, write, writeAt };
+}
+
+for (const otherRollout of [false, true]) {
+  test(`codex Resume restarts a first-launch updater ${otherRollout ? 'without adopting another conversation' : 'with no conversation to resume'}`, async (t) => {
+    const { root, proj, writeAt } = codexSessionsFixture();
+    t.after(() => {
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(proj, { recursive: true, force: true });
+    });
+    const other = '77777777-7777-4777-8777-777777777777';
+    const createdAt = Date.now() - 60_000;
+    if (otherRollout) writeAt(other, new Date(createdAt + 10_000), Date.now());
+    const sm = new SessionManager();
+    sm.map.clear();
+    sm.map.set('updating-card', {
+      agent: 'codex', tmux: 'cx_update', socket: 'update-test', cwd: proj,
+      name: 'My card', intent: '', createdAt, model: 'gpt-6.1', effort: 'high',
+      autoCompactTokens: 120000, addDirs: ['/extra'], parentSession: 'parent-card',
+    });
+    if (otherRollout) sm.map.set('other-card', { agent: 'codex', cwd: proj, liveSessionId: other });
+    sm.dead = new Set(['cx_update']);
+    sm._save = () => {};
+    sm.refreshAlive = async () => {};
+    sm._tmux = async (socket, args) => {
+      assert.equal(socket, 'update-test');
+      assert.deepEqual(args, ['capture-pane', '-t', 'cx_update', '-p', '-S', '-60']);
+      return { stdout: '🎉 Update ran successfully! Please restart Codex.' };
+    };
+    const kills = [];
+    sm.killForSession = async (id) => { kills.push(id); return ['cx_update']; };
+    let command;
+    let launchDir;
+    sm._newSession = async (_tmux, dir, cmd) => { command = cmd; launchDir = dir; };
+    const codex = adapterFor('codex');
+    const discover = codex.discoverLiveId;
+    codex.discoverLiveId = (opts) => discover.call(codex, { ...opts, sessionsDir: root });
+    t.after(() => { codex.discoverLiveId = discover; });
+    await sm.resume('updating-card', proj);
+    assert.match(command, /AW_SESSION_ID='updating-card'/);
+    assert.doesNotMatch(command, /codex 'resume'|77777777-7777-4777-8777-777777777777/);
+    assert.match(command, /'-m' 'gpt-6.1'/);
+    assert.match(command, /'model_reasoning_effort=high'/);
+    assert.match(command, /'model_auto_compact_token_limit=120000'/);
+    assert.match(command, /'--add-dir' '\/extra'/);
+    assert.equal(launchDir, proj);
+    assert.deepEqual(kills, ['updating-card']);
+    const entry = sm.entryFor('updating-card');
+    assert.equal(entry.name, 'My card');
+    assert.equal(entry.createdAt, createdAt);
+    assert.equal(entry.intent, '');
+    assert.equal(entry.parentSession, 'parent-card');
+    assert.equal(entry.liveSessionId, undefined);
+    assert.notEqual(entry.tmux, 'cx_update');
+    if (otherRollout) assert.equal(sm.entryFor('other-card').liveSessionId, other);
+  });
+}
+
+test('codex Resume does not restart an unfinished updater fork with its parent task', async (t) => {
+  const { root, proj, writeAt } = codexSessionsFixture();
+  t.after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(proj, { recursive: true, force: true });
+  });
+  const source = '99999999-9999-4999-8999-999999999999';
+  writeAt(source, new Date(Date.now() - 60_000), Date.now());
+  const sm = new SessionManager();
+  sm.map.clear();
+  sm.map.set('parent-card', { agent: 'codex', cwd: proj, intent: 'Parent task', liveSessionId: source, tmux: 'cx_parent' });
+  sm.map.set('fork-card', forkEntry({ short: 'fork', tmux: 'cx_fork', cwd: proj, parentEntry: sm.entryFor('parent-card'), parentId: 'parent-card', createdAt: Date.now() }));
+  sm.dead = new Set(['cx_fork']);
+  sm._tmux = async () => ({ stdout: '🎉 Update ran successfully! Please restart Codex.' });
+  sm._save = () => {};
+  sm.refreshAlive = async () => {};
+  const kills = [];
+  sm.killForSession = async (id) => { kills.push(id); return []; };
+  let command;
+  sm._newSession = async (_tmux, _dir, cmd) => { command = cmd; };
+  const codex = adapterFor('codex');
+  const discover = codex.discoverLiveId;
+  codex.discoverLiveId = (opts) => discover.call(codex, { ...opts, sessionsDir: root });
+  t.after(() => { codex.discoverLiveId = discover; });
+  await assert.rejects(sm.resume('fork-card', proj), /Could not locate a codex session to resume/);
+  assert.deepEqual(kills, []);
+  assert.equal(command, undefined);
+  assert.equal(sm.entryFor('fork-card').tmux, 'cx_fork');
+  assert.equal(sm.entryFor('fork-card').liveSessionId, undefined);
+  assert.equal(sm.entryFor('parent-card').liveSessionId, source);
+});
+
+for (const forkedFrom of [undefined, 'parent-card']) {
+  test(`codex Resume keeps an existing ${forkedFrom ? 'fork' : 'conversation'} after an updater exit`, async () => {
+    const sm = resumableCodex('existing-update');
+    sm.map.get('existing-update').tmux = 'cx_update';
+    sm.map.get('existing-update').forkedFrom = forkedFrom;
+    sm.dead = new Set(['cx_update']);
+    sm.killForSession = async () => [];
+    let command;
+    sm._newSession = async (_tmux, _dir, cmd) => { command = cmd; };
+    await sm.resume('existing-update', os.tmpdir());
+    assert.match(command, /codex 'resume' 'live-abc'/);
+    assert.equal(sm.entryFor('existing-update').liveSessionId, 'live-abc');
+  });
+}
+
+test('codex Resume retries a failed exit capture and records the fresh conversation', async (t) => {
+  const { root, proj, writeAt } = codexSessionsFixture();
+  t.after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(proj, { recursive: true, force: true });
+  });
+  const sm = new SessionManager();
+  sm.map.clear();
+  sm.map.set('capture-retry', { agent: 'codex', tmux: 'cx_update', cwd: proj, intent: 'Original task', createdAt: Date.now() - 60_000 });
+  sm.dead = new Set(['cx_update']);
+  sm._save = () => {};
+  sm.refreshAlive = async () => {};
+  let captures = 0;
+  sm._tmux = async () => {
+    if (++captures === 1) throw new Error('capture unavailable');
+    return { stdout: '🎉 Update ran successfully! Please restart Codex.' };
+  };
+  const fresh = '88888888-8888-4888-8888-888888888888';
+  let command;
+  const kills = [];
+  sm.killForSession = async (id) => { kills.push(id); return ['cx_update']; };
+  sm._newSession = async (_tmux, _dir, cmd) => {
+    command = cmd;
+    writeAt(fresh, new Date(), Date.now());
+  };
+  const codex = adapterFor('codex');
+  const discover = codex.discoverLiveId;
+  codex.discoverLiveId = (opts) => discover.call(codex, { ...opts, sessionsDir: root });
+  t.after(() => { codex.discoverLiveId = discover; });
+  await assert.rejects(sm.resume('capture-retry', proj), /Could not read Codex exit output/);
+  assert.deepEqual(kills, []);
+  assert.equal(command, undefined);
+  assert.equal(sm.entryFor('capture-retry').tmux, 'cx_update');
+  await sm.resume('capture-retry', proj);
+  assert.match(command, / 'Original task'$/);
+  assert.doesNotMatch(command, /codex 'resume'/);
+  assert.deepEqual(kills, ['capture-retry']);
+  assert.equal(sm.entryFor('capture-retry').liveSessionId, fresh);
+});
+
+test('codex Resume leaves a replacement alone when the pane changes during exit capture', async () => {
+  const sm = new SessionManager();
+  sm.map.clear();
+  sm.map.set('changed-update', { agent: 'codex', tmux: 'cx_update', cwd: os.tmpdir() });
+  sm.dead = new Set(['cx_update']);
+  sm._tmux = async () => {
+    sm.map.set('changed-update', { agent: 'codex', tmux: 'cx_replacement', liveSessionId: 'live-replacement' });
+    return { stdout: '🎉 Update ran successfully! Please restart Codex.' };
+  };
+  sm.killForSession = async () => { throw new Error('must not kill replacement'); };
+  sm._newSession = async () => { throw new Error('must not launch'); };
+  await assert.rejects(sm.resume('changed-update', os.tmpdir()), /Codex pane changed/);
+  assert.equal(sm.entryFor('changed-update').tmux, 'cx_replacement');
+  assert.equal(sm.entryFor('changed-update').liveSessionId, 'live-replacement');
+});
+
+for (const [label, state] of [
+  ['archived', { archivedAt: 5 }],
+  ['snoozed', { snooze: { until: 9_000_000, createdAt: 1, comment: 'later' } }],
+]) {
+  test(`automatic Codex update recovery preserves a card ${label} during conversation lookup`, async (t) => {
+    const sm = new SessionManager();
+    sm.map.clear();
+    sm.map.set('automatic-update', { agent: 'codex', tmux: 'cx_update', cwd: os.tmpdir() });
+    sm.dead = new Set(['cx_update']);
+    sm.killForSession = async () => [];
+    let launched;
+    sm._newSession = async (tmux) => { launched = tmux; };
+    const discarded = [];
+    sm._tmux = async (_socket, args) => {
+      if (args[0] === 'capture-pane') return { stdout: '🎉 Update ran successfully! Please restart Codex.' };
+      assert.equal(args[0], 'kill-session');
+      discarded.push(args[args.indexOf('-t') + 1]);
+    };
+    t.mock.method(adapterFor('codex'), 'discoverLiveId', async () => {
+      Object.assign(sm.entryFor('automatic-update'), state);
+      return 'live-fresh';
+    });
+    await assert.rejects(sm.resume('automatic-update', os.tmpdir(), { automatic: true }), /archived or snoozed during resume/);
+    for (const [key, value] of Object.entries(state)) assert.deepEqual(sm.entryFor('automatic-update')[key], value);
+    assert.equal(sm.entryFor('automatic-update').liveSessionId, undefined);
+    assert.deepEqual(discarded, [launched]);
+  });
 }
 
 test('codex resume never binds a card to a rollout older than the card itself', async () => {
@@ -1330,7 +1729,7 @@ test('resolveWorktree creates a worktree and returns its path + branch', async (
     cwd: repo, intent: 'fix the bug', branch: '', folderName: '', auto: true, short: 'abcd1234',
   });
   assert.equal(res.branch, 'fix-bug');
-  assert.equal(path.basename(res.cwd), 'proj-worktree-fix-bug');
+  assert.equal(path.basename(res.cwd), 'proj-fix-bug');
   assert.equal(res.worktree.path, res.cwd);
 });
 
@@ -1484,6 +1883,48 @@ test('clearSnooze removes the field but keeps the entry', () => {
   assert.equal(sm.entryFor('sess-x').snooze, undefined);
   assert.ok(sm.entryFor('sess-x')); // entry itself stays
   assert.equal(sm.clearSnooze('sess-x'), false); // no-op second time
+});
+
+test('clearSnoozeDescendants wakes every listed session, clearing their pending suspend, and skips unsnoozed ones', () => {
+  const sm = freshManager();
+  sm.setSnooze('p', 2_000_000, { cwd: '/y' });
+  sm.setSnooze('c1', 2_000_000, { cwd: '/y' });
+  sm.setSnooze('c2', 2_000_000, { cwd: '/y' });
+  sm.markSuspendPending('c1');
+  assert.equal(sm.clearSnoozeDescendants(['c1', 'c2', 'awake', 'unmapped']), 2);
+  assert.equal(sm.entryFor('c1').snooze, undefined);
+  assert.equal(sm.entryFor('c1').suspendPending, undefined);
+  assert.equal(sm.entryFor('c2').snooze, undefined);
+  assert.ok(sm.entryFor('p').snooze, 'the parent is not touched');
+});
+
+function claimSnooze(sm, id) {
+  const entry = sm.entryFor(id);
+  const claim = { snooze: entry.snooze, suspendPending: entry.suspendPending, generation: sm.snoozeGeneration(id) };
+  sm.clearSnooze(id);
+  return claim;
+}
+
+test('restoreSnooze puts a claimed snooze (and its pending suspend) back', () => {
+  const sm = freshManager();
+  sm.setSnooze('sess-r', 2_000_000, { cwd: '/y', comment: 'keep me' });
+  sm.entryFor('sess-r').suspendPending = true;
+  const claim = claimSnooze(sm, 'sess-r');
+  assert.equal(sm.restoreSnooze('sess-r', claim), true);
+  assert.equal(sm.entryFor('sess-r').snooze.comment, 'keep me');
+  assert.equal(sm.entryFor('sess-r').suspendPending, true);
+  assert.equal(sm.restoreSnooze('sess-r', claim), false); // already present
+  assert.equal(sm.restoreSnooze('nope', claim), false);
+});
+
+test('restoreSnooze refuses once a newer snooze was set, even if it was cleared again', () => {
+  const sm = freshManager();
+  sm.setSnooze('sess-r', 2_000_000, { cwd: '/y', comment: 'A' });
+  const claim = claimSnooze(sm, 'sess-r');
+  sm.setSnooze('sess-r', 3_000_000, { cwd: '/y', comment: 'B' });
+  sm.clearSnooze('sess-r');
+  assert.equal(sm.restoreSnooze('sess-r', claim), false);
+  assert.equal(sm.entryFor('sess-r').snooze, undefined);
 });
 
 test('detachSession clears parentSession, keeping the rest of the entry', () => {
@@ -1646,6 +2087,77 @@ test('dispatch stores parentSession when passed', async () => {
   assert.equal(sm.map.get(sessionId).parentSession, 'ORCH1');
 });
 
+test('dispatch stores offBoard when passed, and leaves it undefined otherwise', async () => {
+  const sm = smForDispatch();
+  const hosted = await sm.dispatch({ cwd: os.tmpdir(), intent: 'x', offBoard: 'jobs' });
+  assert.equal(sm.map.get(hosted.sessionId).offBoard, 'jobs');
+  const plain = await sm.dispatch({ cwd: os.tmpdir(), intent: 'y' });
+  assert.equal(sm.map.get(plain.sessionId).offBoard, undefined);
+});
+
+test('dispatch with remoteControl launches explicit/default Claude and stores it; a plain dispatch has neither', async () => {
+  const sm = smForDispatch();
+  const inners = [];
+  sm._newSession = async (_tmux, _dir, inner) => { inners.push(inner); };
+  for (const agent of [undefined, 'claude']) {
+    const rc = await sm.dispatch({ cwd: os.tmpdir(), intent: 'x', agent, remoteControl: { name: 'Phone' } });
+    assert.match(inners.at(-1), /'--remote-control' 'Phone'/);
+    assert.deepEqual(sm.map.get(rc.sessionId).remoteControl, { name: 'Phone' });
+  }
+  const plain = await sm.dispatch({ cwd: os.tmpdir(), intent: 'y' });
+  assert.doesNotMatch(inners.at(-1), /--remote-control/);
+  assert.equal(sm.map.get(plain.sessionId).remoteControl, undefined);
+});
+
+test('fork Remote Control isolation omits the flag and persisted name from the child', async () => {
+  const sm = smForDispatch();
+  let inner;
+  sm._newSession = async (_tmux, _dir, cmd) => { inner = cmd; };
+  const parentEntry = { agent: 'claude', remoteControl: { name: 'Phone' } };
+  const { sessionId } = await sm.fork({ sourceId: 'L0', parentId: 'parent', parentEntry, cwd: os.tmpdir() });
+  assert.doesNotMatch(inner, /--remote-control/);
+  assert.equal('remoteControl' in sm.map.get(sessionId), false);
+  assert.deepEqual(parentEntry.remoteControl, { name: 'Phone' });
+});
+
+for (const agent of ['codex', 'future-agent']) {
+  test(`dispatch Remote Control refuses ${agent} before card, directory, worktree or session creation`, async () => {
+    const sm = smForDispatch();
+    const dir = path.join(os.tmpdir(), `aw-refused-rc-${process.pid}-${agent}`);
+    const effects = [];
+    sm._newSession = async () => { effects.push('launch'); };
+    sm._freshScratchDir = () => { effects.push('scratch'); return dir; };
+    sm._ensureCwd = () => { effects.push('cwd'); return dir; };
+    sm._prepare = async () => { effects.push('prepare'); };
+    sm._launchContext = async () => { effects.push('card context'); return { env: {}, addDirs: [] }; };
+    sm._save = () => { effects.push('save'); };
+    for (const opts of [{}, { cwd: dir }, { cwd: dir, worktree: true, worktreeBranch: 'rc-test' }]) {
+      await assert.rejects(() => sm.dispatch({ ...opts, intent: 'x', agent, remoteControl: { name: 'Phone' } }),
+        new RegExp(`Agent "${agent}" does not support Remote Control`));
+    }
+    assert.deepEqual(effects, []);
+    assert.equal(sm.map.size, 0);
+    assert.equal(fs.existsSync(dir), false);
+  });
+}
+
+test('dispatch Remote Control refuses missing Claude capability before any creation', async () => {
+  const sm = smForDispatch();
+  const adapter = adapterFor('claude');
+  const prev = adapter.supportsRemoteControl;
+  const effects = [];
+  sm._freshScratchDir = () => { effects.push('scratch'); return os.tmpdir(); };
+  sm._newSession = async () => { effects.push('launch'); };
+  delete adapter.supportsRemoteControl;
+  try {
+    await assert.rejects(() => sm.dispatch({ remoteControl: { name: 'Phone' } }), /claude.*does not support Remote Control/);
+    assert.deepEqual(effects, []);
+    assert.equal(sm.map.size, 0);
+  } finally {
+    adapter.supportsRemoteControl = prev;
+  }
+});
+
 test('dispatch leaves parentSession undefined when not passed', async () => {
   const sm = smForDispatch();
   const { sessionId } = await sm.dispatch({ cwd: os.tmpdir(), intent: 'x' });
@@ -1773,8 +2285,221 @@ test('dispatch: worktree mode does not add a common-git-dir --add-dir for claude
   let captured = '';
   sm._newSession = async (_t, _d, inner) => { captured = inner; };
   await sm.dispatch({ cwd: repo, intent: 'fix the bug', worktree: true, worktreeAuto: true }); // default agent: claude
-  assert.doesNotMatch(captured, /worktrees/);
+  assert.ok(!captured.includes(path.join(repo, '.git')), captured);
+  assert.ok(!captured.includes('--add-dir'), captured);
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('dispatch trusts SESSIONS_DIR (never the launch cwd) for a claude session, and not for codex', async () => {
+  const sm = smForDispatch();
+  const trusted = [];
+  sm._ensureClaudeTrust = (p) => trusted.push(p);
+  await sm.dispatch({ cwd: os.tmpdir(), intent: 'x' });
+  await sm.dispatch({ cwd: os.tmpdir(), intent: 'x', agent: 'codex' });
+  assert.deepEqual(trusted, [SESSIONS_DIR]);
+});
+
+async function withClaudeTrustSetting(value, fn) {
+  let saved;
+  try { saved = fs.readFileSync(CHILD_FULL_VIEW_CONFIG_PATH, 'utf8'); } catch { saved = null; }
+  try {
+    writeConfig({ trustClaudeLaunchCwd: value });
+    await fn();
+  } finally {
+    if (saved === null) { try { fs.rmSync(CHILD_FULL_VIEW_CONFIG_PATH); } catch { /* nothing to restore */ } }
+    else fs.writeFileSync(CHILD_FULL_VIEW_CONFIG_PATH, saved);
+  }
+}
+
+// Launch, resume and fork in a worktree each hand the launch cwd to the trust
+// mirror (which only trusts it when the source repo is trusted), and only while
+// the setting is on.
+async function worktreeTrustMirrorCalls(setting) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'aw-wt-trust-'));
+  const repo = path.join(root, 'proj');
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, 'f.txt'), 'x');
+  const git = (...a) => execFileSync('git', ['-C', repo, '-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { stdio: 'pipe' });
+  git('init', '-q', '-b', 'main');
+  git('add', '-A');
+  git('commit', '-q', '-m', 'i');
+  const calls = [];
+  try {
+    await withClaudeTrustSetting(setting, async () => {
+      const sm = smForDispatch();
+      sm.killForSession = async () => [];
+      sm._ensureClaudeTrust = () => {};
+      sm._mirrorWorktreeTrust = async (p) => { calls.push(['mirror', p]); };
+      let launchedDir;
+      sm._newSession = async (_t, d) => { launchedDir = d; };
+      await sm.dispatch({ cwd: repo, intent: 'x', worktree: true, worktreeAuto: true });
+      const wt = launchedDir;
+      calls.push(['launched', wt]);
+      sm.map.set('c1', { agent: 'claude', runtime: 'devcontainer', liveSessionId: '00000000-0000-4000-8000-000000000000', cwd: wt });
+      await sm._doResume('c1', wt, {});
+      await sm.fork({ sourceId: 'L0', parentId: 'c1', parentEntry: { agent: 'claude', cwd: wt }, cwd: wt });
+      await sm.fork({ sourceId: 'L0', parentId: 'c1', parentEntry: { agent: 'codex', cwd: wt }, cwd: wt });
+    });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+  return calls;
+}
+
+test('launch, resume and fork in a worktree mirror its repo\'s Claude trust onto it when the setting is on', async () => {
+  const calls = await worktreeTrustMirrorCalls(true);
+  const wt = calls.find(([k]) => k === 'launched')[1];
+  assert.match(wt, /worktrees\.noindex/);
+  // dispatch, resume, claude fork; never the codex fork.
+  assert.deepEqual(calls.filter(([k]) => k === 'mirror').map(([, p]) => p), [wt, wt, wt]);
+});
+
+test('launch, resume and fork never call the worktree trust mirror when the setting is off', async () => {
+  const calls = await worktreeTrustMirrorCalls(false);
+  assert.deepEqual(calls.filter(([k]) => k === 'mirror'), []);
+});
+
+// A launch context that points CLAUDE_CONFIG_DIR at a login's own config gets
+// the default launch's trust written there too, authorised only by the server's
+// config (test-setup's throwaway CLAUDE_CONFIG_DIR, snapshotted and restored).
+async function withLoginTrustFixture(fn) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'aw-login-trust-')));
+  const repo = path.join(root, 'proj');
+  fs.mkdirSync(repo);
+  fs.writeFileSync(path.join(repo, 'f.txt'), 'x');
+  const git = (...a) => execFileSync('git', ['-C', repo, '-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { stdio: 'pipe' });
+  git('init', '-q', '-b', 'main');
+  git('add', '-A');
+  git('commit', '-q', '-m', 'i');
+  const serverFile = path.join(process.env.CLAUDE_CONFIG_DIR, '.claude.json');
+  let saved;
+  try { saved = fs.readFileSync(serverFile, 'utf8'); } catch { saved = null; }
+  const login = (name, seed) => {
+    const dir = path.join(root, name);
+    fs.mkdirSync(dir);
+    if (seed) fs.writeFileSync(path.join(dir, '.claude.json'), JSON.stringify(seed, null, 2) + '\n');
+    return dir;
+  };
+  const trusted = (dir) => {
+    let data;
+    try { data = JSON.parse(fs.readFileSync(path.join(dir, '.claude.json'), 'utf8')); } catch { return []; }
+    return Object.entries(data.projects || {}).filter(([, v]) => v?.hasTrustDialogAccepted === true).map(([k]) => k).sort();
+  };
+  const serveTrust = (dirs) => fs.writeFileSync(serverFile, JSON.stringify({ projects: Object.fromEntries(dirs.map((d) => [d, { hasTrustDialogAccepted: true }])) }, null, 2) + '\n');
+  try {
+    await withClaudeTrustSetting(true, () => fn({ root, repo, login, trusted, serveTrust, serverDir: process.env.CLAUDE_CONFIG_DIR }));
+  } finally {
+    if (saved === null) fs.rmSync(serverFile, { force: true });
+    else fs.writeFileSync(serverFile, saved);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function smWithLogin(order) {
+  const sm = smForDispatch();
+  sm.killForSession = async () => [];
+  sm.loginDir = null;
+  sm._launchContext = async () => {
+    order?.push('context');
+    return { env: sm.loginDir ? { CLAUDE_CONFIG_DIR: sm.loginDir } : {}, addDirs: [] };
+  };
+  const real = { trust: sm._ensureClaudeTrust, mirror: sm._mirrorWorktreeTrust, login: sm._ensureLoginClaudeTrust };
+  sm._ensureClaudeTrust = (p) => { order?.push(['trust', p]); return real.trust(p); };
+  sm._mirrorWorktreeTrust = (p) => { order?.push(['mirror', p]); return real.mirror(p); };
+  sm._ensureLoginClaudeTrust = (d, o) => { order?.push(['login', d]); return real.login(d, o); };
+  sm.launchedDir = null;
+  sm._newSession = async (_t, d) => { sm.launchedDir = d; };
+  return sm;
+}
+
+test('login trust: dispatch, resume, fork and worktree trust land in a fixture login .claude.json', async () => {
+  await withLoginTrustFixture(async ({ repo, login, trusted, serveTrust, serverDir }) => {
+    serveTrust([repo]);
+    const order = [];
+    const sm = smWithLogin(order);
+
+    sm.loginDir = login('dispatch');
+    await sm.dispatch({ cwd: repo, intent: 'x', worktree: true, worktreeAuto: true });
+    const wt = sm.launchedDir;
+    assert.match(wt, /worktrees\.noindex/);
+    assert.deepEqual(trusted(sm.loginDir), [SESSIONS_DIR, wt].sort());
+    assert.deepEqual(order, ['context', ['trust', SESSIONS_DIR], ['mirror', wt], ['login', sm.loginDir]], 'launch context is collected before any trust');
+
+    sm.loginDir = login('resume');
+    sm.map.set('c1', { agent: 'claude', runtime: 'devcontainer', liveSessionId: '00000000-0000-4000-8000-000000000000', cwd: wt });
+    await sm._doResume('c1', wt, {});
+    assert.deepEqual(trusted(sm.loginDir), [SESSIONS_DIR, wt].sort());
+
+    sm.loginDir = login('fork');
+    await sm.fork({ sourceId: 'L0', parentId: 'c1', parentEntry: { agent: 'claude', cwd: wt }, cwd: wt });
+    assert.deepEqual(trusted(sm.loginDir), [SESSIONS_DIR, wt].sort());
+
+    // A plain checkout the server already trusts: the cwd itself, never a parent.
+    sm.loginDir = login('trusted-cwd');
+    await sm.dispatch({ cwd: repo, intent: 'x' });
+    assert.deepEqual(trusted(sm.loginDir), [SESSIONS_DIR, repo].sort());
+
+    assert.deepEqual(trusted(serverDir), [SESSIONS_DIR, repo, wt].sort(), 'the server config gets only what a default launch writes');
+  });
+});
+
+test('login trust: an untrusted folder is never trusted in the login config', async () => {
+  await withLoginTrustFixture(async ({ root, repo, login, trusted, serveTrust, serverDir }) => {
+    serveTrust([]);
+    const sm = smWithLogin();
+    const elsewhere = path.join(root, 'elsewhere');
+    fs.mkdirSync(elsewhere);
+
+    // The login's own file trusting the repo authorises nothing: only the server config does.
+    sm.loginDir = login('dispatch', { projects: { [repo]: { hasTrustDialogAccepted: true } } });
+    await sm.dispatch({ cwd: repo, intent: 'x', worktree: true, worktreeAuto: true });
+    const wt = sm.launchedDir;
+    assert.deepEqual(trusted(sm.loginDir), [SESSIONS_DIR, repo].sort(), 'no worktree entry');
+
+    sm.loginDir = login('resume');
+    sm.map.set('c1', { agent: 'claude', runtime: 'devcontainer', liveSessionId: '00000000-0000-4000-8000-000000000000', cwd: wt });
+    await sm._doResume('c1', wt, {});
+    assert.deepEqual(trusted(sm.loginDir), [SESSIONS_DIR]);
+
+    sm.loginDir = login('fork');
+    await sm.fork({ sourceId: 'L0', parentId: 'c1', parentEntry: { agent: 'claude', cwd: elsewhere }, cwd: elsewhere });
+    assert.deepEqual(trusted(sm.loginDir), [SESSIONS_DIR]);
+
+    // A server config trusting an unrelated folder grants nothing here either.
+    serveTrust([path.join(root, 'other')]);
+    sm.loginDir = login('dispatch-2');
+    await sm.dispatch({ cwd: elsewhere, intent: 'x' });
+    assert.deepEqual(trusted(sm.loginDir), [SESSIONS_DIR]);
+    assert.ok(!trusted(serverDir).includes(elsewhere) && !trusted(serverDir).includes(wt));
+  });
+});
+
+test('login trust: a refused launch context writes no trust anywhere', async () => {
+  await withLoginTrustFixture(async ({ repo, login, trusted, serveTrust, serverDir }) => {
+    serveTrust([repo]);
+    const sm = smWithLogin();
+    sm.loginDir = login('refused');
+    sm._launchContext = async () => { throw new Error('refused by test'); };
+    await assert.rejects(sm.dispatch({ cwd: repo, intent: 'x' }), /refused by test/);
+    assert.deepEqual(trusted(sm.loginDir), []);
+    assert.deepEqual(trusted(serverDir), [repo]);
+  });
+});
+
+test('login trust: a default launch writes trust exactly as before', async () => {
+  await withLoginTrustFixture(async ({ repo, serveTrust, trusted, serverDir }) => {
+    serveTrust([repo]);
+    const order = [];
+    const sm = smWithLogin(order);
+    await sm.dispatch({ cwd: repo, intent: 'x', worktree: true, worktreeAuto: true });
+    const wt = sm.launchedDir;
+    sm.map.set('c1', { agent: 'claude', runtime: 'devcontainer', liveSessionId: '00000000-0000-4000-8000-000000000000', cwd: wt });
+    await sm._doResume('c1', wt, {});
+    await sm.fork({ sourceId: 'L0', parentId: 'c1', parentEntry: { agent: 'claude', cwd: wt }, cwd: wt });
+    const launch = ['context', ['trust', SESSIONS_DIR], ['mirror', wt]];
+    assert.deepEqual(order, [...launch, ...launch, ...launch], 'the same two calls per launch, and no login write');
+    assert.deepEqual(trusted(serverDir), [SESSIONS_DIR, repo, wt].sort());
+  });
 });
 
 test('dispatch never calls ensureCodexTrust for a claude session', async () => {
@@ -1961,8 +2686,8 @@ test('_newSession cd\'s into the dir inside the pane command, not just via tmux 
   let args;
   sm._tmux = async (_socket, a) => { args = args || a; return { stdout: '' }; };
   await sm._newSession('cc_abc', "/tmp/aw dir'x", 'launch --me', '');
-  assert.deepEqual(args.slice(0, 6), ['new-session', '-d', '-s', 'cc_abc', '-c', "/tmp/aw dir'x"]);
-  assert.equal(args[6], `cd '/tmp/aw dir'\\''x' && launch --me`);
+  assert.deepEqual(args.slice(0, 9), ['new-session', '-d', '-P', '-F', '#{pane_id}', '-s', 'cc_abc', '-c', "/tmp/aw dir'x"]);
+  assert.equal(args[9], `cd '/tmp/aw dir'\\''x' && launch --me`);
 });
 
 test('worktree dispatch does NOT create a nonexistent cwd (fails as a non-repo, no stray dir)', async () => {
@@ -2171,6 +2896,14 @@ test('suspendable: a relaunched session qualifies again once the relaunch itself
   assert.equal(out.length, 1);
 });
 
+test('suspendable: a known transcript with unknown activity is not suspended on the timer', () => {
+  const now = 20 * 60 * 60 * 1000;
+  const out = suspendableSessions(
+    [cand({ hasTranscript: true, lastActivity: null, relaunchedAt: now - 2 * 60 * 60 * 1000 })],
+    { idleMs: 60 * 60 * 1000, now });
+  assert.deepEqual(out, []);
+});
+
 // A fork's transcript REPLAYS its parent's history (same timestamps), so a
 // seconds-old fork inherits an ancient lastActivity. createdAt covers it — and
 // dispatch — without either constructor needing its own stamp.
@@ -2189,6 +2922,13 @@ test('suspendPending: fires on a freshly relaunched session regardless of the fl
   const out = suspendableSessions(
     [cand({ suspendPending: true, relaunchedAt: now, lastActivity: now })],
     { idleMs: null, now });
+  assert.equal(out.length, 1);
+});
+
+test('suspendPending: overrides unknown transcript activity', () => {
+  const out = suspendableSessions(
+    [cand({ suspendPending: true, hasTranscript: true, lastActivity: null })],
+    { idleMs: null, now: 1000 });
   assert.equal(out.length, 1);
 });
 
@@ -2320,6 +3060,14 @@ test('reconcileSuspend: suspends an idle-past-threshold session and returns its 
   const ids = await sm.reconcileSuspend(sessions, { suspendIdleHours: 4 });
   assert.deepEqual(ids, ['s1']);
   assert.deepEqual(sm.suspended, ['s1']);
+});
+
+test('reconcileSuspend: skips a known transcript whose activity is unavailable', async () => {
+  const sm = smForReconcile([{ sessionId: 's1' }]);
+  const sessions = [{ sessionId: 's1', tmux: 'cc_s1', status: 'idle', lastActivity: null, hasTranscript: true }];
+  const ids = await sm.reconcileSuspend(sessions, { suspendIdleHours: 4 });
+  assert.deepEqual(ids, []);
+  assert.deepEqual(sm.suspended, []);
 });
 
 test('reconcileSuspend: skips an attached session and a working one', async () => {
@@ -2514,7 +3262,7 @@ test('fork asks for the FORK\'s new card id but the PARENT\'s task, with reason 
   const asked = recordingContext(sm);
   const { sessionId } = await sm.fork({ sourceId: 'L0', parentId: 'parent', parentEntry: { agent: 'claude' }, cwd: dir });
   assert.equal(asked.length, 1);
-  assert.deepEqual(asked[0], { sid: sessionId, task: { id: 'TP', name: 'p' }, agent: 'claude', runtime: 'local', reason: 'fork' });
+  assert.deepEqual(asked[0], { sid: sessionId, task: { id: 'TP', name: 'p' }, agent: 'claude', runtime: 'local', reason: 'fork', parentId: 'parent' });
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -2538,6 +3286,39 @@ async function withRuntime(rt, extId, fn) {
   try { return await fn(); } finally { unregisterRuntimesFor(extId); }
 }
 const CLOUDISH = { id: 'cloudt', label: '☁ Cloud', resumable: false };
+
+test('dispatch: a buildLaunch runtime refuses a launch context it cannot guard in the pane', async () => {
+  const sm = smForDispatch();
+  let launched = false;
+  sm._newSession = async () => { launched = true; };
+  sm._launchContext = async () => ({ env: {}, addDirs: [], refuseIfSet: ['ANTHROPIC_API_KEY'] });
+  await withRuntime({ ...CLOUDISH, buildLaunch: async () => 'echo handed-off' }, 'cloud', async () => {
+    await assert.rejects(sm.dispatch({ cwd: os.tmpdir(), intent: 'x', runtime: 'cloudt' }), /cannot check ANTHROPIC_API_KEY in the pane; launch refused/);
+  });
+  assert.equal(launched, false);
+  assert.equal(sm.map.size, 0);
+});
+
+// The loader already makes a buildLaunch runtime `resumable: false`; registered
+// raw without it, resume and fork reach the same pane-guard refusal as dispatch.
+test('resume and fork: a buildLaunch runtime refuses a launch context it cannot guard in the pane', async () => {
+  const sm = smForDispatch();
+  const calls = [];
+  sm.killForSession = async () => [];
+  sm._newSession = async () => { calls.push('launch'); };
+  sm._ensureClaudeTrust = () => { calls.push('trust'); };
+  sm._mirrorWorktreeTrust = async () => { calls.push('mirror'); };
+  sm._launchContext = async () => ({ env: {}, addDirs: [], refuseIfSet: ['ANTHROPIC_API_KEY'] });
+  const own = { id: 'ownt', label: 'Own', skipsHostResumeGuard: true, buildLaunch: async () => 'echo handed-off' };
+  await withClaudeTrustSetting(true, () => withRuntime(own, 'own', async () => {
+    const entry = { agent: 'claude', runtime: 'ownt', liveSessionId: '00000000-0000-4000-8000-000000000000', cwd: os.tmpdir() };
+    sm.map.set('c1', entry);
+    await assert.rejects(sm._doResume('c1', os.tmpdir(), {}), /Runtime ownt builds its own launch, so it cannot check ANTHROPIC_API_KEY in the pane; launch refused/);
+    await assert.rejects(sm.fork({ sourceId: 'L0', parentId: 'c1', parentEntry: entry, cwd: os.tmpdir() }), /Runtime ownt builds its own launch, so it cannot check ANTHROPIC_API_KEY in the pane; launch refused/);
+  }));
+  assert.deepEqual(calls, [], 'no trust written and nothing launched');
+  assert.deepEqual([...sm.map.keys()], ['c1']);
+});
 
 test('dispatch: a wrapLaunch extension runtime decorates the adapter\'s command', async () => {
   const sm = smForDispatch();
@@ -2599,6 +3380,35 @@ test('dispatch: preflight gets the widened bag, and a refusal throws before any 
   assert.equal(fs.existsSync(target), false, 'no directory was created for a refused dispatch');
   assert.equal(sm.map.size, 0);
   fs.rmSync(base, { recursive: true, force: true });
+});
+
+test('dispatch refuses an agent the runtime does not list, before preflight or any dir', async () => {
+  const sm = smForDispatch();
+  let launched = false;
+  let preflighted = false;
+  sm._newSession = async () => { launched = true; };
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'aw-rt-agents-'));
+  const target = path.join(base, 'not-yet');
+  await assert.rejects(() => sm.dispatch({ cwd: target, intent: 'x', runtime: 'devcontainer', agent: 'codex' }), /"Devcontainer" runtime can't run codex sessions/);
+  await withRuntime({ id: 'toyrt', label: 'Toy', wrapLaunch: async ({ inner }) => inner, preflight: async () => { preflighted = true; return null; } }, 'toy', async () => {
+    await assert.rejects(() => sm.dispatch({ cwd: target, intent: 'x', runtime: 'toyrt', agent: 'codex' }), /"Toy" runtime can't run codex sessions \(it supports: claude\)/);
+  });
+  assert.equal(preflighted, false);
+  assert.equal(launched, false);
+  assert.equal(fs.existsSync(target), false);
+  assert.equal(sm.map.size, 0);
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+test('dispatch launches a codex session on a runtime that lists codex', async () => {
+  const sm = smForDispatch();
+  let captured;
+  sm._newSession = async (_tmux, _dir, inner) => { captured = inner; };
+  await withRuntime({ id: 'toyrt', label: 'Toy', agents: ['claude', 'codex'], wrapLaunch: async ({ inner }) => `toy && ${inner}` }, 'toy', async () => {
+    const { sessionId } = await sm.dispatch({ cwd: os.tmpdir(), intent: 'x', runtime: 'toyrt', agent: 'codex' });
+    assert.match(captured, /^toy && .*codex/);
+    assert.equal(sm.map.get(sessionId).runtime, 'toyrt');
+  });
 });
 
 test('resume and fork of a resumable:false card refuse with the runtime\'s label and leave its pane alone', async () => {
@@ -2695,5 +3505,167 @@ for (const mode of ['buildLaunch', 'wrapLaunch']) {
         assert.equal(fs.existsSync(cwd), false);
       });
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+}
+
+test('killForSession lists the pane processes before kill-session so the agent is stopped first', async () => {
+  const sm = new SessionManager();
+  sm.map.set('CARD', { tmux: 'cc_live', socket: '' });
+  sm.scanSockets = () => [''];
+  sm.refreshAlive = async () => {};
+  const verbs = [];
+  sm._tmux = async (_socket, a) => {
+    verbs.push(a[0]);
+    if (a[0] === 'has-session') throw new Error('gone now');
+    return { stdout: '' };
+  };
+  await sm.killForSession('CARD');
+  assert.deepEqual(verbs, ['list-panes', 'kill-session', 'has-session']);
+});
+
+for (const permissionMode of [undefined, 'bypassPermissions']) {
+  test(`dispatch and resume preserve permission mode ${permissionMode ?? 'auto'}`, async () => {
+    const sm = smForDispatch();
+    let captured = '';
+    sm._newSession = async (_t, _d, inner) => { captured = inner; };
+    sm.killForSession = async () => [];
+    const { sessionId } = await sm.dispatch({ cwd: os.tmpdir(), intent: 'x', permissionMode });
+    const expected = permissionMode ?? 'auto';
+    assert.equal(sm.map.get(sessionId).permissionMode, expected);
+    assert.ok(captured.includes(`'--permission-mode' '${expected}'`));
+    await withRuntime({ id: 'permission-test', label: 'Test', skipsHostResumeGuard: true, wrapLaunch: async ({ inner }) => inner }, 'permission-test', async () => {
+      sm.map.get(sessionId).runtime = 'permission-test';
+      await sm.resume(sessionId, os.tmpdir());
+      assert.ok(captured.includes(`'--permission-mode' '${expected}'`));
+      assert.equal(sm.map.get(sessionId).permissionMode, expected);
+      const fork = await sm.fork({ sourceId: sm.map.get(sessionId).liveSessionId, parentId: sessionId, parentEntry: sm.map.get(sessionId), cwd: os.tmpdir() });
+      assert.ok(captured.includes(`'--permission-mode' '${expected}'`));
+      assert.equal(sm.map.get(fork.sessionId).permissionMode, expected);
+    });
+  });
+}
+
+test('dispatch rejects invalid and unsupported permission modes before launch', async () => {
+  const sm = smForDispatch();
+  for (const opts of [{ permissionMode: 'invalid' }, { agent: 'codex', permissionMode: 'manual' }]) {
+    await assert.rejects(() => sm.dispatch({ cwd: os.tmpdir(), ...opts }), /permission mode/i);
+  }
+});
+
+test('_newSession returns the new pane id, and null when tmux prints something else', async () => {
+  const sm = new SessionManager();
+  const calls = [];
+  sm._tmux = async (socket, args) => { calls.push(args); return args[0] === 'new-session' ? { stdout: '%7\n' } : {}; };
+  assert.equal(await sm._newSession('cc_x', os.tmpdir(), 'true', ''), '%7');
+  const created = calls.find((a) => a[0] === 'new-session');
+  assert.deepEqual(created.slice(0, 7), ['new-session', '-d', '-P', '-F', '#{pane_id}', '-s', 'cc_x']);
+  sm._tmux = async () => ({ stdout: 'oops\n' });
+  assert.equal(await sm._newSession('cc_y', os.tmpdir(), 'true', ''), null);
+  sm._tmux = async () => ({});
+  assert.equal(await sm._newSession('cc_z', os.tmpdir(), 'true', ''), null);
+});
+
+test('dispatch, resume and fork store the launched pane id on the entry', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aw-pane-id-'));
+  const sm = smForDispatch();
+  sm._newSession = async () => '%7';
+  const { sessionId } = await sm.dispatch({ cwd: dir, intent: 'x' });
+  assert.equal(sm.entryFor(sessionId).paneId, '%7');
+
+  sm.killForSession = async () => [];
+  sm._tmux = async () => ({});
+  sm._newSession = async () => '%8';
+  sm.map.set('c1', { agent: 'claude', runtime: 'devcontainer', liveSessionId: '00000000-0000-4000-8000-000000000000', cwd: dir, paneId: '%1' });
+  await sm._doResume('c1', dir, {});
+  assert.equal(sm.entryFor('c1').paneId, '%8');
+  sm._newSession = async () => null;
+  await sm._doResume('c1', dir, {});
+  assert.equal(sm.entryFor('c1').paneId, undefined);
+
+  sm._newSession = async () => '%9';
+  const forked = await sm.fork({ sourceId: 'L0', parentId: 'PARENT', parentEntry: { agent: 'claude' }, cwd: dir });
+  assert.equal(sm.entryFor(forked.sessionId).paneId, '%9');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('paneTargetFor prefers the pane id and falls back to the tmux name', () => {
+  const sm = new SessionManager();
+  sm.map.clear();
+  sm.map.set('a', { tmux: 'cc_a', paneId: '%7' });
+  sm.map.set('b', { tmux: 'cc_b' });
+  sm.map.set('c', { tmux: 'cc_c', paneId: '%9' });
+  sm.alive = new Set(['cc_a', 'cc_b']);
+  assert.equal(sm.paneTargetFor('a'), '%7');
+  assert.equal(sm.paneTargetFor('b'), 'cc_b');
+  assert.equal(sm.paneTargetFor('c'), null);
+  assert.equal(sm.paneTargetFor('missing'), null);
+});
+
+
+for (const agent of ['claude', 'codex']) {
+  test(`${agent} dispatch collects launch context after before-dispatch bindings are persisted`, async () => {
+    const sm = smForDispatch();
+    let bound = false;
+    let command;
+    sm._fireExtHooks = async (name) => { if (name === 'onBeforeDispatch') bound = true; };
+    sm._launchContext = async () => ({ env: bound ? { AW_BOUND: 'yes' } : {}, addDirs: [] });
+    sm._newSession = async (_t, _d, inner) => { command = inner; };
+    await sm.dispatch({ cwd: os.tmpdir(), intent: 'x', agent });
+    assert.match(command, /AW_BOUND='yes'/);
+  });
+
+  test(`${agent} fork launch context gets the parent before onFork`, async () => {
+    const sm = smForDispatch();
+    sm._resolveLiveId = async () => 'live';
+    let seen;
+    const order = [];
+    sm._launchContext = async (ctx) => { seen = ctx; order.push('context'); return { env: {}, addDirs: [] }; };
+    sm._fireExtHooks = async (name) => { if (name === 'onFork') order.push('fork'); };
+    await sm.fork({ sourceId: 'source', parentId: 'parent', parentEntry: { agent }, cwd: os.tmpdir() });
+    assert.equal(seen.parentId, 'parent');
+    assert.equal(seen.reason, 'fork');
+    assert.deepEqual(order, ['context', 'fork']);
+  });
+
+  for (const phase of ['dispatch', 'resume', 'fork']) {
+    test(`${agent} ${phase} refuses deliberately without launching a pane`, async () => {
+      const sm = smForDispatch();
+      sm._resolveLiveId = async () => 'live';
+      sm.killForSession = async () => [];
+      let launched = false;
+      sm._newSession = async () => { launched = true; };
+      sm._launchContext = (payload) => collectLaunchContext(payload, {
+        ext: { hooks: { 'session.launchContext': [{ extId: 'guard', fn: () => ({ refuse: 'context unavailable' }) }] } },
+        onError: () => {},
+      });
+      const entry = { agent, cwd: os.tmpdir(), tmux: 'refused-pane', liveSessionId: 'live' };
+      if (agent === 'claude' && phase === 'resume') entry.runtime = 'devcontainer';
+      sm.map.set('parent', entry);
+      const launch = phase === 'dispatch' ? () => sm.dispatch({ cwd: os.tmpdir(), agent })
+        : phase === 'resume' ? () => sm.resume('parent', os.tmpdir())
+        : () => sm.fork({ sourceId: 'live', parentId: 'parent', parentEntry: entry, cwd: os.tmpdir() });
+      await assert.rejects(launch(), /context unavailable/);
+      assert.equal(launched, false);
+    });
+  }
+}
+
+for (const action of ['dispatch', 'resume', 'fork']) {
+  test(`${action} surfaces Codex trust errors without launching`, async () => {
+    const sm = smForDispatch();
+    const error = new Error('Cannot resolve project trust directory');
+    sm._ensureCodexTrust = () => { throw error; };
+    let launches = 0;
+    sm._newSession = async () => { launches++; };
+    sm.killForSession = async () => [];
+    const parentEntry = { agent: 'codex', cwd: os.tmpdir(), liveSessionId: 'live-trust' };
+    sm.map.set('card-trust-error', parentEntry);
+    const launch = {
+      dispatch: () => sm.dispatch({ agent: 'codex', cwd: os.tmpdir(), intent: 'x' }),
+      resume: () => sm.resume('card-trust-error', os.tmpdir()),
+      fork: () => sm.fork({ sourceId: 'live-trust', parentId: 'card-trust-error', parentEntry, cwd: os.tmpdir() }),
+    };
+    await assert.rejects(launch[action], (err) => err === error);
+    assert.equal(launches, 0);
   });
 }

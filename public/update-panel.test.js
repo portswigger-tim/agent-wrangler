@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { shouldReloadForVersion, updateSummary, sessionOnOlderCode, updateAvailable, rolledBackText, updateToastText } from './update-panel.js';
+import { shouldReloadForVersion, updateSummary, updateAvailable, rolledBackText, updateToastText, installDriftNotice, outdatedExtensions, changesText, extUpdateKeys, extUpdateIsNew, extUpdateToastText, extUpdateLineText } from './update-panel.js';
 
 test('a page reloads only when a known code version changes', () => {
   assert.equal(shouldReloadForVersion(null, 'abc'), false, 'first connect just records it');
@@ -26,14 +26,6 @@ test('an error shows the server message', () => {
   assert.equal(updateSummary({ phase: 'error', error: 'fetch failed' }), 'fetch failed');
 });
 
-test('a live session launched on another commit is on older code', () => {
-  assert.equal(sessionOnOlderCode({ managed: true, launchedCodeVersion: 'a' }, 'b'), true);
-  assert.equal(sessionOnOlderCode({ managed: true, launchedCodeVersion: 'b' }, 'b'), false);
-  assert.equal(sessionOnOlderCode({ managed: false, launchedCodeVersion: 'a' }, 'b'), false);
-  assert.equal(sessionOnOlderCode({ managed: true, launchedCodeVersion: null }, 'b'), false);
-  assert.equal(sessionOnOlderCode({ managed: true, launchedCodeVersion: 'a' }, null), false);
-});
-
 test('the settings dot shows only for an update that can be taken', () => {
   assert.equal(updateAvailable({ behind: 2, blocked: null }), true);
   assert.equal(updateAvailable({ behind: 2, blocked: 'dirty' }), false);
@@ -54,4 +46,153 @@ test('a new update toasts once per upstream commit, and not when the user just a
   assert.equal(updateToastText(status, { userAsked: true }), '');
   assert.equal(updateToastText({ ...status, blocked: 'dirty' }), '');
   assert.equal(updateToastText({ ...status, rolledBack: { target: 'r2' } }), '', 'the rollback banner already covers it');
+});
+
+test('the summary names the checkout service when an update cannot be applied here', () => {
+  assert.match(updateSummary({ phase: 'status', status: { head: 'x', commits: [], behind: 1, blocked: null, canApply: false } }), /not started by the checkout service/);
+});
+
+test('a landed upgrade asks for a restart, offering the button only where the server can restart', () => {
+  const drift = { installRoot: '/opt/aw', target: '/versions/0.2.0', version: '0.2.0', runningVersion: '0.1.0', restartHint: 'Restart it with `brew services restart agent-wrangler`.' };
+  assert.equal(installDriftNotice({ drift: null, canRestart: true }), null);
+  for (const [canRestart, restart, hint] of [
+    [true, true, null],
+    [false, false, drift.restartHint],
+  ]) {
+    const notice = installDriftNotice({ drift, canRestart });
+    assert.equal(notice.restart, restart, `canRestart=${canRestart}`);
+    assert.equal(notice.hint, hint, `canRestart=${canRestart}`);
+    assert.match(notice.text, /An upgrade has landed \(0\.1\.0 → 0\.2\.0\).*restart the wrangler to finish/);
+  }
+});
+
+test('the drift notice leaves out versions it cannot tell apart, and says when the path is mid-upgrade', () => {
+  const base = { installRoot: '/opt/aw', target: '/versions/x', restartHint: 'h' };
+  assert.match(installDriftNotice({ drift: { ...base, version: null, runningVersion: '0.1.0' } }).text, /^An upgrade has landed, but/);
+  assert.match(installDriftNotice({ drift: { ...base, version: '0.1.0', runningVersion: '0.1.0' } }).text, /^An upgrade has landed, but/);
+  assert.match(installDriftNotice({ drift: { ...base, target: null, version: null } }).text, /\/opt\/aw cannot be resolved, so an upgrade may be in progress/);
+});
+
+const ext = (id, label, commits, extra = {}) => ({ id, label, sha: `${id}0`, remoteSha: `${id}1`, behind: true, commits, ...extra });
+const many = { extensions: [ext('jira', 'Jira links', 7), ext('w2', 'Wrangler squared', 4), ext('slack', 'Slack digest', 1), { id: 'usage', behind: false }, { id: 'down', error: 'offline' }] };
+
+test('extension notices count only outdated extensions that were reached', () => {
+  assert.deepEqual(outdatedExtensions(many).map((e) => e.id), ['jira', 'w2', 'slack']);
+  assert.deepEqual(outdatedExtensions(null), []);
+  assert.equal(changesText(1), '1 change');
+  assert.equal(changesText(4), '4 changes');
+  assert.equal(changesText(50, true), '50+ changes');
+});
+
+test('the extension toast copy follows the approved design', () => {
+  assert.equal(extUpdateToastText(many), '3 extensions out of date · 12 changes missing');
+  assert.equal(extUpdateToastText({ extensions: [ext('jira', 'Jira links', 1)] }), 'Jira links has an update · 1 change missing');
+  assert.equal(extUpdateToastText({ extensions: [ext('jira', 'Jira links', 4)] }), 'Jira links has an update · 4 changes missing');
+  assert.equal(extUpdateToastText(many, { core: true }), 'Update available · 3 extensions out of date');
+  assert.equal(extUpdateToastText({ extensions: [ext('jira', 'Jira links', 50, { capped: true }), ext('w2', 'W2', 2)] }), '2 extensions out of date · 52+ changes missing');
+  assert.equal(extUpdateToastText({ extensions: [{ id: 'usage', behind: false }] }), '');
+});
+
+test('the Updates tab line says how many are out of date, or that all are current', () => {
+  assert.equal(extUpdateLineText(many), '3 extensions out of date · 12 changes missing.');
+  assert.equal(extUpdateLineText({ extensions: [ext('jira', 'Jira links', 4)] }), '1 extension out of date · 4 changes missing.');
+  assert.equal(extUpdateLineText({ extensions: [{ id: 'a', behind: false }, { id: 'b', behind: false }, { id: 'c', error: 'x' }] }), 'All 2 extensions up to date.');
+});
+
+test('the extension toast fires only when something newly falls behind', () => {
+  const keys = extUpdateKeys(many);
+  assert.deepEqual(keys, ['jira@jira1', 'slack@slack1', 'w2@w21']);
+  assert.equal(extUpdateIsNew(many, []), true);
+  assert.equal(extUpdateIsNew(many, keys), false);
+  // Fewer outdated after an update is not news.
+  assert.equal(extUpdateIsNew({ extensions: [ext('jira', 'Jira links', 7)] }, keys), false);
+  // A remote that moved again is.
+  assert.equal(extUpdateIsNew({ extensions: [{ ...ext('jira', 'Jira links', 9), remoteSha: 'jira2' }] }, keys), true);
+});
+
+function restartTestDocument(t) {
+  const previous = globalThis.document;
+  t.after(() => { globalThis.document = previous; });
+  globalThis.document = { createElement: (tag) => ({
+    tag, children: [],
+    append(...nodes) { this.children.push(...nodes); },
+    addEventListener(event, fn) { this[event] = fn; },
+  }) };
+}
+
+test('restart panel gates the action, dispatches clicks, and disables it during restart', async (t) => {
+  const { restartPanelEl } = await import('./update-panel.js');
+  restartTestDocument(t);
+  assert.equal(restartPanelEl(), null);
+  let restarts = 0;
+  const panel = restartPanelEl({ canRestart: true, onRestart: () => restarts++ });
+  const button = panel.children[0].children[1];
+  assert.equal(button.textContent, 'Restart now');
+  assert.equal(button.disabled, false);
+  button.click();
+  assert.equal(restarts, 1);
+  const busy = restartPanelEl({ canRestart: true, restarting: true }).children[0].children[1];
+  assert.equal(busy.disabled, true);
+  assert.equal(busy.textContent, 'Restarting…');
+  const drift = { target: '/versions/new', restartHint: 'Restart manually.' };
+  const unsupported = restartPanelEl({ drift });
+  assert.equal(unsupported.children[0].children.length, 1);
+  assert.equal(unsupported.children[2].textContent, 'Restart manually.');
+  assert.equal(restartPanelEl({ drift, canRestart: true }).children[0].children[1].textContent, 'Restart now');
+});
+
+test('Updates disables Restart now when another restart path is already in progress', async (t) => {
+  const { readFileSync } = await import('node:fs');
+  const vm = await import('node:vm');
+  const { restartPanelEl } = await import('./update-panel.js');
+  restartTestDocument(t);
+  const source = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+  const mountStart = source.indexOf('function mountUpdatePanel(host)');
+  const mount = source.slice(mountStart, source.indexOf('\n}\n', mountStart) + 3);
+  for (const state of [{ updatePhase: 'restarting', extRestarting: false }, { updatePhase: 'idle', extRestarting: true }]) {
+    const host = document.createElement('div');
+    const ctx = {
+      ...state, host, restartPanelEl, installDrift: null, canRestartServer: true,
+      installDriftRestarting: false, updateStatus: null, updateError: '', updateUnavailable: null,
+      updatePanelEl: () => null, extUpdatesEl: () => null, extBgUpdates: null, autoUpdate: 'off',
+    };
+    vm.runInNewContext(`${mount}\nmountUpdatePanel(host);`, ctx);
+    assert.equal(host.children[0].children[0].children[1].disabled, true, JSON.stringify(state));
+  }
+});
+
+test('reconnecting after a restart re-enables the Updates restart button', async (t) => {
+  const { readFileSync } = await import('node:fs');
+  const vm = await import('node:vm');
+  const { restartPanelEl } = await import('./update-panel.js');
+  restartTestDocument(t);
+  const source = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+  const functionSource = (name) => {
+    const start = source.indexOf(`function ${name}(`);
+    assert.ok(start >= 0);
+    const end = source.indexOf('\n}\n', start);
+    assert.ok(end > start);
+    return source.slice(start, end + 3);
+  };
+  const configStart = source.indexOf("else if (msg.type === 'config') {");
+  const configEnd = source.indexOf('\n    }', configStart);
+  assert.ok(configStart >= 0 && configEnd > configStart);
+  const configBody = source.slice(source.indexOf('{', configStart) + 1, configEnd);
+  const host = document.createElement('div');
+  const ctx = {
+    host, restartPanelEl, extRestarting: true, installDriftRestarting: true,
+    updatePhase: 'idle', installDrift: null, canRestartServer: true,
+    updateStatus: null, updateError: '', updateUnavailable: null,
+    updatePanelEl: () => null, extUpdatesEl: () => null, extBgUpdates: null, autoUpdate: 'off',
+    noteCodeVersion() {}, applyUpdateStatus() {}, applyExtUpdateStatus() {}, noteRolledBack() {},
+    remountExtensions() {}, extPendingRemoval: new Set(),
+    msg: { type: 'config', canRestart: true },
+  };
+  vm.runInNewContext(`${functionSource('mountUpdatePanel')}
+    function remountUpdatePanel() { host.children = []; mountUpdatePanel(host); }
+    ${functionSource('noteConfigUpdate')}
+    remountUpdatePanel();`, ctx);
+  assert.equal(host.children[0].children[0].children[1].disabled, true);
+  vm.runInNewContext(configBody, ctx);
+  assert.equal(host.children[0].children[0].children[1].disabled, false);
 });

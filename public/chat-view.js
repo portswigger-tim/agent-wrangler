@@ -9,6 +9,7 @@
 import { groupChatEvents } from './chat-group.js';
 import { createChatDom } from './chat-dom.js';
 import { createRenderer } from './markdown-preview.js';
+import { imageSources, imageMimeOf, sourceToFrame, MAX_IMAGES_PER_PASTE } from './clipboard-images.js';
 
 export const POLL_MS = 2000;
 // Send → "my own message is on screen" waits on two things: the TUI writing the
@@ -41,6 +42,93 @@ export function isHumanTypedUserItem(item) {
   return !String(item.event?.text || '').startsWith(AGENT_WRANGLER_NOTICE_PREFIX);
 }
 
+const LEADING_IMAGE_MARKER = /^\[Image #\d+\]\s*/;
+
+// The TUI records a pasted prompt with its tabs expanded to spaces (a leading
+// tab came back as four spaces in two independent Claude Code sessions), so an
+// echo and its transcript line can differ only in horizontal whitespace. Runs of
+// spaces and tabs collapse to one on both sides before comparing; newlines stay
+// significant so distinct multi-line prompts cannot be confused.
+const flatten = (text) => String(text || '').replace(/[ \t]+/g, ' ').trim();
+
+// Whether a transcript user event is the recording of a locally echoed prompt.
+export function echoMatchesEvent(echo, event) {
+  // Mounting reads a window of history, which may hold an older prompt with the
+  // same words ("yes", "continue") — only one recorded after the send is ours.
+  if (Number.isFinite(event.ts) && event.ts < echo.sentAt - 2000) return false;
+  let text = flatten(event.text).replace(/^! +/, '!');
+  const sent = flatten(echo.text).replace(/^! +/, '!');
+  if (text === sent) return Boolean(text) || echo.images.length === 0 || (Array.isArray(event.images) && event.images.length > 0);
+  // The TUI prepends one `[Image #N]` marker per attachment, so at most that many
+  // leading markers are dropped; any the human typed themselves stay in the prose.
+  for (let i = 0; i < echo.images.length && LEADING_IMAGE_MARKER.test(text); i += 1) {
+    text = text.replace(LEADING_IMAGE_MARKER, '').trim();
+    if (text === sent) return true;
+  }
+  return false;
+}
+
+// Codex folds prompts queued mid-turn into one user message, joined with no
+// separator, so no single echo equals the recorded text. A run of two or more
+// consecutive echoes whose texts concatenate (whitespace aside) to the event
+// text is that fold; returns the run, or [] when none is.
+export function echoRunMatchingEvent(echoes, event) {
+  const recordedAfter = (echo) => !Number.isFinite(event.ts) || event.ts >= echo.sentAt - 2000;
+  for (let start = 0; start < echoes.length - 1; start += 1) {
+    let rest = flatten(event.text);
+    const run = [];
+    for (let i = start; i < echoes.length; i += 1) {
+      const echo = echoes[i];
+      if (!recordedAfter(echo)) break;
+      let markers = 0;
+      while (markers < echo.images.length && LEADING_IMAGE_MARKER.test(rest)) {
+        rest = rest.replace(LEADING_IMAGE_MARKER, '');
+        markers += 1;
+      }
+      const sent = flatten(echo.text);
+      if (!sent && !markers) break;
+      if (!rest.startsWith(sent)) break;
+      rest = rest.slice(sent.length).trimStart();
+      run.push(echo);
+      if (!rest) return run.length >= 2 ? run : [];
+    }
+  }
+  return [];
+}
+
+export const ECHOES_KEY = 'aw.chatEchoes';
+export const ECHO_MAX_AGE_MS = 60 * 60 * 1000;
+
+export function parseStoredEchoes(raw, now = Date.now()) {
+  const out = new Map();
+  let parsed;
+  try { parsed = JSON.parse(raw || '[]'); } catch { return out; }
+  if (!Array.isArray(parsed)) return out;
+  for (const entry of parsed) {
+    if (!Array.isArray(entry) || typeof entry[0] !== 'string' || !Array.isArray(entry[1])) continue;
+    const list = entry[1]
+      .filter((e) => e && typeof e.text === 'string' && Number.isFinite(e.sentAt) && e.sentAt >= now - ECHO_MAX_AGE_MS)
+      .map((e) => ({
+        sessionId: entry[0],
+        requestId: e.requestId,
+        text: e.text,
+        images: Array.isArray(e.images) ? e.images.filter((n) => typeof n === 'string') : [],
+        sentAt: e.sentAt,
+        state: 'queued',
+        node: null,
+      }));
+    if (list.length) out.set(entry[0], list);
+  }
+  return out;
+}
+
+export function serializeEchoes(store) {
+  return JSON.stringify([...store].map(([sessionId, list]) => [
+    sessionId,
+    list.map((e) => ({ requestId: e.requestId, text: e.text, images: e.images, sentAt: e.sentAt })),
+  ]));
+}
+
 export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, onPickModel, onOpenFile, cwdFor } = {}) {
   const wrap = document.getElementById('chat-wrap');
   const stream = document.getElementById('chat-stream');
@@ -51,7 +139,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
   // and the agent's rendered markdown must linkify identically.
   const baseDir = () => (sessionId ? cwdFor?.(sessionId) : null) || null;
   const dom = createChatDom({
-    renderMarkdown: createRenderer(window.markdownit, { mdPathBase: baseDir }),
+    renderMarkdown: createRenderer(window.markdownit, { mdPathBase: baseDir, boardOrigin: window.location?.origin }),
     baseDir,
   });
 
@@ -65,7 +153,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
     const hit = e.target?.closest?.('[data-md-path]');
     if (!hit) return;
     e.preventDefault();
-    onOpenFile?.(hit.dataset.mdPath);
+    onOpenFile?.(hit.dataset.mdPath, sessionId);
   };
   stream.addEventListener('click', openMdPath);
   stream.addEventListener('keydown', (e) => {
@@ -115,13 +203,27 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
   // Declared here (factory scope), not inside submit() — setStatus and a later
   // task both need to reach `input` to drive its placeholder/disabled state.
   const input = document.getElementById('chat-input');
+  const isMac = /Mac/i.test(window.navigator?.userAgentData?.platform || window.navigator?.platform || '');
+  document.addEventListener('keydown', (e) => {
+    if (!isMac || !sessionId || wrap.hidden || e.defaultPrevented || e.isComposing || e.repeat) return;
+    if (e.key.toLowerCase() !== 'c' || !e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+    const active = document.activeElement;
+    if (active !== document.body && !wrap.contains(active)) return;
+    if (active === input && input.selectionStart !== input.selectionEnd) return;
+    const selection = window.getSelection?.();
+    if (!selection || !stream.contains(selection.anchorNode) || !stream.contains(selection.focusNode)) return;
+    if (!selection.toString()) return;
+    if (document.execCommand('copy')) e.preventDefault();
+  });
   const sendBtn = document.getElementById('chat-send');
   const stopBtn = document.getElementById('chat-stop');
   const hint = document.getElementById('chat-hint');
   const suggestionBtn = document.getElementById('chat-suggestion');
   const modelEl = document.getElementById('chat-current-model');
   const attachEl = document.getElementById('chat-attachments');
-  const jumpBtn = document.getElementById('chat-jump-last');
+  const jumpNav = document.getElementById('chat-jump-nav');
+  const jumpPrevBtn = document.getElementById('chat-jump-prev');
+  const jumpNextBtn = document.getElementById('chat-jump-next');
   const exitNoticeEl = document.getElementById('chat-exit-notice');
 
   // s.exitOutput (state-reader.js) off the graph node — the one thing this view
@@ -157,41 +259,67 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
     exitNoticeEl.appendChild(body);
   }
 
-  // The node for the most recently appended `chat-user` item, so the jump
-  // pill has something to scroll to. Reset wherever the stream itself is
-  // cleared (mount, unmount, rebuildStream) — otherwise it would dangle at a
-  // node no longer in the document.
-  let lastUserEl = null;
+  // Every human-typed `chat-user` node, oldest first, so the jump buttons can
+  // step between them. Reset wherever the stream itself is cleared (mount,
+  // unmount, rebuildStream) — otherwise it would dangle at nodes no longer in
+  // the document.
+  let userEls = [];
+
+  // Wider than .chat-user's scroll-margin-top (20px): a message the last jump
+  // landed on sits that far below the top edge and must not count as "next".
+  const NAV_SLACK_PX = 28;
 
   // getBoundingClientRect rather than offsetTop/scrollTop math: the stream is
-  // now position:absolute inside .chat-stream-wrap (see styles.css) so this
-  // stays correct regardless of that positioning, and it degrades safely
-  // (guarded below) against the test suite's DOM stub, which has neither.
-  function jumpTargetOffscreen() {
-    if (!lastUserEl) return false;
-    if (typeof lastUserEl.getBoundingClientRect !== 'function' || typeof stream.getBoundingClientRect !== 'function') return false;
-    const r = lastUserEl.getBoundingClientRect();
+  // position:absolute inside .chat-stream-wrap (see styles.css) so this stays
+  // correct regardless of that positioning, and it degrades safely (guarded
+  // below) against the test suite's DOM stub, which has neither.
+  function navTargets() {
+    const none = { prev: null, next: null };
+    if (!userEls.length || typeof stream.getBoundingClientRect !== 'function') return none;
     const sr = stream.getBoundingClientRect();
-    return r.bottom <= sr.top || r.top >= sr.bottom;
+    let prev = null;
+    let next = null;
+    for (const el of userEls) {
+      if (typeof el.getBoundingClientRect !== 'function') return none;
+      const top = el.getBoundingClientRect().top - sr.top;
+      if (top < -NAV_SLACK_PX) prev = el;
+      else if (top > NAV_SLACK_PX && !next) next = el;
+    }
+    // Scrolling is clamped at the bottom, so stepping "down" there would
+    // leave the view where it is and the button would look dead.
+    if (stream.scrollHeight - stream.scrollTop - stream.clientHeight < 1) return { prev, next: null };
+    // Past the last user message, down means the end of the conversation.
+    return { prev, next: next || 'bottom' };
   }
 
   function updateJumpVisibility() {
-    jumpBtn.hidden = !jumpTargetOffscreen();
+    const { prev, next } = navTargets();
+    jumpPrevBtn.disabled = !prev;
+    jumpNextBtn.disabled = !next;
+    jumpNav.hidden = !prev && !next;
   }
   stream.addEventListener('scroll', updateJumpVisibility);
-  jumpBtn.addEventListener('click', () => {
-    // Captured rather than read again after the scroll/timeout below: a new
-    // user message could arrive and reassign lastUserEl before either fires,
-    // and this click must only ever act on the bubble it was pressed for.
-    const target = lastUserEl;
+
+  function jumpTo(target) {
     if (!target) return;
+    if (target === 'bottom') {
+      // Instant, not smooth: a poll landing mid-animation would see us not
+      // yet at the bottom and stop auto-following, stranding the view short.
+      stream.scrollTop = stream.scrollHeight;
+      updateJumpVisibility();
+      return;
+    }
     target.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
     target.classList?.remove('chat-jump-target');
-    void target.offsetWidth; // restart the animation if the pill is clicked again mid-pulse
+    void target.offsetWidth; // restart the animation if pressed again mid-pulse
     target.classList?.add('chat-jump-target');
+    // `target` is captured so a later press only ever clears the bubble it
+    // pulsed, not whichever one is current when the timeout fires.
     setTimeout(() => target.classList?.remove('chat-jump-target'), 950);
     updateJumpVisibility();
-  });
+  }
+  jumpPrevBtn.addEventListener('click', () => jumpTo(navTargets().prev));
+  jumpNextBtn.addEventListener('click', () => jumpTo(navTargets().next));
 
   wrap.addEventListener('click', (e) => {
     if (input.contains(e.target)) return;
@@ -221,15 +349,49 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
   // reader was actually trying to recover.
   //
   // Held per card id rather than simply cleared, so switching away does not throw
-  // away work in progress. In memory only, and deliberately not localStorage: an
-  // unsent prompt is a thing of the moment, and surviving a reload would put words
-  // in the composer the reader has long forgotten writing.
+  // away work in progress. Mirrored to localStorage so a reload (e.g. the UI
+  // restarting for an update) does not lose a long message either.
   //
   // Attachments travel WITH the text, because a pasted image's filename is only
   // meaningful inside the session whose pastes folder holds it — restoring the
   // prose without them would silently drop the images it refers to, and carrying
   // them to a DIFFERENT session is the leak this whole store exists to stop.
-  const drafts = new Map();
+  const DRAFTS_KEY = 'aw.chatDrafts';
+  const DRAFTS_MAX = 50;
+  function parseStoredDrafts(raw) {
+    try {
+      const parsed = JSON.parse(raw || '[]');
+      return Array.isArray(parsed) ? parsed.filter((e) => Array.isArray(e) && typeof e[0] === 'string' && typeof e[1]?.text === 'string' && Array.isArray(e[1].attachments)) : [];
+    } catch { return []; }
+  }
+  // Every read and write goes through storage rather than a private snapshot, so a
+  // second board tab never overwrites this one's drafts (or resurrects a sent one)
+  // from a stale copy. After a storage write fails, the in-memory map takes over
+  // so drafts still survive card switches.
+  class PersistedDrafts {
+    constructor() { this.memory = null; }
+    read() {
+      if (this.memory) return this.memory;
+      try { return new Map(parseStoredDrafts(localStorage.getItem(DRAFTS_KEY))); } catch { return new Map(); }
+    }
+    write(map) {
+      while (map.size > DRAFTS_MAX) map.delete(map.keys().next().value);
+      try { localStorage.setItem(DRAFTS_KEY, JSON.stringify([...map])); } catch { this.memory = map; }
+    }
+    get(k) { return this.read().get(k); }
+    set(k, v) {
+      const map = this.read();
+      map.delete(k);
+      map.set(k, v);
+      this.write(map);
+      return this;
+    }
+    delete(k) {
+      const map = this.read();
+      if (map.delete(k)) this.write(map);
+    }
+  }
+  const drafts = new PersistedDrafts();
 
   // Set when THIS view interrupted a turn: the interrupt is what may leave a
   // restored prompt in the PANE's composer, so the next send must clear it. Armed
@@ -243,6 +405,98 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
   let restoreOverDraft = false;
   let messageSeq = 0;
   const pendingMessages = new Map();
+  // Local echoes of sent prompts, per session, newest last. Each is drawn the
+  // moment Send is pressed (dashed) and stays until the transcript records the
+  // prompt, which then replaces it. Held by session rather than by the DOM so
+  // leaving the view (to the terminal, or another card) and coming back redraws
+  // them; `node` is null whenever the stream they were drawn in has been cleared.
+  // Mirrored to localStorage so a reload does not lose prompts the agent has not
+  // yet recorded (e.g. while it auto-compacts). A prompt whose send was still in
+  // flight at reload has no delivery verdict left to await, so it comes back as
+  // queued.
+  const echoStore = (() => {
+    try { return parseStoredEchoes(localStorage.getItem(ECHOES_KEY)); } catch { return new Map(); }
+  })();
+  function persistEchoes() {
+    try { localStorage.setItem(ECHOES_KEY, serializeEchoes(echoStore)); } catch {}
+  }
+  const echoList = () => echoStore.get(sessionId) || [];
+
+  function detachEchoNodes() {
+    for (const list of echoStore.values()) {
+      for (const e of list) {
+        e.node?.remove();
+        e.node = null;
+      }
+    }
+  }
+
+  function removeEcho(echo) {
+    echo.node?.remove();
+    const list = (echoStore.get(echo.sessionId) || []).filter((e) => e !== echo);
+    if (list.length) echoStore.set(echo.sessionId, list);
+    else echoStore.delete(echo.sessionId);
+    persistEchoes();
+    if (echo.sessionId === sessionId) pinTail();
+  }
+
+  function pruneEchoes() {
+    const cutoff = Date.now() - ECHO_MAX_AGE_MS;
+    for (const list of [...echoStore.values()]) for (const e of list) if (e.sentAt < cutoff) removeEcho(e);
+  }
+
+  // One tray holds every prompt sent but not yet recorded, so several queued
+  // prompts read as a single waiting group rather than a run of separate messages.
+  const queueTray = document.createElement('div');
+  queueTray.className = 'chat-queue';
+  const queueHead = document.createElement('div');
+  queueHead.className = 'chat-queue-head';
+  queueTray.appendChild(queueHead);
+
+  // The tail of the stream is always the working row, then the tray. Queued
+  // prompts belong after everything the agent is still producing, whatever order
+  // the nodes were appended in.
+  function pinTail() {
+    if (live) stream.appendChild(live);
+    const list = echoList();
+    if (!list.length) {
+      queueTray.remove();
+      return;
+    }
+    for (const e of list) {
+      if (!e.node) {
+        e.node = dom.itemNode({
+          type: 'user',
+          event: { text: e.text, images: e.images.map((name) => ({ label: 'Image', name })) },
+        });
+        e.node.dataset.pending = e.state;
+      }
+      queueTray.appendChild(e.node);
+    }
+    const queued = list.filter((e) => e.state === 'queued').length;
+    queueHead.textContent = queued
+      ? `Queued · ${queued} waiting for the agent`
+      : 'Sending…';
+    stream.appendChild(queueTray);
+  }
+
+  const eventKey = (event) => `${event.ts}|${event.text}`;
+  // Events that have already acknowledged a send, per session, so history replayed
+  // by a remount cannot acknowledge a newer identical prompt.
+  const ackedEvents = new Map();
+  const ACKED_MAX = 200;
+
+  function echoMatches(echo, item) {
+    if (ackedEvents.get(echo.sessionId)?.has(eventKey(item.event || {}))) return false;
+    return echoMatchesEvent(echo, item.event || {});
+  }
+
+  function noteAcked(sessionId, event) {
+    const set = ackedEvents.get(sessionId) || new Set();
+    set.add(eventKey(event));
+    if (set.size > ACKED_MAX) set.delete(set.values().next().value);
+    ackedEvents.set(sessionId, set);
+  }
 
   function saveDraft(id) {
     if (!id) return;
@@ -267,6 +521,11 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
   // either call site deciding on its own partial view.
   let lastStatus = null;
   let lastWaitingReason = null;
+  let lastWaitingFor = null;
+  // A `session.inputGate` lock on this session (`{ reason }`, app.js), or null.
+  // Unlike a needs-you block it is not cleared by mount: the app re-seeds it
+  // right after, and a session switch must never flash the composer unlocked.
+  let lastGate = null;
   let lastPending = null;
   let lastTs = null;
   // Claude Code's suggested next prompt, scraped off the pane server-side (see
@@ -395,7 +654,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
     }
     // Re-appended every render so it stays last even when this call follows an
     // appendItems that added nodes after it.
-    stream.appendChild(live);
+    pinTail();
     paintLive();
     if (stick) stream.scrollTop = stream.scrollHeight;
   }
@@ -414,7 +673,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
   // word on a prompt they did not write.
   function loadComposer(text) {
     input.value = text;
-    input.disabled = false;
+    input.disabled = Boolean(lastGate);
     input.focus();
     // Caret at the end, not a selection over the whole value: the point of
     // restoring a prompt is to amend it, and a full selection means the next
@@ -424,6 +683,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
     // fire, so a multi-line suggestion would land in a one-row box that hides
     // most of itself.
     input.dispatchEvent(new Event('input'));
+    scheduleDraftSave();
   }
 
   function renderSuggestion() {
@@ -431,38 +691,48 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
     // discard something the human was in the middle of writing — and while
     // blocked, when the composer is disabled and the only useful action is
     // answering the prompt in the pane.
-    const show = Boolean(lastSuggestion) && !input.value.trim() && !blockedByNeedsYou();
+    const show = Boolean(lastSuggestion) && !input.value.trim() && !blockedByNeedsYou() && !lastGate && !echoList().length;
     suggestionBtn.hidden = !show;
     if (show) suggestionBtn.textContent = lastSuggestion;
   }
 
   // An attached image is a complete prompt on its own (the TUI submits the bare
   // `[Image #1]`), so Send has to stay live for an empty box that holds one.
+  let refocusInput = false;
+
   function renderSendability() {
     if (sessionId && pendingMessages.has(sessionId)) {
+      // Disabling a focused field blurs it for good, so note it to hand focus back.
+      if (document.activeElement === input) refocusInput = true;
       input.disabled = true;
       sendBtn.disabled = true;
       return;
     }
-    if (blockedByNeedsYou()) return; // setStatus owns the button while blocked
+    if (blockedByNeedsYou() || lastGate) return; // setStatus owns the button while blocked
     input.disabled = false;
+    if (refocusInput) {
+      refocusInput = false;
+      // Only when focus is still nowhere: a click elsewhere meanwhile is the user's call.
+      if (!document.activeElement || document.activeElement === document.body) input.focus();
+    }
     sendBtn.disabled = !input.value.trim() && !attachments.length;
   }
 
   function submit() {
     const text = input.value.trim();
-    if (!sessionId || pendingMessages.has(sessionId) || (!text && !attachments.length)) return;
+    if (!sessionId || lastGate || pendingMessages.has(sessionId) || (!text && !attachments.length)) return;
     // The EXISTING human message path: live → paste into the pane, dormant →
     // wake and deliver, archived → refuse. Deliberately not the mailbox, which
     // is peer-only. Only NAMES go over the wire — the server resolves them back
     // to paths inside this session's own pastes folder.
     const requestId = `${requestEra}#${++messageSeq}`;
-    const pending = { requestId, sessionId, clearComposer: paneRestoreArmed };
+    const pending = { requestId, sessionId, clearComposer: paneRestoreArmed, draft: { text: input.value, attachments: attachments.slice() } };
     pendingMessages.set(sessionId, pending);
     if (pending.clearComposer) {
       paneRestoreArmed = false;
       restoreToken = null;
     }
+    const sentAttachments = attachments;
     const accepted = send({
       type: 'message', sessionId, text,
       requestId,
@@ -473,9 +743,26 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       pendingMessages.delete(sessionId);
       if (pending.clearComposer) paneRestoreArmed = true;
       setPasteNote('Not sent: connection unavailable.');
+    } else {
+      setPasteNote('Sending…');
+      echoSent(pending, text, sentAttachments);
+      input.value = '';
+      input.style.height = 'auto';
+      attachments = [];
+      renderAttachments();
     }
-    else setPasteNote('Sending…');
     renderSendability();
+  }
+
+  function echoSent(pending, text, sentAttachments) {
+    const echo = { sessionId: pending.sessionId, requestId: pending.requestId, text, images: sentAttachments.map((a) => a.name), sentAt: Date.now(), state: '1', node: null };
+    pending.echo = echo;
+    echoStore.set(echo.sessionId, [...echoList(), echo]);
+    persistEchoes();
+    pinTail();
+    stream.scrollTop = stream.scrollHeight;
+    updateJumpVisibility();
+    renderSuggestion();
   }
 
   sendBtn.addEventListener('click', submit);
@@ -523,7 +810,19 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       interruptAndRestore();
     }
   });
-  input.addEventListener('input', () => {
+  let draftTimer = null;
+  // Explicit rather than driven by every input event: mount's loadDraft dispatches
+  // a synthetic input, and treating that hydration as an edit would file one
+  // card's draft under another.
+  function scheduleDraftSave() {
+    if (!sessionId) return;
+    clearTimeout(draftTimer);
+    const id = sessionId;
+    const era = requestEra;
+    draftTimer = setTimeout(() => { if (sessionId === id && requestEra === era && !pendingMessages.has(id)) saveDraft(id); }, 400);
+  }
+  input.addEventListener('input', (e) => {
+    if (e.isTrusted) scheduleDraftSave();
     input.style.height = 'auto';
     // An unrendered element (display:none somewhere above — the sidebar hidden by
     // the diff view's fullscreen, the pane hidden on unmount) reports scrollHeight
@@ -546,10 +845,6 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
   // the agent auto-attaches it. Verified against a live pane: a path inside
   // pasted prompt text becomes a real inline image, not a Read tool call.
   //
-  // Bounded per paste. A clipboard can hold a whole screenshot burst, and each
-  // one costs a base64 frame plus a file, so a slip is capped rather than
-  // unbounded — the human can always paste again.
-  const MAX_IMAGES_PER_PASTE = 4;
   // Tokens are era-stamped so a reply that lands after the view moved to another
   // session is dropped rather than typing a stale path into someone else's
   // composer. Same reasoning as the poll's token, different reply type, so
@@ -589,51 +884,93 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
         attachments = attachments.filter((x) => x !== a);
         renderAttachments();
         renderSendability();
+        scheduleDraftSave();
       });
       chip.appendChild(drop);
       attachEl.appendChild(chip);
     });
   }
 
-  input.addEventListener('paste', (e) => {
+  // Paste and drop share one path: both hand over a DataTransfer, and what a
+  // source puts in it (see clipboard-images.js) does not depend on which gesture
+  // delivered it.
+  function attachFrom(e, dt) {
     if (!sessionId) return;
-    const items = Array.from(e.clipboardData?.items || []);
-    const files = items
-      .filter((it) => it.kind === 'file' && typeof it.type === 'string' && it.type.startsWith('image/'))
-      .map((it) => it.getAsFile())
-      .filter(Boolean);
-    // No image on the clipboard means this is an ordinary text paste, which must
-    // fall through untouched — preventDefault here would break pasting text.
-    if (!files.length) return;
+    const { sources, text } = imageSources(dt);
+    // No image means an ordinary text paste or drop, which must fall through
+    // untouched — preventDefault here would break pasting text.
+    if (!sources.length) return;
     e.preventDefault();
-    const take = files.slice(0, MAX_IMAGES_PER_PASTE);
-    const skipped = files.length - take.length;
+    // Markup with an image in it (a copied selection) still carries words the
+    // human meant to paste, and preventDefault just swallowed them.
+    // setRangeText fires no input event, so raise one for the resize and Send.
+    if (text) {
+      input.setRangeText(text, input.selectionStart, input.selectionEnd, 'end');
+      input.dispatchEvent(new Event('input'));
+      scheduleDraftSave();
+    }
+    attachSources(sources);
+  }
+
+  function attachSources(sources) {
+    const take = sources.slice(0, MAX_IMAGES_PER_PASTE);
+    const skipped = sources.length - take.length;
     setPasteNote(take.length > 1 ? `Attaching ${take.length} images…` : 'Attaching image…');
-    for (const file of take) {
+    for (const source of take) {
       const token = `${requestEra}#${++pasteSeq}`;
       pendingPastes.add(token);
-      const reader = new FileReader();
-      reader.onerror = () => {
-        pendingPastes.delete(token);
-        setPasteNote('Could not read that image from the clipboard.');
-      };
-      reader.onload = () => {
-        // readAsDataURL gives "data:<mime>;base64,<payload>" — split once on the
-        // first comma so a payload containing one cannot truncate the split.
-        const raw = String(reader.result || '');
-        const comma = raw.indexOf(',');
-        const mime = /^data:([^;,]+)/.exec(raw)?.[1] || file.type;
-        if (comma < 0) {
-          pendingPastes.delete(token);
-          setPasteNote('Could not read that image from the clipboard.');
-          return;
-        }
-        send({ type: 'paste-image', sessionId, token, mime, dataBase64: raw.slice(comma + 1) });
-      };
-      reader.readAsDataURL(file);
+      sourceToFrame(source).then(
+        (frame) => {
+          // Gone stale while the image was being read or converted.
+          if (!pendingPastes.has(token)) return;
+          send({ type: 'paste-image', sessionId, token, ...frame });
+        },
+        (err) => {
+          if (!pendingPastes.delete(token)) return;
+          setPasteNote(err?.message || 'Could not read that image.');
+        },
+      );
     }
     if (skipped > 0) setPasteNote(`Attaching ${take.length} images — ${skipped} more were skipped.`);
+  }
+
+  // Ctrl+V is the terminal's paste key, and on macOS the browser fires no paste
+  // event for it, so muscle memory from the terminal pasted nothing here.
+  input.addEventListener('keydown', (e) => {
+    if (!isMac || !sessionId || !e.ctrlKey || e.metaKey || e.altKey || e.shiftKey || e.key.toLowerCase() !== 'v') return;
+    if (!navigator.clipboard?.read) return;
+    e.preventDefault();
+    const id = sessionId;
+    const era = requestEra;
+    const current = () => sessionId === id && requestEra === era && !pendingMessages.has(id);
+    navigator.clipboard.read().then(async (clipItems) => {
+      if (!current()) return;
+      const files = [];
+      let text = '';
+      for (const item of clipItems) {
+        const imgType = item.types.find((t) => t.startsWith('image/'));
+        if (imgType) files.push(new File([await item.getType(imgType)], 'paste', { type: imgType }));
+        else if (item.types.includes('text/plain')) text += await (await item.getType('text/plain')).text();
+      }
+      if (!current()) return;
+      if (files.length) attachSources(files.map((file) => ({ kind: 'file', file, mime: imageMimeOf(file) })));
+      else if (text) {
+        input.setRangeText(text, input.selectionStart, input.selectionEnd, 'end');
+        input.dispatchEvent(new InputEvent('input', { bubbles: true }));
+        scheduleDraftSave();
+      }
+    }).catch(() => setPasteNote('Clipboard access was blocked — use Cmd+V to paste.'));
   });
+
+  input.addEventListener('paste', (e) => attachFrom(e, e.clipboardData));
+  // The whole view is the drop target rather than just the composer, which is a
+  // thin strip that is easy to miss with a file in hand. dragover has to cancel
+  // for the drop to fire at all, but only when files are coming, so dragging
+  // text around the composer keeps its native behaviour.
+  wrap.addEventListener('dragover', (e) => {
+    if (sessionId && Array.from(e.dataTransfer?.types || []).includes('Files')) e.preventDefault();
+  });
+  wrap.addEventListener('drop', (e) => attachFrom(e, e.dataTransfer));
 
   modelEl.addEventListener('click', () => {
     if (!sessionId || modelEl.disabled) return;
@@ -679,7 +1016,15 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       // A mail/PR-nudge item still leaves the PREVIOUS tracked node in place —
       // it must not overwrite a genuine human message with one that only
       // looks like one, even though it renders in the same bubble style.
-      if (item.type === 'user' && isHumanTypedUserItem(item)) lastUserEl = node;
+      if (item.type === 'user' && isHumanTypedUserItem(item)) {
+        userEls.push(node);
+        const hit = echoList().find((e) => echoMatches(e, item));
+        const folded = hit ? [] : ackedEvents.get(sessionId)?.has(eventKey(item.event || {})) ? [] : echoRunMatchingEvent(echoList(), item.event || {});
+        noteAcked(sessionId, item.event);
+        const hits = hit ? [hit] : folded;
+        for (const h of hits) removeEcho(h);
+        if (hits.length) renderSuggestion();
+      }
       if (item.type === 'subagent') {
         node.addEventListener('click', () => onSubagentClick?.(sessionId, item.event.id));
       }
@@ -704,8 +1049,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       }
       stream.appendChild(node);
     }
-    // Keep the live row last: these nodes were just appended after it.
-    if (live) stream.appendChild(live);
+    pinTail();
     if (stick) stream.scrollTop = stream.scrollHeight;
     updateJumpVisibility();
   }
@@ -750,10 +1094,11 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
     offset = null;
     clearBurst();
     stream.textContent = '';
+    detachEchoNodes();
     // Same dangling-reference reasoning as `live` below: the node this pointed
     // at was just cleared out of the document.
-    lastUserEl = null;
-    jumpBtn.hidden = true;
+    userEls = [];
+    jumpNav.hidden = true;
     // The row was a child of the stream just cleared, so the handle is dangling —
     // dropped here so the next render appends a fresh one instead of a detached
     // node with a live timer against it.
@@ -761,6 +1106,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
     clearInterval(tick);
     tick = null;
     renderLive();
+    pinTail();
     poll();
   }
 
@@ -771,21 +1117,31 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       const current = sessionId === msg.sessionId;
       pendingMessages.delete(msg.sessionId);
       if (!msg.ok) {
+        if (pending.echo) {
+          removeEcho(pending.echo);
+          renderSuggestion();
+        }
         if (current && pending.clearComposer) paneRestoreArmed = true;
         if (current) {
+          input.value = pending.draft.text;
+          attachments = pending.draft.attachments.slice();
+          input.dispatchEvent(new Event('input'));
+          renderAttachments();
+          saveDraft(msg.sessionId);
           const prefix = msg.outcome === 'unknown' ? 'Delivery status unknown' : 'Not sent';
           setPasteNote(`${prefix}: ${msg.error || 'check the terminal before sending again'}`);
           renderSendability();
-        }
+        } else drafts.set(msg.sessionId, pending.draft);
         return;
       }
+      if (pending.echo) {
+        pending.echo.state = 'queued';
+        if (pending.echo.node) pending.echo.node.dataset.pending = 'queued';
+        if (current) pinTail();
+      }
       if (current) {
-        input.value = '';
-        input.style.height = 'auto';
-        attachments = [];
         drafts.delete(msg.sessionId);
         setPasteNote(null);
-        renderAttachments();
         renderSendability();
         kickBurst();
       } else drafts.delete(msg.sessionId);
@@ -829,6 +1185,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       attachments.push({ name: msg.name });
       renderAttachments();
       renderSendability();
+      scheduleDraftSave();
       input.focus();
       // Cleared only once nothing is still in flight, so a multi-image paste does
       // not flash "done" while the rest are still uploading.
@@ -846,8 +1203,10 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       generation += 1;
       requestEra += 1;
       stream.textContent = '';
-      lastUserEl = null;
-      jumpBtn.hidden = true;
+      detachEchoNodes();
+      pruneEchoes();
+      userEls = [];
+      jumpNav.hidden = true;
       // A new era starts with no known pending call or status — otherwise the
       // previous session's working line would flash on screen until this
       // session's own setStatus/onChatReply arrives.
@@ -887,6 +1246,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       clearInterval(tick);
       tick = null;
       renderLive();
+      pinTail();
       renderSuggestion();
       // Cleared, not carried: the model belongs to the session being left. The
       // caller re-seeds it straight after mount (see renderSidebar in app.js).
@@ -911,8 +1271,9 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       requestEra += 1;
       wrap.hidden = true;
       stream.textContent = '';
-      lastUserEl = null;
-      jumpBtn.hidden = true;
+      detachEchoNodes();
+      userEls = [];
+      jumpNav.hidden = true;
       lastPending = null;
       lastStatus = null;
       lastWaitingReason = null;
@@ -1029,6 +1390,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       // (driven by this same status) has already disappeared.
       lastStatus = status;
       lastWaitingReason = waitingReason || null;
+      lastWaitingFor = waitingFor || null;
       renderLive();
       renderSuggestion();
       renderHint();
@@ -1036,7 +1398,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       const box = document.querySelector('.chat-box');
       const needsYou = status === 'needs-you';
       const isApiError = needsYou && waitingReason === 'api-error';
-      const blocked = blockedByNeedsYou();
+      const blocked = blockedByNeedsYou() || Boolean(lastGate);
       bar.hidden = !needsYou;
       bar.textContent = ''; // called on every render — rebuild rather than accumulate children.
       if (needsYou) {
@@ -1076,7 +1438,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       // stop inviting input until the dialog is answered — and revert cleanly once
       // it isn't, since this runs on every render in both directions.
       box?.setAttribute('data-blocked', blocked ? '1' : '0');
-      input.placeholder = blocked ? 'Answer the prompt in the terminal first…' : 'Send a prompt…';
+      input.placeholder = lastGate ? lastGate.reason : (blocked ? 'Answer the prompt in the terminal first…' : 'Send a prompt…');
       input.disabled = blocked;
       // A disabled input still retains its value, so without this a prompt typed
       // before the block started stays sendable via a click — defeating the guard.
@@ -1086,6 +1448,14 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       sendBtn.disabled = blocked;
       if (!blocked) renderSendability();
       stopBtn.hidden = status !== 'working';
+    },
+
+    // Lock or unlock the composer for a `session.inputGate` (null unlocks).
+    setInputGate(gate) {
+      const next = gate?.reason ? { reason: gate.reason } : null;
+      if ((next?.reason || null) === (lastGate?.reason || null)) return;
+      lastGate = next;
+      if (sessionId) this.setStatus(lastStatus, lastWaitingFor, lastWaitingReason);
     },
   };
 }

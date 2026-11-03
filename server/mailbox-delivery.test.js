@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import os from 'node:os';
 import { deliverMailNotification } from './mailbox-delivery.js';
 import { createPaneDeferral } from './pane-deferral.js';
+import { composeMailNotification } from './mail-notification.js';
 
 function deps({ live = {}, entries = {}, mcpConnectsAfterPolls = 0, mcpSeenStale = false } = {}) {
   const sent = [];
@@ -40,12 +42,202 @@ test('live recipient: delivers into the pane without resuming it', async () => {
   assert.equal(d.resumed.length, 0);
 });
 
+// A Claude recipient with a published socket, recording socket sends.
+function socketDeps({ agent, socket = { socketPath: '/s/x.sock', keyPath: '/s/x.key' }, sendFails = false } = {}) {
+  const d = deps({ live: { CARD1: { tmux: 'cc_one', socket: '/s/a' } }, entries: { CARD1: { agent, liveSessionId: 'LIVE1' } } });
+  d.socketSent = [];
+  d.socketLookups = [];
+  d.findSocket = (id) => { d.socketLookups.push(id); return socket; };
+  d.sendSocket = async (target, text) => {
+    if (sendFails) throw new Error('socket send failed: ECONNREFUSED');
+    d.socketSent.push({ target, text });
+  };
+  return d;
+}
+
+function assertSocketMarker(actual, original) {
+  assert.equal(actual.slice(0, original.length), original);
+  assert.match(actual.slice(original.length), /^\n\[Notification: [0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\]$/);
+}
+
+test('Claude socket notifications get fresh UUID markers on every send', async () => {
+  const d = socketDeps({ agent: 'claude' });
+  const text = composeMailNotification([{ from: 'same_sender', body: 'private body' }]);
+  for (let i = 0; i < 3; i += 1) {
+    assert.deepEqual(await deliverMailNotification('CARD1', text, d), { mode: 'live' });
+  }
+  assert.equal(d.socketSent.length, 3);
+  for (const sent of d.socketSent) assertSocketMarker(sent.text, text);
+  assert.equal(new Set(d.socketSent.map((sent) => sent.text)).size, 3);
+  assert.deepEqual(d.sent, []);
+});
+
+for (const [route, options] of [
+  ['Codex', { agent: 'codex' }],
+  ['Claude terminal fallback without a socket', { agent: 'claude', socket: null }],
+  ['Claude terminal fallback after a failed socket send', { agent: 'claude', sendFails: true }],
+]) {
+  test(`${route} retains the original notification text`, async () => {
+    const d = socketDeps(options);
+    const text = composeMailNotification([{ from: 'same_sender', body: 'private body' }]);
+    for (let i = 0; i < 2; i += 1) {
+      assert.deepEqual(await deliverMailNotification('CARD1', text, d), { mode: 'live' });
+    }
+    assert.deepEqual(d.sent.map((sent) => sent.text), [text, text]);
+  });
+}
+
+test('live Claude recipient is delivered over its socket and never pasted', async () => {
+  const d = socketDeps({ agent: 'claude' });
+  const mode = await deliverMailNotification('CARD1', 'you have mail', d);
+  assert.deepEqual(mode, { mode: 'live' });
+  assert.deepEqual(d.socketSent[0].target, { socketPath: '/s/x.sock', keyPath: '/s/x.key' });
+  assertSocketMarker(d.socketSent[0].text, 'you have mail');
+  assert.deepEqual(d.socketLookups, ['LIVE1']);
+  assert.deepEqual(d.sent, []);
+});
+
+test('an entry with no agent recorded is treated as Claude', async () => {
+  const d = socketDeps({});
+  await deliverMailNotification('CARD1', 'you have mail', d);
+  assert.equal(d.socketSent.length, 1);
+  assert.deepEqual(d.sent, []);
+});
+
+test('live Codex recipient is pasted, never sent over a socket', async () => {
+  const d = socketDeps({ agent: 'codex' });
+  const mode = await deliverMailNotification('CARD1', 'you have mail', d);
+  assert.deepEqual(mode, { mode: 'live' });
+  assert.deepEqual(d.socketSent, []);
+  assert.deepEqual(d.socketLookups, []);
+  assert.equal(d.sent.length, 1);
+});
+
+test('Claude recipient with no published socket falls back to the paste', async () => {
+  const d = socketDeps({ agent: 'claude', socket: null });
+  const mode = await deliverMailNotification('CARD1', 'you have mail', d);
+  assert.deepEqual(mode, { mode: 'live' });
+  assert.deepEqual(d.socketSent, []);
+  assert.deepEqual(d.sent, [{ name: 'cc_one', text: 'you have mail', socket: '/s/a' }]);
+});
+
+test('a failed socket send falls back to the paste', async () => {
+  const d = socketDeps({ agent: 'claude', sendFails: true });
+  const mode = await deliverMailNotification('CARD1', 'you have mail', d);
+  assert.deepEqual(mode, { mode: 'live' });
+  assert.deepEqual(d.sent, [{ name: 'cc_one', text: 'you have mail', socket: '/s/a' }]);
+});
+
+test('the paste fallback still defers behind a draft when the socket send fails', async () => {
+  const d = socketDeps({ agent: 'claude', sendFails: true });
+  d.paneDeferral = { deliverOrDefer: async ({ onDefer }) => { onDefer('composer not confirmed empty'); return 'deferred'; } };
+  const mode = await deliverMailNotification('CARD1', 'you have mail', d);
+  assert.deepEqual(mode, { mode: 'deferred', reason: 'composer not confirmed empty' });
+});
+
+test('the MCP-ready wait runs before a socket send', async () => {
+  const d = socketDeps({ agent: 'claude' });
+  d.sessionManager.entryFor = () => ({ agent: 'claude', liveSessionId: 'LIVE1', relaunchedAt: Date.now() });
+  d.mcpConnectsAfterPolls = 2;
+  let polls = 0;
+  d.mcpSeenAt = () => { polls += 1; return polls > 2 ? Date.now() + 1000 : 0; };
+  d.sendSocket = async () => { d.socketSent.push({ pollsBefore: polls }); };
+  await deliverMailNotification('CARD1', 'you have mail', d);
+  assert.ok(d.socketSent[0].pollsBefore > 2);
+});
+
+test('a snoozed or archived recipient never reaches the socket', async () => {
+  const d = socketDeps({ agent: 'claude' });
+  d.sessionManager.entryFor = () => ({ agent: 'claude', archivedAt: 1 });
+  assert.deepEqual(await deliverMailNotification('CARD1', 'x', d), { mode: 'skip' });
+  assert.deepEqual(d.socketSent, []);
+});
+
 test('dormant recipient keeps its mail unread without being resumed', async () => {
   const d = deps({ entries: { CARD1: { cwd: '/tmp/session' } } });
   const mode = await deliverMailNotification('CARD1', 'you have mail', d);
   assert.deepEqual(mode, { mode: 'deferred', reason: 'no tmux target' });
   assert.equal(d.resumed.length, 0);
   assert.deepEqual(d.sent, []);
+});
+
+test('dormant recipient is resumed bare, with the notification left for the gated live path', async () => {
+  const d = deps({ entries: { CARD1: { cwd: os.tmpdir() } } });
+  d.wakesDormant = () => true;
+  const mode = await deliverMailNotification('CARD1', 'you have mail', d);
+  assert.equal(mode.mode, 'deferred');
+  assert.equal(d.resumed.length, 1);
+  assert.deepEqual([d.resumed[0][0], d.resumed[0][2]], ['CARD1', { reason: 'mail', automatic: true }]);
+  assert.deepEqual(d.sent, []);
+});
+
+test('a snoozed dormant recipient is never woken for mail', async () => {
+  const d = deps({ entries: { CARD1: { cwd: os.tmpdir(), snooze: { until: Date.now() + 3600_000, createdAt: 1 } } } });
+  d.wakesDormant = () => true;
+  const mode = await deliverMailNotification('CARD1', 'x', d);
+  assert.equal(mode.mode, 'deferred');
+  assert.equal(d.resumed.length, 0);
+});
+
+test('a dormant recipient archived before the wake is skipped, not resumed', async () => {
+  const d = deps({ entries: { CARD1: { cwd: os.tmpdir() } } });
+  d.wakesDormant = () => true;
+  const entry = d.sessionManager.entryFor('CARD1');
+  const real = d.sessionManager.entryFor;
+  let calls = 0;
+  d.sessionManager.entryFor = (id) => (++calls > 1 ? { ...entry, archivedAt: 1 } : real(id));
+  assert.deepEqual(await deliverMailNotification('CARD1', 'x', d), { mode: 'skip' });
+  assert.equal(d.resumed.length, 0);
+});
+
+test('a recipient that went live during the directory lookup is not resumed again', async () => {
+  const live = {};
+  const d = deps({ live, entries: { CARD1: { cwd: os.tmpdir() } } });
+  d.wakesDormant = () => true;
+  const tmuxFor = d.tmuxFor;
+  let calls = 0;
+  d.tmuxFor = (id) => (++calls > 1 ? 'cc_other' : tmuxFor(id));
+  const mode = await deliverMailNotification('CARD1', 'x', d);
+  assert.equal(mode.mode, 'deferred');
+  assert.equal(d.resumed.length, 0);
+});
+
+test('a resume that loses to an archive is skipped, not retried', async () => {
+  const d = deps({ entries: { CARD1: { cwd: os.tmpdir() } } });
+  d.wakesDormant = () => true;
+  d.sessionManager.resume = async () => {
+    d.sessionManager.entryFor('CARD1').archivedAt = 1;
+    throw new Error('archived during resume');
+  };
+  assert.deepEqual(await deliverMailNotification('CARD1', 'x', d), { mode: 'skip' });
+});
+
+test('a snooze set during the wake window defers the mail without resuming', async () => {
+  const d = deps({ entries: { CARD1: { cwd: os.tmpdir() } } });
+  d.wakesDormant = () => true;
+  const entry = d.sessionManager.entryFor('CARD1');
+  let calls = 0;
+  d.sessionManager.entryFor = () => (++calls > 1 ? { ...entry, snooze: { until: 1, createdAt: 1 } } : entry);
+  const mode = await deliverMailNotification('CARD1', 'x', d);
+  assert.equal(mode.mode, 'deferred');
+  assert.equal(d.resumed.length, 0);
+});
+
+test('a resume discarded because a snooze appeared mid-launch defers instead of erroring', async () => {
+  const d = deps({ entries: { CARD1: { cwd: os.tmpdir() } } });
+  d.wakesDormant = () => true;
+  d.sessionManager.resume = async () => {
+    d.sessionManager.entryFor('CARD1').snooze = { until: 1, createdAt: 1 };
+    throw new Error('discarded');
+  };
+  assert.equal((await deliverMailNotification('CARD1', 'x', d)).mode, 'deferred');
+});
+
+test('a failed resume propagates so the sweep reopens the settle window', async () => {
+  const d = deps({ entries: { CARD1: { cwd: os.tmpdir() } } });
+  d.wakesDormant = () => true;
+  d.sessionManager.resume = async () => { throw new Error('boom'); };
+  await assert.rejects(deliverMailNotification('CARD1', 'x', d), /boom/);
 });
 
 test('live recipient archived during its settle window is skipped', async () => {
@@ -112,4 +304,128 @@ test('a live recipient whose pane is not ready reports why delivery was deferred
   });
   const mode = await deliverMailNotification('CARD1', 'you have mail', d);
   assert.deepEqual(mode, { mode: 'deferred', reason: 'board status working' });
+});
+
+const E = '\x1b';
+const codexEmpty = `${E}[1m›${E}[0m ${E}[2mAsk Codex to do anything${E}[0m`;
+const codexWorking = `${E}[1m•${E}[0m Working ${E}[2m(15m 16s • esc to interrupt)${E}[0m · 1 background terminal running`;
+
+function paneDeps({ agent = 'codex', status = 'working', pane = `${codexWorking}\n${codexEmpty}` } = {}) {
+  const d = deps({ live: { CARD1: { tmux: 'cx_one', socket: '/s' } }, entries: { CARD1: { agent } } });
+  d.paneDeferral = createPaneDeferral({
+    tmuxFor: d.tmuxFor, socketFor: d.socketFor,
+    agentFor: () => agent,
+    statusFor: () => status,
+    capture: async () => typeof pane === 'function' ? pane() : pane,
+    sendText: async (name, text, socket) => { d.sent.push({ name, text, socket }); },
+  });
+  return d;
+}
+
+test('Codex mail reaches an active turn with an empty composer', async () => {
+  const d = paneDeps();
+  assert.deepEqual(await deliverMailNotification('CARD1', 'you have mail', d), { mode: 'live' });
+  assert.deepEqual(d.sent, [{ name: 'cx_one', text: 'you have mail', socket: '/s' }]);
+  assert.deepEqual(d.resumed, []);
+  assert.deepEqual(d.paneDeferral.pending('CARD1'), []);
+});
+
+test('Codex mail can arrive during a pane redraw while the board still reports working', async () => {
+  const d = paneDeps({ pane: codexEmpty });
+  assert.deepEqual(await deliverMailNotification('CARD1', 'you have mail', d), { mode: 'live' });
+  assert.equal(d.sent.length, 1);
+});
+
+for (const [label, pane] of [
+  ['typed draft', `${codexWorking}\n${E}[1m›${E}[0m half a question`],
+  ['typed placeholder', `${codexWorking}\n${E}[1m›${E}[0m Ask Codex to do anything`],
+  ['echoed prompt', `${codexWorking}\n${E}[1;2m› Ask Codex to do anything${E}[0m`],
+  ['unreadable capture', ''],
+]) {
+  test(`Codex mail during a turn defers for ${label}`, async () => {
+    const d = paneDeps({ pane });
+    const result = await deliverMailNotification('CARD1', 'you have mail', d);
+    assert.equal(result.mode, 'deferred');
+    assert.deepEqual(d.sent, []);
+    assert.deepEqual(d.paneDeferral.pending('CARD1'), [], 'mail retries from its durable mailbox');
+  });
+}
+
+for (const status of ['needs-you', 'unknown']) {
+  test(`Codex mail still defers for board status ${status}`, async () => {
+    const d = paneDeps({ status });
+    assert.deepEqual(await deliverMailNotification('CARD1', 'you have mail', d), {
+      mode: 'deferred', reason: `board status ${status}`,
+    });
+    assert.deepEqual(d.sent, []);
+  });
+}
+
+test('Codex mail still defers for a pane dialog despite a working board status', async () => {
+  const dialog = ['› 1. Update now', '  2. Skip', '  3. Skip until next version', '  Press Enter to continue'];
+  const d = paneDeps({ pane: [...dialog, codexEmpty].join('\n') });
+  assert.deepEqual(await deliverMailNotification('CARD1', 'you have mail', d), {
+    mode: 'deferred', reason: 'pane classified needs-you',
+  });
+  assert.deepEqual(d.sent, []);
+});
+
+test('Claude socket mail reaches a working session without touching its draft', async () => {
+  const d = paneDeps({ agent: 'claude', pane: `${E}[39m❯ a human draft` });
+  const socket = { socketPath: '/s/claude.sock', keyPath: '/s/claude.key' };
+  const sent = [];
+  d.findSocket = () => socket;
+  d.sendSocket = async (target, text) => { sent.push({ target, text }); };
+  assert.deepEqual(await deliverMailNotification('CARD1', 'you have mail', d), { mode: 'live' });
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].target, socket);
+  assertSocketMarker(sent[0].text, 'you have mail');
+  assert.deepEqual(d.sent, []);
+});
+
+for (const socketUnavailable of [true, false]) {
+  test(`Claude mail paste fallback waits until idle when its socket ${socketUnavailable ? 'is absent' : 'fails'}`, async () => {
+    const d = paneDeps({ agent: 'claude', pane: `${E}[39m❯ ` });
+    d.findSocket = () => socketUnavailable ? null : { socketPath: '/s/claude.sock', keyPath: '/s/claude.key' };
+    d.sendSocket = async () => { throw new Error('socket unavailable'); };
+    assert.deepEqual(await deliverMailNotification('CARD1', 'you have mail', d), {
+      mode: 'deferred', reason: 'board status working',
+    });
+    assert.deepEqual(d.sent, []);
+  });
+}
+
+test('Codex mail rechecks for a new draft after waiting for MCP readiness', async () => {
+  let pane = `${codexWorking}\n${codexEmpty}`;
+  const d = paneDeps({ pane: () => pane });
+  const relaunchedAt = Date.now();
+  d.sessionManager.entryFor = () => ({ agent: 'codex', relaunchedAt });
+  d.mcpSeenAt = () => {
+    pane = `${codexWorking}\n${E}[1m›${E}[0m a new draft`;
+    return relaunchedAt + 1;
+  };
+  assert.deepEqual(await deliverMailNotification('CARD1', 'you have mail', d), {
+    mode: 'deferred', reason: 'composer not confirmed empty (after beforeSend)',
+  });
+  assert.deepEqual(d.sent, []);
+});
+
+test('Claude terminal mail defers a blank-first-line draft, then automatically delivers after it clears', async () => {
+  const d = socketDeps({ agent: 'claude', socket: null });
+  const frame = `\x1b[38;5;244m${'─'.repeat(100)}`;
+  let pane = [frame, '\x1b[39m❯ ', '  Review this draft before sending.', frame].join('\n');
+  d.paneDeferral = createPaneDeferral({
+    tmuxFor: d.tmuxFor, socketFor: d.socketFor,
+    capture: async () => pane,
+    sendText: async (name, text, socket) => { d.sent.push({ name, text, socket }); },
+  });
+  const notification = composeMailNotification([{}]);
+  assert.deepEqual(await deliverMailNotification('CARD1', notification, d), {
+    mode: 'deferred', reason: 'composer not confirmed empty',
+  });
+  assert.deepEqual(d.sent, []);
+  assert.equal(d.paneDeferral.pendingCount(), 0);
+  pane = [frame, '\x1b[39m❯ ', frame].join('\n');
+  assert.deepEqual(await deliverMailNotification('CARD1', notification, d), { mode: 'live' });
+  assert.deepEqual(d.sent, [{ name: 'cc_one', text: notification, socket: '/s/a' }]);
 });

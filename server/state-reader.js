@@ -2,11 +2,10 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import chokidar from 'chokidar';
-import { discoverClaudeSessions, capturePane, classify, claudeTitle, hasBackgroundShell as detectBackgroundShell } from './tmux-scraper.js';
+import { discoverClaudeSessions, capturePane, classifyPane, claudeTitle, hasBackgroundShell as detectBackgroundShell } from './tmux-scraper.js';
 import { CLAUDE_DIR, SESSIONS_DIR, readJsonSafe, statusOf, liveStatusDecision, liveState } from './claude-paths.js';
+import { codexStatus as realCodexStatus } from './agents/codex-status.js';
 import { adapterFor, modelPillFor, maxContextWindowFor, discoveryFloor } from './agents/index.js';
 import { runtimeFor, findRuntime } from './runtimes/index.js';
 import { worktreeStatus } from './worktree.js';
@@ -14,24 +13,29 @@ import { repoSlugFor } from './repo-slug.js';
 import { isLegacyWorkerWorkflow } from './workflow.js';
 import { usageSince } from './transcript-reader.js';
 import { autoFixPrChecksDefault } from './config-store.js';
+import { boundedPs } from './bounded-ps.js';
+import { logWarn } from './log.js';
 
-const execp = promisify(execFile);
-
-// pid -> { tty, cpu } for every process, from one `ps` call. A real `ttysNNN`
+// pid -> { tty } for every process, from one `ps` call. A real `ttysNNN`
 // means the session lives in an open terminal window; `??` means background.
-async function procInfo() {
+export async function procInfo(opts) {
   const map = new Map();
-  try {
-    const { stdout } = await execp('ps', ['-axo', 'pid=,tty=,%cpu=']);
-    for (const line of stdout.split('\n')) {
-      const m = line.match(/^\s*(\d+)\s+(\S+)\s+([\d.]+)/);
-      if (m) map.set(Number(m[1]), { tty: m[2], cpu: parseFloat(m[3]) });
-    }
-  } catch {
-    /* ps unavailable */
+  const stdout = await boundedPs(['-axo', 'pid=,tty='], opts);
+  if (stdout === null) {
+    // A wedged tty makes ps hang unkillably; boot must not wait on it. Warn once
+    // per outage, not on every graph rebuild.
+    if (!procInfoSkipped) logWarn('session tty scan skipped');
+    procInfoSkipped = true;
+    return map;
+  }
+  procInfoSkipped = false;
+  for (const line of stdout.split('\n')) {
+    const m = line.match(/^\s*(\d+)\s+(\S+)/);
+    if (m) map.set(Number(m[1]), { tty: m[2] });
   }
   return map;
 }
+let procInfoSkipped = false;
 
 const ROSTER = path.join(CLAUDE_DIR, 'daemon', 'roster.json');
 const JOBS_DIR = path.join(CLAUDE_DIR, 'jobs');
@@ -119,7 +123,7 @@ async function buildTeammates(entries) {
       name: e.member.name || e.member.agentType || 'teammate',
       agentType: e.member.agentType || null,
       color: e.member.color || null,
-      status: e.paneId ? classify(text).status : 'unknown',
+      status: e.paneId ? classifyPane(text, 'claude').status : 'unknown',
       paneId: e.paneId || null,
     });
   }
@@ -175,29 +179,31 @@ function addDirsFromWorker(worker) {
 }
 
 // Claude Code titles a freshly-launched session with its own auto "agent" name —
-// the cwd basename plus an optional short hex hash, e.g. `enterprise-3f` — and
+// a slug of the cwd basename plus a 2-hex random tail, e.g. `enterprise-3f` — and
 // holds it there until it regenerates a conversation summary (a just-resumed
 // session often never does). That name otherwise outranks `intent`/`summary` in
 // `sessionLabel` below, flipping a meaningful card to junk the moment the pane is
-// scraped, so we treat it as no title and fall through. The basename is matched
-// verbatim (regex-escaped), the hex tail case-insensitively; a real summary is a
-// phrase (spaces, non-hex words) so it won't collide.
+// scraped, so we treat it as no title and fall through. `claudeAutoNameSlug`
+// mirrors Claude Code's own slugger (2.1.296: first 4 whitespace words,
+// lowercased, every non-[a-z0-9] run → `-`, cut to 40 chars, dashes trimmed, so
+// `charlie.goldstraw` → `charlie-goldstraw-5c`); a real summary is a phrase with
+// spaces, so it won't collide.
+function claudeAutoNameSlug(base) {
+  return base.split(/\s+/).filter(Boolean).slice(0, 4).join(' ').toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').slice(0, 40).replace(/^-+|-+$/g, '') || 'claude';
+}
+
 function isAutoAgentTitle(title, cwd) {
   const base = cwd ? path.basename(cwd) : '';
   if (!base) return false;
   const t = String(title || '');
-  const esc = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  if (new RegExp(`^${esc}(-[0-9a-f]+)?$`, 'i').test(t)) return true;
-  const clipped = t.replace(/(?:\.\.\.|…)$/, '');
-  if (clipped !== t && clipped.length >= 8 && base.toLowerCase().startsWith(clipped.toLowerCase())) return true;
-  // For a long basename, Claude Code truncates it mid-word before appending the
-  // hex tail (e.g. "…open-te-04" for a "…open-terminal" cwd), so the exact match
-  // above misses it. Treat a substantial truncated prefix (+ optional hex tail)
-  // as the same placeholder — a real summary is a phrase, so it can't collide
-  // with a bare dash-joined prefix of the cwd basename.
-  const stripped = t.replace(/-[0-9a-f]+$/i, '');
-  return stripped.length >= base.length / 2 && stripped.length < base.length
-    && base.toLowerCase().startsWith(stripped.toLowerCase());
+  const lower = t.toLowerCase();
+  if (lower === base.toLowerCase()) return true;
+  const slug = claudeAutoNameSlug(base);
+  if (lower === slug || (t.length === slug.length + 3 && t.startsWith(`${slug}-`) && /-[0-9a-f]{2}$/.test(t))) return true;
+  const clipped = lower.replace(/(?:\.\.\.|…)$/, '');
+  return clipped !== lower && clipped.length >= 8
+    && (base.toLowerCase().startsWith(clipped) || slug.startsWith(clipped));
 }
 
 function shortCodexTitle(source) {
@@ -223,16 +229,16 @@ function sessionLabel({ agent = 'claude', names = [], liveTitle, aiTitle, intent
   const prompt = clean(intent);
   for (const [index, n] of names.entries()) {
     const c = clean(n, index === 0);
-    if (agent === 'codex' && index > 0 && c === prompt) continue;
-    if (c) return agent === 'codex' && index > 0 ? shortCodexTitle(c) : c;
+    if (adapterFor(agent).labels.summaryFirst && index > 0 && c === prompt) continue;
+    if (c) return adapterFor(agent).labels.summaryFirst && index > 0 ? shortCodexTitle(c) : c;
   }
-  const live = agent === 'claude' ? clean(liveTitle) : '';
+  const live = adapterFor(agent).labels.liveTitle ? clean(liveTitle) : '';
   if (live) return live;
   const ai = clean(aiTitle);
   if (ai) return ai;
-  if (agent === 'codex') {
+  if (adapterFor(agent).labels.summaryFirst) {
     const source = clean(summary) || prompt;
-    if (!source) return 'Codex session';
+    if (!source) return `${adapterFor(agent).label} session`;
     return shortCodexTitle(source);
   }
   const derived = prompt || clean(summary);
@@ -258,9 +264,33 @@ function withForkMark(label, entry) {
 // waitingFor text, and exported so it's unit-testable directly: readSessions()
 // reads a real ~/.claude/sessions file with no injection seam, so this can't be
 // reached via buildGraph without a live process on the test machine.
-export function apiErrorPromotion(status, apiError) {
+//
+// waitingReason splits the errors by whether waiting can fix them: 'api-error'
+// for a dropped or stalled connection (Claude Code's own wording, listed below)
+// that the same prompt can simply be retried after, and 'api-error-blocking'
+// for everything else — login, auth, credit, usage limit, prompt too long, a
+// 400 over the conversation's own history, and any error not recognised here.
+const TRANSIENT_API_ERRORS = [
+  /The response stopped arriving\./,
+  /Server error mid-response\./,
+  /Part of the response never arrived/,
+  /The response stream was malformed/,
+  /Your computer went to sleep (mid-response|before a response was produced)/,
+  /Connection (lost|closed) (mid-response|before a response was produced)/,
+  /The response stalled before a response was produced/,
+  /Can.t reach the API server|ENOTFOUND/,
+  /Request timed out/,
+  /Repeated 529 Overloaded errors/,
+  /Connection error\./,
+];
+
+export function apiErrorReason(text) {
+  return text && TRANSIENT_API_ERRORS.some((re) => re.test(text)) ? 'api-error' : 'api-error-blocking';
+}
+
+export function apiErrorPromotion(status, apiError, apiErrorText) {
   if (!apiError || status === 'working' || status === 'needs-you') return null;
-  return { status: 'needs-you', waitingFor: 'API error — connection closed mid-response', waitingReason: 'api-error' };
+  return { status: 'needs-you', waitingFor: apiErrorText || 'API error', waitingReason: apiErrorReason(apiErrorText) };
 }
 
 // Build the folder + session graph from the raw state, enriched by the
@@ -272,15 +302,35 @@ export function apiErrorPromotion(status, apiError) {
 // extension that has since been disabled or uninstalled reads as a host (local)
 // session for status and cost, rather than taking buildGraph down for every card.
 // Resume/fork still refuse it by name (relaunchRefusal).
+// A runtime's optional `cost` hook replaces ONLY the card's `usd` (e.g. a gateway
+// that prices requests itself); every other enrichment field stands. null, a
+// throw or an off-shape answer means "no opinion" and the transcript figure stays.
+export async function applyRuntimeCost(runtime, args, enr) {
+  if (!runtime?.cost) return enr;
+  let ans;
+  try { ans = await runtime.cost(args); } catch { return enr; }
+  const usd = ans?.usd;
+  if (typeof usd !== 'number' || !Number.isFinite(usd) || usd < 0) return enr;
+  return { ...(enr || {}), usd };
+}
+
 export const resolveRuntimeForGraph = (id) => findRuntime(id) || runtimeFor(undefined);
 
-export async function buildGraph(sessionManager, enrich, { runtimeResolver = resolveRuntimeForGraph, discover = discoverClaudeSessions, capture = capturePane, mailStore } = {}) {
+export async function buildGraph(sessionManager, enrich, { runtimeResolver = resolveRuntimeForGraph, discover = discoverClaudeSessions, capture = capturePane, codexStatus = realCodexStatus, mailStore, mailDraftBlocked } = {}) {
+  const graphAnalysis = (agent, id, opts) => {
+    const adapter = adapterFor(agent);
+    return adapter.graphAnalysis ? adapter.graphAnalysis(id, opts, enrich) : adapter.analyze(id, opts);
+  };
   const now = Date.now();
   // The mail pill's data, keyed on card id like every other per-session field —
   // omitted entirely (undefined) when no mailStore is injected, so a caller that
   // doesn't pass one (most tests) sees no `mail` field rather than a fabricated
   // empty one.
-  const mailInfo = (sid) => (mailStore ? mailStore.unreadInfo(sid, now) : undefined);
+  const mailInfo = (sid) => {
+    if (!mailStore) return undefined;
+    const info = mailStore.unreadInfo(sid, now);
+    return info.unread && mailDraftBlocked?.(sid, now) ? { ...info, draftBlocked: true } : info;
+  };
   // The install-wide fallback every card's autoFixPrChecks resolves against when it
   // has no explicit per-session choice. Read ONCE per build (readConfig is a sync
   // file read and this is per-session, three times over), so a mid-build settings
@@ -313,13 +363,18 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
   // A `buildLaunch` runtime (server/runtimes/index.js) qualifies for the same reason: its
   // pane runs the extension's own command, never a `claude` this discovery would match (a
   // cloud card's pane holds on a `sleep` once the create client exits), so without this it
-  // would read as dormant and offer a Resume that relaunchRefusal then refuses.
+  // would read as dormant and offer a Resume that relaunchRefusal then refuses. A
+  // `wrapLaunch` runtime opts in with `liveByTmux: true` (1.34.0) when its pane runs a
+  // wrapper discovery can't see through (e.g. a sandbox's `exec` client around the agent).
   const discoveredTmux = new Set(discovered.map((d) => d.tmuxName));
   for (const entry of sessionManager?.activeEntries?.() || []) {
-    if (entry.runtime !== 'devcontainer' && !runtimeResolver(entry.runtime)?.buildLaunch) continue;
+    if (entry.runtime !== 'devcontainer') {
+      const rt = runtimeResolver(entry.runtime);
+      if (!rt?.buildLaunch && !rt?.liveByTmux) continue;
+    }
     const tmuxName = sessionManager?.tmuxNameFor?.(entry.sessionId);
     if (!tmuxName || discoveredTmux.has(tmuxName)) continue;
-    discovered.push({ tmuxName, socket: sessionManager?.socketOf?.(tmuxName) ?? '', claudePid: null, agent: entry.agent || 'claude', cwd: entry.cwd, command: '', paneTitle: '' });
+    discovered.push({ tmuxName, socket: sessionManager?.socketOf?.(tmuxName) ?? '', claudePid: null, agent: entry.agent ?? 'claude', cwd: entry.cwd, command: '', paneTitle: '' });
     discoveredTmux.add(tmuxName);
   }
   const proc = await procInfo();
@@ -399,6 +454,8 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
     // Skip forked copies created by Resume: a tmux session we own but mapped to
     // a *different* (original) session id. The original node represents it.
     const discTmux = pidToTmux.get(s.pid) || null;
+    const deadHome = sessionManager?.deadTmuxNameFor?.(s.sessionId);
+    if (deadHome && (discTmux === deadHome || !sessionManager?.alive?.has(discTmux))) continue;
     const forkOwner = discTmux && sessionManager?.tmuxOwner ? sessionManager.tmuxOwner(discTmux) : null;
     if (forkOwner && forkOwner !== s.sessionId) continue;
 
@@ -431,8 +488,8 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
     const intent = worker?.dispatch?.seed?.intent ?? '';
 
     const mapEntry = sessionManager?.entryFor?.(s.sessionId);
-    const enrichment = enrich ? await enrich(s.sessionId, { since: usageSince(mapEntry) }) : null;
-    const agentId = mapEntry?.agent || 'claude';
+    const agentId = mapEntry?.agent ?? 'claude';
+    const enrichment = await graphAnalysis(agentId, s.sessionId, { since: usageSince(mapEntry) });
     const name = sessionLabel({
       agent: agentId,
       names: [mapEntry?.name, s.name && s.name !== s.jobId ? s.name : null, worker?.dispatch?.seed?.name],
@@ -453,8 +510,17 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
     // text regardless — captured once here and reused for both checks rather
     // than scraping twice.
     let status = liveStatusDecision(s.status);
-    const paneText = tmux ? await capture(tmux, 60, sessionManager?.socketOf?.(tmux) ?? '') : '';
-    if (status === 'scrape') status = tmux ? classify(paneText).status : 'unknown';
+    const paneTarget = sessionManager?.paneTargetFor?.(s.sessionId) ?? tmux;
+    const paneText = paneTarget ? await capture(paneTarget, 60, sessionManager?.socketOf?.(tmux) ?? '') : '';
+    let scrapeWaitingFor = null;
+    if (status === 'scrape') {
+      if (!tmux) status = 'unknown';
+      else if (adapterFor(agentId).statusSource === 'codex-rollout') {
+        const c = await codexStatus({ liveSid: mapEntry?.liveSessionId, paneText });
+        status = c.status;
+        scrapeWaitingFor = c.waitingFor;
+      } else status = paneText === '' ? 'unknown' : classifyPane(paneText, agentId).status;
+    }
     // Claude's own 'shell' status (→ working) means "a Bash tool is tracked as
     // live" — it covers both a still-blocking foreground command AND a detached
     // run_in_background job the turn has already ended on; the file can't tell
@@ -463,12 +529,12 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
     // can go stale for as long as the job runs (verified against a real session:
     // frozen 20+ minutes after the pane itself reached its idle prompt) — else a
     // detached background job pins the card at "busy" for its entire lifetime.
-    if (s.status === 'shell' && tmux && classify(paneText).status === 'idle') status = 'idle';
+    if (s.status === 'shell' && tmux && classifyPane(paneText, agentId).status === 'idle') status = 'idle';
     // A dropped API connection ends the turn with no permission request, so the
     // status file reports idle/unknown even though the response is incomplete —
     // surface it as needs-you instead of a silent "done" (see transcript-reader's
     // apiError tracking). Skipped when the file already says working/needs-you.
-    const apiError = apiErrorPromotion(status, enrichment?.apiError);
+    const apiError = apiErrorPromotion(status, enrichment?.apiError, enrichment?.apiErrorText);
     if (apiError) status = apiError.status;
     // Each agent's CLI renders its own "a background job is running" marker —
     // detectBackgroundShell is keyed on agentId (see tmux-scraper.js).
@@ -486,7 +552,7 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
       status,
       hasBackgroundShell,
       rawStatus: s.status || null,
-      waitingFor: apiError ? apiError.waitingFor : (s.waitingFor || null),
+      waitingFor: apiError ? apiError.waitingFor : (s.waitingFor || scrapeWaitingFor || null),
       waitingReason: apiError ? apiError.waitingReason : null,
       kind: s.kind || worker?.dispatch?.source || 'unknown',
       cwd,
@@ -496,6 +562,8 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
       intent,
       createdAt: mapEntry?.createdAt || null,
       model: mapEntry?.model || null,
+      effort: mapEntry?.effort || null,
+      permissionMode: mapEntry?.permissionMode || null,
       currentModel: enrichment?.currentModel ?? null,
       modelPill: modelPillFor(agentId, enrichment?.currentModel, mapEntry?.model),
       autoCompactTokens: mapEntry?.autoCompactTokens || null,
@@ -508,6 +576,7 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
       autoFixPrChecks: mapEntry?.autoFixPrChecks ?? fixPrDefault,
       autoMergeOnPass: mapEntry?.autoMergeOnPass ?? false,
       childFullView: mapEntry?.childFullView ?? null,
+      offBoard: mapEntry?.offBoard || null,
       launchedCodeVersion: mapEntry?.launchedCodeVersion || null,
       links: mapEntry?.links || [],
       worktree: await worktreeStatus(mapEntry?.worktree),
@@ -515,8 +584,8 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
       tasks: readJobInFlight(s.jobId),
       updatedAt: s.updatedAt || null,
       lastActivity: enrichment?.lastActivity ?? null,
+      hasTranscript: enrichment?.hasTranscript ?? false,
       tty: proc.get(s.pid)?.tty ?? null,
-      cpu: proc.get(s.pid)?.cpu ?? null,
       managed: Boolean(tmux),
       // A live-restart (or dormant Resume) is mid-flight for this card: the client
       // holds the card in place and shows a "restarting" badge instead of the
@@ -574,12 +643,13 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
     const appEntry = sessionManager?.entryByTmux?.(d.tmuxName) || null;
     if (!appEntry) continue;
     const realSid = appEntry.sessionId;
+    if (sessionManager?.deadTmuxNameFor?.(realSid)) continue;
     if (synthesized.has(realSid)) continue;
     synthesized.add(realSid);
     // An archived session that's still running in tmux stays off the board.
     if (sessionManager?.isArchived?.(realSid)) continue;
     const fcwd = d.cwd || appEntry?.cwd;
-    const agentId = appEntry?.agent || d.agent || 'claude';
+    const agentId = appEntry?.agent ?? d.agent ?? 'claude';
     const adapter = adapterFor(agentId);
     // The Claude actually running in this owned tmux may be a Resume fork with a
     // *different* id than the owner. Read its live id + hook-written status from
@@ -599,26 +669,34 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
     // the abandoned conversation (stale label once dormant, and Resume brings the
     // abandoned one back). No-ops when unchanged; see noteLiveSessionId.
     if (live?.liveSid) await sessionManager?.noteLiveSessionId?.(realSid, live.liveSid);
-    const enr = (runtime.analyze ? await runtime.analyze({ entry: appEntry, liveSid: live?.liveSid || appEntry?.liveSessionId }) : null)
-      || await adapter.analyze(live?.liveSid || appEntry?.liveSessionId || realSid, { since: usageSince(appEntry) });
+    const costSid = live?.liveSid || appEntry?.liveSessionId;
+    const enr = await applyRuntimeCost(runtime, { entry: appEntry, liveSid: costSid },
+      (runtime.analyze ? await runtime.analyze({ entry: appEntry, liveSid: costSid }) : null)
+        || await adapter.analyze(costSid || realSid, { since: usageSince(appEntry) }));
     // A recognized live status wins (Claude's mapped status, or Codex's). Else
     // surface a reported-but-unrecognized status as 'unknown', and only scrape when
     // nothing was reported (Codex has no status file → live.rawStatus is absent).
     let status = live && live.status !== 'unknown' ? live.status : liveStatusDecision(live?.rawStatus);
-    const paneText = await capture(d.tmuxName, 60, d.socket || '');
+    const paneText = await capture(d.paneId || d.tmuxName, 60, d.socket || '');
     // classify() may also carry a hint (e.g. devcontainer bring-up/failure) alongside
     // the status — only meaningful on the scrape branch, since a recognized live
     // status above already has its own waitingFor (needs-you) or none (working/idle).
     let scrapeWaitingFor = null;
-    if (status === 'scrape') { const c = classify(paneText); status = c.status; scrapeWaitingFor = c.waitingFor || null; }
+    if (status === 'scrape') {
+      const c = adapterFor(agentId).statusSource === 'codex-rollout'
+        ? await codexStatus({ liveSid: live?.liveSid || appEntry.liveSessionId, paneText })
+        : paneText === '' ? { status: 'unknown' } : classifyPane(paneText, agentId);
+      status = c.status;
+      scrapeWaitingFor = c.waitingFor || null;
+    }
     // Same override as the managed-session pass above: Claude's 'shell' status
     // can go stale for as long as a detached background job runs, well past the
     // pane's own idle prompt — trust the pane over it. `live.status` above is
     // already mapped, so `rawStatus` is the only way to tell 'shell' from 'busy'.
-    if (live?.rawStatus === 'shell' && classify(paneText).status === 'idle') status = 'idle';
+    if (live?.rawStatus === 'shell' && classifyPane(paneText, agentId).status === 'idle') status = 'idle';
     // See the managed-session pass above: a dropped API connection ends the turn
     // without a permission request, so surface it as needs-you rather than idle.
-    const apiError = apiErrorPromotion(status, enr?.apiError);
+    const apiError = apiErrorPromotion(status, enr?.apiError, enr?.apiErrorText);
     if (apiError) status = apiError.status;
     // Each agent's CLI renders its own "a background job is running" marker —
     // detectBackgroundShell is keyed on agentId (see tmux-scraper.js).
@@ -661,6 +739,8 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
       intent: appEntry?.intent || '',
       createdAt: appEntry?.createdAt || null,
       model: appEntry?.model || null,
+      effort: appEntry?.effort || null,
+      permissionMode: appEntry?.permissionMode || null,
       currentModel: enr?.currentModel ?? null,
       modelPill: modelPillFor(agentId, enr?.currentModel, appEntry?.model),
       autoCompactTokens: appEntry?.autoCompactTokens || null,
@@ -673,6 +753,7 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
       autoFixPrChecks: appEntry?.autoFixPrChecks ?? fixPrDefault,
       autoMergeOnPass: appEntry?.autoMergeOnPass ?? false,
       childFullView: appEntry?.childFullView ?? null,
+      offBoard: appEntry?.offBoard || null,
       launchedCodeVersion: appEntry?.launchedCodeVersion || null,
       links: appEntry?.links || [],
       worktree: await worktreeStatus(appEntry?.worktree),
@@ -684,8 +765,8 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
       // pure-scrape session (no live file) falls back to its last activity.
       updatedAt: live?.updatedAt ?? enr?.lastActivity ?? null,
       lastActivity: enr?.lastActivity ?? null,
+      hasTranscript: enr?.hasTranscript ?? false,
       tty: proc.get(d.claudePid)?.tty ?? null,
-      cpu: proc.get(d.claudePid)?.cpu ?? null,
       managed: true,
       restarting: Boolean(sessionManager?.isResuming?.(realSid)),
       tmux: d.tmuxName,
@@ -715,7 +796,7 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
     if (representedSids.has(sid)) continue;
     representedSids.add(sid);
     const cwd = entry.cwd || null;
-    const agentId = entry.agent || 'claude';
+    const agentId = entry.agent ?? 'claude';
     const deadTmux = sessionManager.deadTmuxNameFor?.(sid);
     const exitOutput = deadTmux ? (await capture(deadTmux, 40, entry.socket || '')).trim() || null : null;
     // Enrich by the LIVE id, not the card id: a Claude session's transcript (cost,
@@ -724,10 +805,8 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
     // their cost/age. Legacy entries have no liveSessionId → fall back to the card id
     // (which for them is the live id). Mirrors the Codex branch.
     const runtime = runtimeResolver(entry.runtime);
-    const enrichment = (runtime.analyze ? await runtime.analyze({ entry, liveSid: entry.liveSessionId || sid }) : null)
-      || ((entry.agent && entry.agent !== 'claude')
-        ? await adapterFor(entry.agent).analyze(entry.liveSessionId || sid, { since: usageSince(entry) })
-        : (enrich ? await enrich(entry.liveSessionId || sid, { since: usageSince(entry) }) : null));
+    const enrichment = await applyRuntimeCost(runtime, { entry, liveSid: entry.liveSessionId || sid }, (runtime.analyze ? await runtime.analyze({ entry, liveSid: entry.liveSessionId || sid }) : null)
+      || await graphAnalysis(agentId, entry.liveSessionId || sid, { since: usageSince(entry) }));
     const label = sessionLabel({
       agent: agentId,
       names: [entry.name, entry.lastLabel],
@@ -758,6 +837,8 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
       intent: entry.intent || '',
       createdAt: entry.createdAt || null,
       model: entry.model || null,
+      effort: entry.effort || null,
+      permissionMode: entry.permissionMode || null,
       currentModel: enrichment?.currentModel ?? null,
       modelPill: modelPillFor(agentId, enrichment?.currentModel, entry.model),
       autoCompactTokens: entry.autoCompactTokens || null,
@@ -770,6 +851,7 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
       autoFixPrChecks: entry.autoFixPrChecks ?? fixPrDefault,
       autoMergeOnPass: entry.autoMergeOnPass ?? false,
       childFullView: entry.childFullView ?? null,
+      offBoard: entry.offBoard || null,
       links: entry.links || [],
       suspendedAt: entry.suspendedAt || null,
       worktree: await worktreeStatus(entry.worktree),
@@ -778,7 +860,6 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
       updatedAt: null,
       lastActivity: enrichment?.lastActivity ?? null,
       tty: null,
-      cpu: null,
       managed: false, // no live tmux → click takes the Resume path, not attach
       // Set while this dormant card's own Resume/Restart is in flight (the tmux is
       // being relaunched right now). This is the site that actually renders during
@@ -827,7 +908,8 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
   // ever rising on the board it was measured on), so every field is paid for over the
   // entire archive on every send. Each has exactly one consumer in public/app.js:
   // cwd + archivedAt the dispatch dialog's recent-folder list, cwd + sessionId its
-  // per-task default repo, model the quick-launch button ranking, label +
+  // per-task default repo, model the quick-launch button ranking (model + effort
+  // also an extension quick-launch's, via dispatch.field's graph), label +
   // viaTaskArchive the sessions a task's Restore names. It USED to mirror the board
   // node (agent/name/intent/createdAt/task/worktree/workflow/parentSession/spawnedBy)
   // to feed the Search view's archived rows; Search now builds its own rows
@@ -842,6 +924,7 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
     cwd: e.cwd || null,
     archivedAt: e.archivedAt,
     model: e.model || null,
+    effort: e.effort || null,
     viaTaskArchive: e.viaTaskArchive || null,
   }));
 

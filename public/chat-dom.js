@@ -179,7 +179,12 @@ export function createChatDom({ document: doc = globalThis.document, renderMarkd
       // blank and Codex's is presence-only (encrypted_content, summary: []), so
       // the textless case is the common one and must not offer a control that
       // opens nothing.
-      if (e.text) {
+      if (e.text && e.visible) {
+        wrap.className = 'chat-assistant';
+        const prose = el('div', 'chat-prose');
+        prose.innerHTML = renderMarkdown(e.text);
+        wrap.appendChild(prose);
+      } else if (e.text) {
         wrap.appendChild(chipButton('chat-thinking-chip', 'chat-thinking-label', label));
         const body = el('div', 'chat-thinking-body', e.text);
         body.dataset.collapsed = '1';
@@ -187,6 +192,14 @@ export function createChatDom({ document: doc = globalThis.document, renderMarkd
       } else {
         wrap.appendChild(el('span', 'chat-thinking-label', label));
       }
+      return wrap;
+    }
+    if (item.type === 'context') {
+      const wrap = el('div', 'chat-thinking');
+      wrap.appendChild(chipButton('chat-thinking-chip', 'chat-thinking-label', e.label || 'Context'));
+      const body = el('div', 'chat-thinking-body', e.text);
+      body.dataset.collapsed = '1';
+      wrap.appendChild(body);
       return wrap;
     }
     if (item.type === 'recap') {

@@ -57,6 +57,10 @@ function stubDom() {
         for (const fn of this._events.get(ev.type) || []) fn(ev);
         return true;
       },
+      contains(node) {
+        for (let n = node; n; n = n._parent) if (n === this) return true;
+        return false;
+      },
       focus() {},
       remove() { this._parent?.removeChild(this); },
       setSelectionRange(a, b) { this.selectionStart = a; this.selectionEnd = b; },
@@ -100,10 +104,23 @@ function stubDom() {
   for (const id of [
     'chat-wrap', 'chat-stream', 'chat-input', 'chat-send', 'chat-stop',
     'chat-hint', 'chat-suggestion', 'chat-current-model', 'chat-context-bar', 'chat-attachments',
-    'chat-notice-bar', 'chat-jump-last', 'chat-exit-notice',
+    'chat-notice-bar', 'chat-jump-nav', 'chat-jump-prev', 'chat-jump-next', 'chat-exit-notice',
   ]) byId.set(id, make(id === 'chat-input' ? 'textarea' : 'div'));
 
+  const body = make('body');
+  body.appendChild(byId.get('chat-wrap'));
+  byId.get('chat-wrap').appendChild(byId.get('chat-stream'));
+  byId.get('chat-wrap').appendChild(byId.get('chat-input'));
   const document = {
+    body,
+    activeElement: body,
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(fn);
+    },
+    dispatchEvent(ev) {
+      for (const fn of listeners.get(ev.type) || []) fn(ev);
+    },
     getElementById: (id) => byId.get(id) || null,
     createElement: (tag) => make(tag),
     // fillLinked's plain-text-segment path (chat-dom.js) — the jump-pill tests
@@ -115,13 +132,14 @@ function stubDom() {
   return { document, byId, listeners };
 }
 
-async function mountView({ onSend, cwd = null, onGoTerminal } = {}) {
+async function mountView({ onSend, cwd = null, onGoTerminal, platform = 'MacIntel' } = {}) {
   const { document, byId } = stubDom();
   globalThis.document = document;
   // Just enough markdown-it for createRenderer's constructor dance. This suite is
   // about composer and restore state, never about rendered prose — chat-dom.test.js
   // owns that — so the renderer only has to exist.
   globalThis.window = {
+    navigator: { platform },
     markdownit: () => ({
       renderer: { rules: {} },
       // createRenderer's markdown-path rules escape through md.utils, so the stub
@@ -152,24 +170,100 @@ async function mountView({ onSend, cwd = null, onGoTerminal } = {}) {
   const { initChatView } = await import('./chat-view.js');
   const sent = [];
   const opened = [];
+  const openedFor = [];
   const view = initChatView({
     send: (m) => { sent.push(m); return onSend?.(m) ?? true; },
     onSubagentClick() {},
     onOpenDiff() {},
     onGoTerminal: (id) => onGoTerminal?.(id),
     onPickModel() {},
-    onOpenFile: (p) => opened.push(p),
+    onOpenFile: (p, sid) => { opened.push(p); openedFor.push(sid); },
     cwdFor: () => cwd,
   });
   const input = byId.get('chat-input');
   // Wire the auto-grow listener's dependency the way a browser would.
   return {
-    view, sent, byId, input, opened, document, timers,
+    view, sent, byId, input, opened, openedFor, document, timers,
     fire: (el, type) => el.dispatchEvent({ type }),
     // Only the still-live ones — a cancelled timeout is exactly what a browser
     // would never run.
     runTimers: () => { for (const t of timers) if (!t.cancelled) t.fn(); },
   };
+}
+
+async function mountSelectedTranscript(options) {
+  const state = await mountView(options);
+  state.view.mount('s1');
+  const stream = state.byId.get('chat-stream');
+  const anchorNode = stream.appendChild(state.document.createElement('p'));
+  const focusNode = stream.appendChild(state.document.createElement('p'));
+  window.getSelection = () => ({ anchorNode, focusNode, toString: () => 'Selected reply' });
+  return { ...state, stream };
+}
+
+for (const focus of ['body', 'transcript link']) {
+  test(`Ctrl+C copies selected transcript text with focus on ${focus}`, async () => {
+    const { stream, document } = await mountSelectedTranscript();
+    if (focus === 'transcript link') document.activeElement = stream.appendChild(document.createElement('a'));
+    const commands = [];
+    document.execCommand = (command) => { commands.push(command); return true; };
+    let prevented = false;
+    document.dispatchEvent({ type: 'keydown', key: 'c', ctrlKey: true, preventDefault() { prevented = true; } });
+    assert.deepEqual(commands, ['copy']);
+    assert.equal(prevented, true);
+  });
+}
+
+test('a rejected copy command leaves Ctrl+C available to the browser', async () => {
+  const { document } = await mountSelectedTranscript();
+  let attempted = false;
+  document.execCommand = (command) => { assert.equal(command, 'copy'); attempted = true; return false; };
+  document.dispatchEvent({ type: 'keydown', key: 'c', ctrlKey: true, preventDefault() { assert.fail('must allow native copy'); } });
+  assert.equal(attempted, true);
+});
+
+for (const modifiers of [
+  { metaKey: true }, {}, { ctrlKey: true, shiftKey: true },
+  { ctrlKey: true, altKey: true }, { ctrlKey: true, metaKey: true },
+]) {
+  test(`copy leaves native shortcuts alone for ${JSON.stringify(modifiers)}`, async () => {
+    const { document } = await mountSelectedTranscript();
+    document.execCommand = () => assert.fail('must leave native shortcut alone');
+    document.dispatchEvent({ type: 'keydown', key: 'c', ...modifiers, preventDefault() { assert.fail('must allow native shortcut'); } });
+  });
+}
+
+for (const platform of ['Win32', 'Linux x86_64']) {
+  test(`Ctrl+C uses native copy on ${platform}`, async () => {
+    const { document } = await mountSelectedTranscript({ platform });
+    document.execCommand = () => assert.fail('must leave native shortcut alone');
+    document.dispatchEvent({ type: 'keydown', key: 'c', ctrlKey: true, preventDefault() { assert.fail('must allow native shortcut'); } });
+  });
+}
+
+for (const scenario of ['handled key', 'composition', 'repeat', 'selected draft', 'shell focus', 'hidden view', 'unmounted view', 'outside selection', 'partial selection', 'empty selection']) {
+  test(`Ctrl+C leaves native behavior when ${scenario}`, async () => {
+    const { view, stream, byId, input, document } = await mountSelectedTranscript();
+    const outside = document.createElement('div');
+    if (scenario === 'selected draft') {
+      document.activeElement = input;
+      input.value = 'draft';
+      input.setSelectionRange(0, 5);
+    }
+    if (scenario === 'shell focus') document.activeElement = outside;
+    if (scenario === 'hidden view') byId.get('chat-wrap').hidden = true;
+    if (scenario === 'unmounted view') view.unmount();
+    if (scenario === 'outside selection') window.getSelection = () => ({ anchorNode: outside, focusNode: outside, toString: () => 'elsewhere' });
+    if (scenario === 'partial selection') window.getSelection = () => ({ anchorNode: stream, focusNode: outside, toString: () => 'crossing views' });
+    if (scenario === 'empty selection') window.getSelection = () => ({ anchorNode: stream, focusNode: stream, toString: () => '' });
+    document.execCommand = () => assert.fail('must leave clipboard alone');
+    document.dispatchEvent({
+      type: 'keydown', key: 'c', ctrlKey: true,
+      defaultPrevented: scenario === 'handled key', isComposing: scenario === 'composition',
+      repeat: scenario === 'repeat',
+      preventDefault() { assert.fail('must allow native behavior'); },
+    });
+  });
 }
 
 // --- context-window percentage chip ------------------------------------------
@@ -418,17 +512,17 @@ test('an empty composer sends nothing', async () => {
   assert.equal(sent.some((m) => m.type === 'message'), false);
 });
 
-test('sending retains the composer until its matching delivery acknowledgement', async () => {
+test('sending empties the composer at once and keeps it locked until the matching acknowledgement', async () => {
   const { view, input, sent } = await mountView();
   view.mount('sess-1');
   view.setStatus('idle');
   input.value = 'once';
   input.dispatchEvent({ type: 'keydown', key: 'Enter', shiftKey: false, preventDefault() {} });
   const message = sent.find((m) => m.type === 'message');
-  assert.equal(input.value, 'once');
+  assert.equal(input.value, '');
   assert.equal(input.disabled, true);
   view.onMessageResult({ requestId: 'other', sessionId: 'sess-1', ok: true });
-  assert.equal(input.value, 'once');
+  assert.equal(input.disabled, true);
   view.onMessageResult({ requestId: message.requestId, sessionId: 'sess-1', ok: true });
   assert.equal(input.value, '');
   assert.equal(input.disabled, false);
@@ -522,9 +616,51 @@ test('pending delivery in one session does not block another session', async () 
   const second = sent.filter((m) => m.type === 'message').at(-1);
   assert.notEqual(second.requestId, first.requestId);
   view.onMessageResult({ requestId: first.requestId, sessionId: 'sess-1', ok: true });
-  assert.equal(input.value, 'second');
   view.onMessageResult({ requestId: second.requestId, sessionId: 'sess-2', ok: true });
   assert.equal(input.value, '');
+});
+
+// The fake DOM's appendChild does not detach from the old parent, so a re-pinned
+// node is listed twice; a real DOM moves it.
+const echoNodes = (byId) => [...new Set(byId.get('chat-stream').children.flatMap((c) => (c.className === 'chat-queue' ? c.children : [c])))].filter((c) => c.className === 'chat-user');
+
+test('a sent prompt appears at once as a dashed bubble, queued once delivered, until the transcript has it', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  input.value = 'hello there';
+  send(input);
+  const [bubble] = echoNodes(byId);
+  assert.equal(bubble.children.map((c) => c.textContent ?? c.data ?? c.nodeValue).join(''), 'hello there');
+  assert.equal(bubble.dataset.pending, '1');
+  view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: true });
+  assert.equal(bubble.dataset.pending, 'queued');
+  assert.equal(echoNodes(byId).length, 1);
+});
+
+test('the transcript copy of a prompt replaces its local echo', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  input.value = 'hello there';
+  send(input);
+  view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: true });
+  const chat = sent.find((m) => m.type === 'chat');
+  assert.equal(echoNodes(byId).length, 1);
+  view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 10, events: [{ kind: 'user', text: 'hello there' }] });
+  assert.equal(echoNodes(byId).length, 1);
+  assert.equal(echoNodes(byId)[0].dataset.pending, undefined);
+});
+
+test('a failed delivery removes the echo and restores the draft', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  input.value = 'keep me';
+  send(input);
+  view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: false, error: 'nope' });
+  assert.equal(echoNodes(byId).length, 0);
+  assert.equal(input.value, 'keep me');
 });
 
 
@@ -533,8 +669,8 @@ test('pending delivery in one session does not block another session', async () 
 // never pass through appendItems, so they can only be reached by delegation off
 // the stream — which is what this covers.
 
-test('a click on a markdown-file control opens the preview at its resolved path', async () => {
-  const { view, byId, opened, document } = await mountView({ cwd: '/repo' });
+test('a click on a markdown-file control opens the preview at its resolved path, for the session on screen', async () => {
+  const { view, byId, opened, openedFor, document } = await mountView({ cwd: '/repo' });
   view.mount('sess-1');
   const btn = document.createElement('button');
   btn.dataset.mdPath = '/repo/docs/plan.md';
@@ -542,6 +678,7 @@ test('a click on a markdown-file control opens the preview at its resolved path'
   let prevented = false;
   byId.get('chat-stream').dispatchEvent({ type: 'click', target: btn, preventDefault: () => { prevented = true; } });
   assert.deepEqual(opened, ['/repo/docs/plan.md']);
+  assert.deepEqual(openedFor, ['sess-1']);
   assert.equal(prevented, true);
 });
 
@@ -672,57 +809,148 @@ test('closing the view calls the burst off', async () => {
   assert.equal(sent.filter((m) => m.type === 'chat').length, before);
 });
 
-// --- jump-to-last-message pill ------------------------------------------------
+// --- previous/next user-message navigator -------------------------------------
 
-test('the jump pill stays hidden with no user message to jump to', async () => {
+function userReply(view, offset, text) {
+  view.onChatReply({ sessionId: 's1', token: 1, offset, epoch: 0, events: [{ kind: 'user', text }] });
+}
+
+test('the navigator stays hidden with no user message to jump to', async () => {
   const { view, byId } = await mountView();
   view.mount('s1');
-  assert.equal(byId.get('chat-jump-last').hidden, true);
+  assert.equal(byId.get('chat-jump-nav').hidden, true);
 });
 
-test('the jump pill shows only once the last user message scrolls out of view', async () => {
+test('the navigator shows only once a user message scrolls out of view', async () => {
   const { view, byId } = await mountView();
   view.mount('s1');
   const streamEl = byId.get('chat-stream');
   streamEl._rect = { top: 0, bottom: 400 };
-  view.onChatReply({ sessionId: 's1', token: 1, offset: 1, epoch: 0, events: [{ kind: 'user', text: 'hi' }] });
+  userReply(view, 1, 'hi');
   const userNode = streamEl.children.find((c) => c.className === 'chat-user');
-  assert.ok(userNode, 'the user bubble was appended');
-  userNode._rect = { top: 50, bottom: 80 }; // inside the stream's visible box
+  userNode._rect = { top: 50, bottom: 80 };
   streamEl.dispatchEvent({ type: 'scroll' });
-  assert.equal(byId.get('chat-jump-last').hidden, true, 'still on screen');
-  userNode._rect = { top: -100, bottom: -20 }; // scrolled above the stream's own box
+  assert.equal(byId.get('chat-jump-nav').hidden, true, 'still on screen');
+  userNode._rect = { top: -100, bottom: -20 };
   streamEl.dispatchEvent({ type: 'scroll' });
-  assert.equal(byId.get('chat-jump-last').hidden, false);
+  assert.equal(byId.get('chat-jump-nav').hidden, false);
+  assert.equal(byId.get('chat-jump-prev').disabled, false);
+  assert.equal(byId.get('chat-jump-next').disabled, true, 'nothing below to step to');
 });
 
-test('clicking the jump pill scrolls to and briefly highlights the last user message', async () => {
+test('prev and next step between user messages relative to the scroll position', async () => {
   const { view, byId } = await mountView();
   view.mount('s1');
-  view.onChatReply({ sessionId: 's1', token: 1, offset: 1, epoch: 0, events: [{ kind: 'user', text: 'hi' }] });
   const streamEl = byId.get('chat-stream');
-  const userNode = streamEl.children.find((c) => c.className === 'chat-user');
-  byId.get('chat-jump-last').dispatchEvent({ type: 'click' });
-  assert.ok(userNode._scrolledIntoViewWith, 'scrollIntoView was called on the bubble');
-  assert.equal(userNode.classList.contains('chat-jump-target'), true);
+  streamEl._rect = { top: 0, bottom: 400 };
+  streamEl.scrollHeight = 1000;
+  streamEl.clientHeight = 400;
+  userReply(view, 1, 'one');
+  userReply(view, 2, 'two');
+  userReply(view, 3, 'three');
+  const [one, two, three] = streamEl.children.filter((c) => c.className === 'chat-user');
+  one._rect = { top: -500, bottom: -460 };
+  two._rect = { top: -200, bottom: -160 };
+  three._rect = { top: 150, bottom: 190 };
+  streamEl.dispatchEvent({ type: 'scroll' });
+  assert.equal(byId.get('chat-jump-nav').hidden, false);
+  byId.get('chat-jump-prev').dispatchEvent({ type: 'click' });
+  assert.ok(two._scrolledIntoViewWith, 'prev lands on the nearest message above');
+  assert.equal(one._scrolledIntoViewWith, undefined);
+  assert.equal(two.classList.contains('chat-jump-target'), true);
+  byId.get('chat-jump-next').dispatchEvent({ type: 'click' });
+  assert.ok(three._scrolledIntoViewWith, 'next lands on the nearest message below');
+});
+
+test('a message a jump just landed on is not the next target', async () => {
+  const { view, byId } = await mountView();
+  view.mount('s1');
+  const streamEl = byId.get('chat-stream');
+  streamEl._rect = { top: 0, bottom: 400 };
+  streamEl.scrollHeight = 1000;
+  streamEl.clientHeight = 400;
+  userReply(view, 1, 'one');
+  userReply(view, 2, 'two');
+  const [one, two] = streamEl.children.filter((c) => c.className === 'chat-user');
+  one._rect = { top: 20, bottom: 60 };
+  two._rect = { top: 300, bottom: 340 };
+  streamEl.dispatchEvent({ type: 'scroll' });
+  byId.get('chat-jump-next').dispatchEvent({ type: 'click' });
+  assert.equal(one._scrolledIntoViewWith, undefined);
+  assert.ok(two._scrolledIntoViewWith);
+});
+
+test('next is disabled when the stream is scrolled to the bottom', async () => {
+  const { view, byId } = await mountView();
+  view.mount('s1');
+  const streamEl = byId.get('chat-stream');
+  streamEl._rect = { top: 0, bottom: 400 };
+  streamEl.scrollHeight = 1000;
+  streamEl.scrollTop = 600;
+  streamEl.clientHeight = 400;
+  userReply(view, 1, 'one');
+  userReply(view, 2, 'two');
+  const [one, two] = streamEl.children.filter((c) => c.className === 'chat-user');
+  one._rect = { top: -300, bottom: -260 };
+  two._rect = { top: 50, bottom: 90 };
+  streamEl.dispatchEvent({ type: 'scroll' });
+  assert.equal(byId.get('chat-jump-prev').disabled, false);
+  assert.equal(byId.get('chat-jump-next').disabled, true);
+});
+
+test('next stays enabled just short of the bottom, where a jump can still move', async () => {
+  const { view, byId } = await mountView();
+  view.mount('s1');
+  const streamEl = byId.get('chat-stream');
+  streamEl._rect = { top: 0, bottom: 400 };
+  userReply(view, 1, 'one');
+  userReply(view, 2, 'two');
+  const [one, two] = streamEl.children.filter((c) => c.className === 'chat-user');
+  streamEl.scrollHeight = 1000;
+  streamEl.scrollTop = 565;
+  streamEl.clientHeight = 400;
+  one._rect = { top: -300, bottom: -260 };
+  two._rect = { top: 50, bottom: 90 };
+  streamEl.dispatchEvent({ type: 'scroll' });
+  assert.equal(byId.get('chat-jump-next').disabled, false);
+});
+
+test('next from the last user message scrolls to the bottom', async () => {
+  const { view, byId } = await mountView();
+  view.mount('s1');
+  const streamEl = byId.get('chat-stream');
+  streamEl._rect = { top: 0, bottom: 400 };
+  userReply(view, 1, 'one');
+  const [one] = streamEl.children.filter((c) => c.className === 'chat-user');
+  one._rect = { top: 0, bottom: 40 };
+  streamEl.scrollHeight = 1000;
+  streamEl.scrollTop = 100;
+  streamEl.clientHeight = 400;
+  streamEl.dispatchEvent({ type: 'scroll' });
+  assert.equal(byId.get('chat-jump-next').disabled, false);
+  byId.get('chat-jump-next').dispatchEvent({ type: 'click' });
+  assert.equal(streamEl.scrollTop, 1000);
+  assert.equal(one._scrolledIntoViewWith, undefined);
 });
 
 test('the jump highlight only ever clears the bubble it was actually pulsing', async () => {
   const { view, byId, runTimers } = await mountView();
   view.mount('s1');
-  view.onChatReply({ sessionId: 's1', token: 1, offset: 1, epoch: 0, events: [{ kind: 'user', text: 'first' }] });
   const streamEl = byId.get('chat-stream');
-  const firstNode = streamEl.children.find((c) => c.className === 'chat-user');
-  byId.get('chat-jump-last').dispatchEvent({ type: 'click' });
-  // A second user message arrives — and gets its own click — before the first
-  // click's highlight timeout fires. The captured `target` in the click handler
-  // is what stops the first timeout from wiping the second bubble's flash.
-  view.onChatReply({ sessionId: 's1', token: 1, offset: 2, epoch: 0, events: [{ kind: 'user', text: 'second' }] });
-  const secondNode = streamEl.children.filter((c) => c.className === 'chat-user')[1];
-  byId.get('chat-jump-last').dispatchEvent({ type: 'click' });
+  streamEl._rect = { top: 0, bottom: 400 };
+  userReply(view, 1, 'first');
+  userReply(view, 2, 'second');
+  const [first, second] = streamEl.children.filter((c) => c.className === 'chat-user');
+  first._rect = { top: -300, bottom: -260 };
+  second._rect = { top: -100, bottom: -60 };
+  byId.get('chat-jump-prev').dispatchEvent({ type: 'click' });
+  assert.equal(second.classList.contains('chat-jump-target'), true);
+  second._rect = { top: 0, bottom: 40 };
+  byId.get('chat-jump-prev').dispatchEvent({ type: 'click' });
+  assert.equal(first.classList.contains('chat-jump-target'), true);
   runTimers();
-  assert.equal(firstNode.classList.contains('chat-jump-target'), false);
-  assert.equal(secondNode.classList.contains('chat-jump-target'), false, 'its own timeout also ran');
+  assert.equal(first.classList.contains('chat-jump-target'), false);
+  assert.equal(second.classList.contains('chat-jump-target'), false);
 });
 
 test('isHumanTypedUserItem rejects Agent-Wrangler-authored notices, accepts everything else', async () => {
@@ -748,22 +976,22 @@ test('a mail/PR-nudge bubble is never the jump target, even as the newest one', 
   humanNode._rect = { top: -100, bottom: -20 };
   mailNode._rect = { top: 50, bottom: 80 };
   streamEl.dispatchEvent({ type: 'scroll' });
-  assert.equal(byId.get('chat-jump-last').hidden, false, 'the human message is still off screen');
-  byId.get('chat-jump-last').dispatchEvent({ type: 'click' });
+  assert.equal(byId.get('chat-jump-nav').hidden, false, 'the human message is still off screen');
+  byId.get('chat-jump-prev').dispatchEvent({ type: 'click' });
   assert.ok(humanNode._scrolledIntoViewWith, 'jumped to the real message');
   assert.equal(mailNode._scrolledIntoViewWith, undefined, 'never jumped to the mail bubble');
 });
 
-test('mounting a different session resets the jump pill', async () => {
+test('mounting a different session resets the jump navigator', async () => {
   const { view, byId } = await mountView();
   view.mount('s1');
   view.onChatReply({ sessionId: 's1', token: 1, offset: 1, epoch: 0, events: [{ kind: 'user', text: 'hi' }] });
   const streamEl = byId.get('chat-stream');
   streamEl.children.find((c) => c.className === 'chat-user')._rect = { top: -100, bottom: -20 };
   streamEl.dispatchEvent({ type: 'scroll' });
-  assert.equal(byId.get('chat-jump-last').hidden, false);
+  assert.equal(byId.get('chat-jump-nav').hidden, false);
   view.mount('s2');
-  assert.equal(byId.get('chat-jump-last').hidden, true, 'a fresh session has nothing yet to jump to');
+  assert.equal(byId.get('chat-jump-nav').hidden, true, 'a fresh session has nothing yet to jump to');
 });
 
 // --- the dead-pane exit notice --------------------------------------------
@@ -876,6 +1104,300 @@ test('clearing needs-you re-enables the composer and hides the bar', async () =>
   view.setStatus('needs-you', 'Codex has a CLI update available');
   view.setStatus('idle');
   const bar = byId.get('chat-notice-bar');
+  assert.equal(bar.hidden, true);
+  assert.equal(input.disabled, false);
+});
+
+test('an input gate disables the composer with its reason, refuses a send and lifts cleanly', async () => {
+  const { view, byId, input, sent } = await mountView();
+  view.mount('s1');
+  view.setStatus('idle');
+  input.value = 'hello';
+  input.dispatchEvent({ type: 'input' });
+  view.setInputGate({ reason: 'Prompt cache expired — unlock from the card' });
+  assert.equal(input.disabled, true);
+  assert.equal(byId.get('chat-send').disabled, true);
+  assert.equal(input.placeholder, 'Prompt cache expired — unlock from the card');
+  // The graph's next setStatus keeps it locked.
+  view.setStatus('idle');
+  assert.equal(input.disabled, true);
+  const before = sent.filter((m) => m.type === 'message').length;
+  send(input);
+  assert.equal(sent.filter((m) => m.type === 'message').length, before);
+  view.setInputGate(null);
+  assert.equal(input.disabled, false);
+  assert.equal(byId.get('chat-send').disabled, false);
+  assert.equal(input.placeholder, 'Send a prompt…');
+});
+
+test('the suggested prompt stays hidden while a sent prompt is still echoed locally', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  const chat = sent.find((m) => m.type === 'chat');
+  view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 1, events: [], suggestion: 'commit and open a PR' });
+  assert.equal(byId.get('chat-suggestion').hidden, false);
+  input.value = 'hi';
+  send(input);
+  assert.equal(byId.get('chat-suggestion').hidden, true);
+  view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: true });
+  assert.equal(byId.get('chat-suggestion').hidden, true);
+  view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 5, events: [{ kind: 'user', text: 'hi' }], suggestion: 'commit and open a PR' });
+  assert.equal(byId.get('chat-suggestion').hidden, false);
+});
+
+test('a queued prompt stays below output that arrives after it was sent', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  input.value = 'later';
+  send(input);
+  view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: true });
+  const chat = sent.find((m) => m.type === 'chat');
+  view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 3, events: [{ kind: 'assistant', text: 'still working' }] });
+  const kids = byId.get('chat-stream').children;
+  assert.equal(kids.at(-1).className, 'chat-queue');
+  assert.ok(kids.some((k) => k.className !== 'chat-user'));
+});
+
+test('queued prompts survive leaving the view and coming back', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  input.value = 'wait for me';
+  send(input);
+  view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: true });
+  view.unmount();
+  assert.equal(echoNodes(byId).length, 0);
+  view.mount('sess-1');
+  assert.equal(echoNodes(byId).length, 1);
+  const [bubble] = echoNodes(byId);
+  assert.equal(bubble.dataset.pending, 'queued');
+  const chat = sent.filter((m) => m.type === 'chat').at(-1);
+  view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 4, events: [{ kind: 'user', text: 'wait for me', ts: Date.now() - 60000 }] });
+  assert.equal(echoNodes(byId)[0], bubble);
+  view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 9, events: [{ kind: 'user', text: 'wait for me', ts: Date.now() + 1000 }] });
+  assert.equal(echoNodes(byId).length, 2);
+  assert.equal(echoNodes(byId).some((n) => n.dataset.pending), false);
+});
+
+test('several queued prompts share one tray with a single heading', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  for (const text of ['abc', 'foobar']) {
+    input.value = text;
+    send(input);
+    view.onMessageResult({ requestId: sent.filter((m) => m.type === 'message').at(-1).requestId, sessionId: 'sess-1', ok: true });
+  }
+  const trays = [...new Set(byId.get('chat-stream').children.filter((c) => c.className === 'chat-queue'))];
+  assert.equal(trays.length, 1);
+  assert.equal(new Set(echoNodes(byId)).size, 2);
+  assert.match(trays[0].children[0].textContent, /Queued · 2 waiting/);
+});
+
+test('a send hands focus back to the composer once delivery is acknowledged', async () => {
+  const { view, input, sent, document } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  let focused = 0;
+  input.focus = () => { focused += 1; };
+  document.activeElement = input;
+  input.value = 'hello';
+  send(input);
+  assert.equal(input.disabled, true);
+  document.activeElement = document.body;
+  view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: true });
+  assert.equal(input.disabled, false);
+  assert.equal(focused, 1);
+});
+
+test('a prompt with an attachment is matched through the TUI image marker', async () => {
+  const { echoMatchesEvent } = await import('./chat-view.js');
+  const echo = { text: 'Explain this', images: ['a.png', 'b.png'], sentAt: 1000 };
+  assert.equal(echoMatchesEvent(echo, { text: '[Image #1][Image #2]Explain this', ts: 1500 }), true);
+  assert.equal(echoMatchesEvent(echo, { text: 'Explain this', ts: 1500 }), true);
+  assert.equal(echoMatchesEvent({ text: '', images: ['a.png'], sentAt: 1000 }, { text: '[Image #1]', ts: 1500 }), true);
+  assert.equal(echoMatchesEvent({ text: '', images: ['a.png'], sentAt: 1000 }, { text: '', ts: 1500 }), false);
+  assert.equal(echoMatchesEvent({ text: '[Image #1] shows the error', images: ['a.png'], sentAt: 1000 }, { text: '[Image #2][Image #1] shows the error', ts: 1500 }), true);
+  const literal = { text: 'Compare [Image #1] with [Image #2]', images: [], sentAt: 1000 };
+  assert.equal(echoMatchesEvent(literal, { text: 'Compare [Image #1] with [Image #2]', ts: 1500 }), true);
+  assert.equal(echoMatchesEvent({ ...literal, images: ['a.png', 'b.png'] }, { text: '[Image #1][Image #2]Compare [Image #1] with [Image #2]', ts: 1500 }), true);
+});
+
+test('a shell command sent with a space after ! leaves the pending tray once recorded', async () => {
+  const { scanChatText } = await import('../server/chat-events.js');
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  input.value = '! gh pr view 123 --repo acme/widgets';
+  send(input);
+  view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: true });
+  assert.equal(echoNodes(byId)[0].dataset.pending, 'queued');
+  const { events } = scanChatText(JSON.stringify({
+    type: 'user', timestamp: new Date().toISOString(),
+    message: { role: 'user', content: '<bash-input> gh pr view 123 --repo acme/widgets</bash-input>' },
+  }), 'claude');
+  const chat = sent.find((m) => m.type === 'chat');
+  view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 10, events });
+  assert.equal(echoNodes(byId).length, 1);
+  assert.equal(echoNodes(byId)[0].dataset.pending, undefined);
+  assert.equal(byId.get('chat-stream').children.some((n) => n.className === 'chat-queue'), false);
+});
+
+test('a pasted tab the TUI expanded to spaces still matches its echo', async () => {
+  const { echoMatchesEvent, echoRunMatchingEvent } = await import('./chat-view.js');
+  const typed = 'error: overwritten by merge:\n\tdocs/nomenclature.md\nAborting';
+  const recorded = 'error: overwritten by merge:\n    docs/nomenclature.md\nAborting';
+  assert.equal(echoMatchesEvent({ text: typed, images: [], sentAt: 1000 }, { text: recorded, ts: 1500 }), true);
+  assert.equal(echoMatchesEvent({ text: 'a\tb', images: [], sentAt: 1000 }, { text: 'a b', ts: 1500 }), true);
+  assert.equal(echoMatchesEvent({ text: 'a b', images: [], sentAt: 1000 }, { text: 'ab', ts: 1500 }), false);
+  assert.equal(echoMatchesEvent({ text: 'a\nb', images: [], sentAt: 1000 }, { text: 'a b', ts: 1500 }), false);
+  const a = { text: 'one\ttwo', images: [], sentAt: 1000 };
+  const b = { text: '\tthree', images: [], sentAt: 2000 };
+  assert.deepEqual(echoRunMatchingEvent([a, b], { text: 'one  two    three', ts: 4000 }), [a, b]);
+});
+
+test('prompts the agent folded into one message are all matched by it', async () => {
+  const { echoRunMatchingEvent } = await import('./chat-view.js');
+  const e = (text, sentAt) => ({ text, images: [], sentAt });
+  const a = e('first thing', 1000);
+  const b = e('second thing', 2000);
+  const c = e('third', 3000);
+  assert.deepEqual(echoRunMatchingEvent([a, b], { text: 'first thingsecond thing', ts: 4000 }), [a, b]);
+  assert.deepEqual(echoRunMatchingEvent([a, b, c], { text: 'first thing\n\nsecond thing\nthird', ts: 4000 }), [a, b, c]);
+  assert.deepEqual(echoRunMatchingEvent([a, b, c], { text: 'second thingthird', ts: 4000 }), [b, c]);
+  assert.deepEqual(echoRunMatchingEvent([a, b], { text: 'first thing', ts: 4000 }), []);
+  assert.deepEqual(echoRunMatchingEvent([a, b], { text: 'first thingsecond thing and more', ts: 4000 }), []);
+  assert.deepEqual(echoRunMatchingEvent([a, b], { text: 'first thingsecond thing', ts: -5000 }), []);
+  assert.deepEqual(echoRunMatchingEvent([e('yes', 1000), e('yes', 5000)], { text: 'yesyes', ts: 2000 }), []);
+  const img = { text: '', images: ['x.png'], sentAt: 1000 };
+  assert.deepEqual(echoRunMatchingEvent([img, b], { text: '[Image #1]second thing', ts: 4000 }), [img, b]);
+  assert.deepEqual(echoRunMatchingEvent([e('', 1000), b], { text: 'second thing', ts: 4000 }), []);
+  assert.deepEqual(echoRunMatchingEvent([{ ...a, images: ['x.png'] }, b], { text: '[Image #1]first thingsecond thing', ts: 4000 }), [{ ...a, images: ['x.png'] }, b]);
+});
+
+test('history replayed by a remount cannot acknowledge a newer identical prompt', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  const sendOnce = () => {
+    input.value = 'continue';
+    send(input);
+    view.onMessageResult({ requestId: sent.filter((m) => m.type === 'message').at(-1).requestId, sessionId: 'sess-1', ok: true });
+  };
+  sendOnce();
+  const ts = Date.now() + 100;
+  const reply = () => {
+    const chat = sent.filter((m) => m.type === 'chat').at(-1);
+    view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 100, events: [{ kind: 'user', text: 'continue', ts }] });
+  };
+  reply();
+  sendOnce();
+  view.unmount();
+  view.mount('sess-1');
+  reply();
+  assert.equal(echoNodes(byId).filter((n) => n.dataset.pending).length, 1);
+});
+
+test('a terminal-origin prompt already shown cannot acknowledge a later identical send', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  const ts = Date.now();
+  const reply = () => {
+    const chat = sent.filter((m) => m.type === 'chat').at(-1);
+    view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 50, events: [{ kind: 'user', text: 'continue', ts }] });
+  };
+  reply();
+  input.value = 'continue';
+  send(input);
+  view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: true });
+  view.unmount();
+  view.mount('sess-1');
+  reply();
+  assert.equal(echoNodes(byId).filter((n) => n.dataset.pending).length, 1);
+});
+
+function stubLocalStorage() {
+  const store = new Map();
+  globalThis.localStorage = { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, String(v)) };
+  return store;
+}
+
+test('queued prompts survive a reload and are dropped once the transcript records them', async () => {
+  stubLocalStorage();
+  try {
+    const first = await mountView();
+    first.view.mount('sess-1');
+    first.view.setStatus('idle');
+    first.input.value = 'still waiting';
+    send(first.input);
+    first.view.onMessageResult({ requestId: first.sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: true });
+
+    const reloaded = await mountView();
+    reloaded.view.mount('sess-1');
+    const [bubble] = echoNodes(reloaded.byId);
+    assert.equal(bubble.children.map((c) => c.textContent ?? c.data ?? c.nodeValue).join(''), 'still waiting');
+    assert.equal(bubble.dataset.pending, 'queued');
+
+    const chat = reloaded.sent.find((m) => m.type === 'chat');
+    reloaded.view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 10, events: [{ kind: 'user', text: 'still waiting' }] });
+    assert.equal(echoNodes(reloaded.byId)[0].dataset.pending, undefined);
+
+    const afterRecorded = await mountView();
+    afterRecorded.view.mount('sess-1');
+    assert.equal(echoNodes(afterRecorded.byId).length, 0);
+  } finally {
+    delete globalThis.localStorage;
+  }
+});
+
+test('a failed delivery is not persisted', async () => {
+  const store = stubLocalStorage();
+  try {
+    const { view, input, sent } = await mountView();
+    view.mount('sess-1');
+    view.setStatus('idle');
+    input.value = 'nope';
+    send(input);
+    view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: false, error: 'x' });
+    const { parseStoredEchoes } = await import('./chat-view.js');
+    assert.equal(parseStoredEchoes(store.get('aw.chatEchoes')).size, 0);
+  } finally {
+    delete globalThis.localStorage;
+  }
+});
+
+test('parseStoredEchoes drops expired and malformed entries and marks the rest queued', async () => {
+  const { parseStoredEchoes, serializeEchoes, ECHO_MAX_AGE_MS } = await import('./chat-view.js');
+  const now = 10_000_000;
+  const raw = JSON.stringify([
+    ['a', [{ requestId: 'r1', text: 'fresh', images: ['x.png'], sentAt: now - 1000 }, { text: 'old', sentAt: now - ECHO_MAX_AGE_MS - 1 }, { text: 5, sentAt: now }]],
+    ['b', [{ text: 'old', sentAt: 0 }]],
+    'junk',
+  ]);
+  const out = parseStoredEchoes(raw, now);
+  assert.deepEqual([...out.keys()], ['a']);
+  assert.equal(out.get('a').length, 1);
+  assert.equal(out.get('a')[0].state, 'queued');
+  assert.equal(out.get('a')[0].sessionId, 'a');
+  assert.equal(parseStoredEchoes('not json', now).size, 0);
+  assert.equal(parseStoredEchoes('{}', now).size, 0);
+  assert.equal(parseStoredEchoes(serializeEchoes(out), now).get('a')[0].text, 'fresh');
+});
+
+test('blocking API errors keep the terminal action and disabled composer until recovery', async () => {
+  const { view, byId, input } = await mountView();
+  view.mount('s1');
+  view.setStatus('needs-you', 'Login expired · Please run /login', 'api-error-blocking');
+  const bar = byId.get('chat-notice-bar');
+  assert.equal(bar.hidden, false);
+  assert.match(bar.children[0].textContent, /Login expired/);
+  assert.doesNotMatch(bar.children[0].textContent, /retry/);
+  assert.equal(bar.children[1].textContent, 'Terminal →');
+  assert.equal(input.disabled, true);
+  view.setStatus('idle');
   assert.equal(bar.hidden, true);
   assert.equal(input.disabled, false);
 });

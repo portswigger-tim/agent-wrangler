@@ -1,0 +1,103 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { readProvenance, trackedBranch } from './provenance.js';
+import { lsRemoteHead, countCommitsBehind } from './install.js';
+
+// The background half of "Check all": run by the core update service's
+// scheduled tick in Notify or Auto mode, and NOTIFY ONLY unless an extension's
+// own record opts in to auto-update. Nothing here clones, installs or touches a
+// working tree; an outdated extension that opted in is handed to `autoUpdate`
+// (index.js wires the install handler's autoUpdateExtension), which applies it
+// only when it needs no re-consent. One it applied leaves the result, since it
+// is no longer behind, and is listed in `autoApplied` instead (its new code
+// loads only at a restart, which update-service.js schedules); one it did not
+// keeps its entry, with the reason as `autoUpdateBlocked` (or `incompatible`,
+// for a host API refusal), so the row still offers the update through its
+// consent screen.
+//
+// Built-in extensions have no remote, and a hand-placed one has no recorded
+// origin, so both are left out of the result entirely rather than reported up
+// to date. A failed check is kept on its own entry (the row shows it) but never
+// counts towards `outdated`.
+//
+// An extension whose record opts in to early-adopter builds is checked against
+// its EA branch (`branch` on its entry), or the default branch if the remote no
+// longer has it; install.js makes that fallback.
+export function createExtensionUpdateCheck({
+  list,
+  provenance = readProvenance,
+  lsRemote = lsRemoteHead,
+  count = countCommitsBehind,
+  hasGitDir = (dir) => fs.existsSync(path.join(dir, '.git')),
+  autoUpdate = null,
+} = {}) {
+  // `id@installed..remote` -> { commits, capped }, so an unmoved remote head is
+  // never fetched again: one ls-remote per extension per tick is the steady state.
+  const counted = new Map();
+
+  async function countOnce(entry, record, remoteSha, branch) {
+    const key = `${entry.id}@${record.sha}..${remoteSha}`;
+    if (counted.has(key)) return counted.get(key);
+    let result;
+    try {
+      // No .git means git would walk up into whatever repo holds DATA_DIR.
+      if (!entry.dir || !hasGitDir(entry.dir)) throw new Error('no clone to count in');
+      result = await count(entry.dir, record.sha, record.originUrl, { branch });
+    } catch {
+      // The heads differ, so it is at least one change; say no more than that.
+      return { commits: 1, capped: true };
+    }
+    for (const k of counted.keys()) if (k.startsWith(`${entry.id}@`)) counted.delete(k);
+    counted.set(key, result);
+    return result;
+  }
+
+  return async function checkExtensions() {
+    const records = provenance();
+    const extensions = [];
+    const autoApplied = [];
+    for (const entry of list()) {
+      if (!entry.external) continue;
+      const record = records[entry.id];
+      if (!record?.originUrl || !record.sha) continue;
+      const branch = trackedBranch(record);
+      const base = { id: entry.id, label: entry.label || entry.id, updatable: true, originUrl: record.originUrl, sha: record.sha, branch };
+      try {
+        const remoteSha = await lsRemote(record.originUrl, { branch });
+        const behind = remoteSha !== record.sha;
+        const status = { ...base, remoteSha, behind, ...(behind ? await countOnce(entry, record, remoteSha, branch) : {}) };
+        if (behind && record.autoUpdate && autoUpdate) {
+          const result = await autoUpdate(entry.id);
+          if (result.applied) {
+            autoApplied.push({ id: entry.id, sha: result.sha });
+            continue;
+          }
+          status[result.incompatible ? 'incompatible' : 'autoUpdateBlocked'] = result.reason;
+        }
+        extensions.push(status);
+      } catch (err) {
+        extensions.push({ ...base, error: String(err?.message || err) });
+      }
+    }
+    return { ...summarizeExtensionUpdates(extensions), autoApplied };
+  };
+}
+
+export function summarizeExtensionUpdates(extensions) {
+  const outdated = extensions.filter((e) => e.behind && !e.error);
+  return {
+    extensions,
+    outdated: outdated.length,
+    commitsBehind: outdated.reduce((n, e) => n + (e.commits || 0), 0),
+    capped: outdated.some((e) => e.capped),
+  };
+}
+
+// The last published result as it stands now: an extension updated (or
+// uninstalled) since that check would otherwise read as out of date on every
+// reconnect until the next tick.
+export function currentExtensionUpdates(summary, records = readProvenance()) {
+  if (!summary) return null;
+  const still = summary.extensions.filter((e) => records[e.id]?.sha === e.sha);
+  return { ...summarizeExtensionUpdates(still), checkedAt: summary.checkedAt };
+}

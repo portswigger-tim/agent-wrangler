@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { mostCommonCwd } from '../../../public/util.js';
 
 // Read-only board snapshot of the tasks (columns) and their ids — the supported
@@ -5,7 +6,8 @@ import { mostCommonCwd } from '../../../public/util.js';
 // tasks.json state file. `bestFolder` (the natural cwd to launch a new session
 // for a task) reuses the exact heuristic the board UI shows: `mostCommonCwd`
 // (public/util.js) folds each session's cwd to its repo root — collapsing both
-// wrangler `<repo>-worktree-<branch>` siblings and `.claude/worktrees/` dirs —
+// wrangler `worktrees.noindex/<repo>-<branch>` dirs, legacy `<repo>-worktree-<branch>`
+// siblings and `.claude/worktrees/` dirs —
 // excludes throwaway scratch dirs, and picks the most frequent repo (ties → most
 // recently active). Keeping one implementation means the tool and the card can
 // never disagree about where a task lives.
@@ -19,9 +21,23 @@ export const listTasksTool = {
     + 'in (the repo the task\'s existing sessions mostly run in, with transient git worktrees '
     + 'folded back to their base repo and scratch dirs ignored). `bestFolder` is null for a task '
     + 'with no settled folder yet — fall back to the spawn default. Unassigned (ad-hoc) sessions '
-    + 'belong to no task and are excluded. Read-only.',
-  inputSchema: {},
-  async handler({ deps }) {
+    + 'belong to no task and are excluded. Pass archived: true to list ARCHIVED tasks instead '
+    + '(id, name, archivedAt, archivedSessionCount) — the ids restore_task accepts. Read-only.',
+  inputSchema: {
+    archived: z.boolean().optional().describe('List archived tasks (restore_task targets) instead of active ones. Default false.'),
+  },
+  async handler({ deps }, args = {}) {
+    if (args.archived === true) {
+      const archivedEntries = deps.sessionManager?.archivedEntries?.() ?? [];
+      const archived = (deps.taskStore.snapshot().tasks ?? []).filter((t) => t.archivedAt).map((t) => ({
+        id: t.id,
+        name: t.name,
+        archivedAt: t.archivedAt,
+        archivedSessionCount: archivedEntries.filter((e) => e.viaTaskArchive === t.id).length,
+      }));
+      const structuredContent = { tasks: archived };
+      return { content: [{ type: 'text', text: JSON.stringify(structuredContent, null, 2) }], structuredContent };
+    }
     // Archived tasks are off the board (see taskStore.archiveTask) — exclude them
     // so an agent can never spawn/assign into one via the `into`/task_id contract;
     // assign_session's taskStore.assign() also refuses them as a second layer.

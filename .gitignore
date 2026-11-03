@@ -14,12 +14,14 @@ docs/*
 !docs/agent-tools.md
 !docs/board-and-sessions.md
 !docs/reviews-and-prs.md
+!docs/install-signals.md
 !.claude/
 .claude/*
 !.claude/skills/
 .claude/skills/*
 !.claude/skills/maintain-product-docs/
 !.claude/skills/maintain-product-docs/SKILL.md
+!.claude/skills/evaluate-model/
 
 # Beads / Dolt files (added by bd init)
 .dolt/

@@ -1,5 +1,7 @@
+import { DiffSyntax } from './diff-syntax-client.js';
 import { send, latestSessions, setMaximized, renderGridIfVisible, taskForSession } from './app.js';
 import { toast } from './toast.js';
+import { anyModalOpen } from './util.js';
 import { X_ICON, MAXIMIZE_ICON, MINIMIZE_ICON } from './icons.js';
 import {
   buildCommentsPayload, draftCount, parseDrafts, isSaveCommentKey,
@@ -18,6 +20,8 @@ import { diffPanelSizing, nextDiffPanelState } from './diff-panel-layout.js';
 // Owns its own DOM wiring + transient state, reaching back into app.js for
 // send/selection (same pattern as modals.js). All git access is server-side —
 // this only renders the `diff` reply and batches inline review comments.
+
+const diffSyntax = new DiffSyntax();
 
 const REFRESH_MS = 3000;
 const PR_REFRESH_MS = 30000;
@@ -108,6 +112,17 @@ export function isDiffPanelOpen() { return openSid !== null; }
 // session's terminal, so a stale diff shouldn't linger over another).
 export function diffPanelSessionId() { return openSid; }
 
+// Told the session id of every panel that closes — by closeDiffPanel, or by
+// openDiffPanel switching to another session, which closes the first one's panel
+// just as surely. app.js uses it to call an extension's openDiff onClose.
+const closeListeners = new Set();
+export function onDiffPanelClosed(fn) { closeListeners.add(fn); }
+function notifyClosed(sessionId) {
+  for (const fn of closeListeners) {
+    try { fn(sessionId); } catch (err) { console.error('diff panel close listener threw', err); }
+  }
+}
+
 // Menu / shortcut entry point. Opens the panel for a session (switching if it was
 // showing a different one) and kicks off the first diff request. Idempotent for
 // the same session — a re-request just refreshes.
@@ -115,6 +130,7 @@ export function openDiffPanel(sessionId) {
   if (!sessionId) return;
   const alreadyOpenSame = openSid === sessionId;
   const switching = openSid && openSid !== sessionId;
+  const previous = openSid;
   openSid = sessionId;
   if (switching) { cancelDrag(); resetSessionState(); clearSubmit(); }
   // Reset the mode toggle back to the default on every genuinely fresh open (a new
@@ -142,6 +158,7 @@ export function openDiffPanel(sessionId) {
   renderLoading();
   requestDiff();
   startPolling();
+  if (switching) notifyClosed(previous);
 }
 
 // Ctrl+Cmd+D: a toggle — close if already showing this session, else open.
@@ -152,6 +169,8 @@ export function toggleDiffPanel(sessionId) {
 
 export function closeDiffPanel() {
   if (openSid === null) return;
+  diffSyntax.cancel();
+  const closed = openSid;
   openSid = null;
   stopPolling();
   cancelDrag();
@@ -178,6 +197,7 @@ export function closeDiffPanel() {
     // collapsed to one column until the next ~4s poll.
     renderGridIfVisible();
   }, reducedMotion() ? 0 : 220);
+  notifyClosed(closed);
 }
 
 // The diff panel's own fullscreen: hides #sidebar so the diff fills the whole
@@ -503,6 +523,7 @@ export function onDiffCommentsResult(msg) {
 // --- rendering ---
 
 function renderLoading() {
+  diffSyntax.cancel();
   bodyEl.replaceChildren(noticeEl('Loading diff…'));
   filelistEl.replaceChildren();
 }
@@ -511,6 +532,8 @@ function renderLoading() {
 // via textContent in diff-dom.js — NEVER innerHTML — so agent-generated file
 // content can't inject markup), then swap it in atomically.
 function renderDiff() {
+  diffSyntax.cancel();
+  const syntaxJobs = [];
   if (!lastDiff) { renderLoading(); return; }
   updateSubText(); // lastDiff.baseRef is only known once a branch-mode reply lands
   const prevScroll = bodyEl.scrollTop; // preserve scroll across an in-place refresh
@@ -573,10 +596,13 @@ function renderDiff() {
       } else {
         for (const h of f.hunks || []) {
           section.append(hunkHeadEl(h.header));
+          const targets = [];
+          const collectText = (el, ln, side) => targets.push({ el, ln, side });
+          syntaxJobs.push({ file: f, hunk: h, targets });
           if (diffLayout === 'split') {
-            for (const pair of pairHunkLines(h.lines)) section.append(pairRowEl(f.path, pair, drafts, selectedKeys));
+            for (const pair of pairHunkLines(h.lines)) section.append(pairRowEl(f.path, pair, drafts, selectedKeys, collectText));
           } else {
-            for (const ln of h.lines || []) section.append(lineEl(f.path, ln, drafts, selectedKeys));
+            for (const ln of h.lines || []) section.append(lineEl(f.path, ln, drafts, selectedKeys, collectText));
           }
         }
       }
@@ -595,6 +621,15 @@ function renderDiff() {
   }
   bodyEl.replaceChildren(frag);
   bodyEl.scrollTop = prevScroll;
+  // Spend the bounded budget on hunks in view before off-screen source.
+  const viewport = bodyEl.getBoundingClientRect();
+  const prioritizedJobs = syntaxJobs.map((job) => {
+    const first = job.targets[0]?.el.getBoundingClientRect();
+    const last = job.targets.at(-1)?.el.getBoundingClientRect();
+    return { job, visible: first && last && first.top <= viewport.bottom && last.bottom >= viewport.top };
+  }).sort((a, b) => Number(Boolean(b.visible)) - Number(Boolean(a.visible))).map(({ job }) => job);
+  void diffSyntax.decorate(prioritizedJobs, () => openSid !== null && !activeKey && !dragSelecting &&
+    !document.getSelection()?.toString());
   if (st === 'ok') filelistEl.replaceChildren(fileListEl(lastDiff.files || []));
   else filelistEl.replaceChildren();
   reapplyActiveFileRow();
@@ -1044,7 +1079,7 @@ document.addEventListener('keydown', (e) => {
   // for Escape, it closed the diff behind the dialog instead of the dialog itself, and
   // a second Escape was needed to actually dismiss it.
   if (document.querySelector('.context-menu')) return;
-  if (document.querySelector('#modal:not(.hidden), [id$="-modal"]:not(.hidden)')) return;
+  if (anyModalOpen(document)) return;
   if (e.key === 'Escape') {
     if (activeKey) { e.preventDefault(); e.stopPropagation(); closeEditor(); return; }
     e.preventDefault(); e.stopPropagation();

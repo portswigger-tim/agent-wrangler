@@ -15,6 +15,9 @@ otherwise it behaves exactly as a Claude-only board.
 - **A control plane for agents, not just for you** — sessions can spawn other agents and orchestrate
   whole multi-agent workflows, hand tasks off to each other, and send one another messages directly —
   real agent-to-agent coordination, not a one-way dashboard.
+- **Remote Control for a Claude session** — ask an agent to launch a session with
+  `spawn_session` and `remote_control: "Phone"`. Claude supports it; Codex does not.
+  See [Remote Control usage and lifecycle](docs/agent-tools.md#remote-control-on-spawn_session).
 - **Visualize your whole fleet, your way** — every agent and its sub-agents rendered on the board,
   grouped under the tasks you assign them to, nested under parent sessions, or collapsed into workflow
   boxes — organize it however makes sense to you.
@@ -62,12 +65,19 @@ otherwise it behaves exactly as a Claude-only board.
   reply arriving word by word the way the terminal does; while a turn is running it shows a
   live row naming the tool in flight and how long the session has been busy.
 - **Themeable** — built-in dark/light plus drop-in custom styles.
-- **Updates from the board** — Settings › Updates checks `origin/main`, lists the new commits and
-  fast-forwards the install and restarts it in one click; sessions keep running through the restart
-  and open tabs reload onto the new code. It checks hourly and can install on its own (Off / Notify /
-  Auto). If an update can't start, the next restart rolls back to the commit it came from. Needs the
-  background service below, a clean checkout on `main`, and no local commits. Running sessions
-  get an "older version" tag until they restart, and an opt-in setting restarts idle ones for you.
+- **Updates from the board** — for a Git checkout, Settings › Updates checks `origin/main`, lists
+  the new commits, fast-forwards the checkout and restarts it in one click. Sessions keep running
+  through the restart, and open tabs reload onto the new code. It checks hourly and can install on
+  its own (Off / Notify / Auto). Notify and Auto also check installed extensions and say how many
+  are out of date and how many changes they're missing; an extension is updated automatically only
+  if you turned on its own Auto-update in Settings › Extensions, and the wrangler restarts to load it
+  once idle. If an update can't start, the next restart rolls back to the commit
+  it came from. Installing needs the background service below (which also installs changed
+  dependencies), a clean checkout on `main` and no local commits. An install that isn't its own Git
+  checkout, such as one managed by a package manager, shows updates as unavailable and never runs
+  Git, but asks for a restart if a package upgrade lands while the wrangler is still running. See
+  [Install signals](docs/install-signals.md). An opt-in setting restarts idle sessions after an
+  update so they pick up new tools and skills.
 
 ![Agent Wrangler board with several tasks, nested and workflow-grouped sessions, and live cost figures](docs/images/board-overview.png)
 
@@ -80,9 +90,10 @@ work, reviewing changes, managing tasks, and automating pull requests.
 | --- | --- |
 | [Board and sessions](docs/board-and-sessions.md) | Dispatch, tasks, TODOs, task memory, worktrees, devcontainers, nesting, snoozing, archiving, search, settings, and shortcuts |
 | [Agent capabilities](docs/agent-capabilities.md) | The skills you can ask an agent to use, including adversarial PR review, advisor consultations, session spawning, mail, links, and activity summaries |
-| [Reviews and pull requests](docs/reviews-and-prs.md) | Peer-review sessions, adversarial PR reviews, the diff reviewer, PR status, auto-fix, and auto-merge |
+| [Reviews and pull requests](docs/reviews-and-prs.md) | Peer-review sessions, adversarial PR reviews, the diff reviewer, PR status, the model footer, auto-fix, and auto-merge |
 | [Agent tools](docs/agent-tools.md) | Reference for the MCP tools available to Agent Wrangler sessions |
 | [Extensions](docs/extensions.md) | The core extensions, installing more, and building one with server, browser, tool, setting, and skill contributions |
+| [Install signals](docs/install-signals.md) | For packagers: the environment variables that decide restart and update behaviour, app identity, and why sessions never inherit them |
 
 If you are unsure what to ask for, start with [Agent capabilities](docs/agent-capabilities.md): it
 includes example prompts for every built-in Wrangler skill.
@@ -93,7 +104,8 @@ includes example prompts for every built-in Wrangler skill.
 - `tmux` (sessions launched through the app run inside named tmux sessions) — `brew install tmux`
   on macOS, `apt-get install tmux` (or your distro's equivalent) on Linux
 - `gh` (optional — PR auto-attach, check-watching, and auto-merge shell out to it; run
-  `gh auth login` once so it's authenticated)
+  `gh auth login` once so it's authenticated, and `gh auth setup-git` too if you install
+  extensions from private GitHub repositories)
 
 **Windows** isn't supported natively, but works via WSL2 — WSL2 runs a real Linux kernel, so the
 Linux path above applies unmodified once you're inside it. Keep your checkout on the WSL2 side of
@@ -111,6 +123,29 @@ npm start          # serves http://localhost:7878
 `npm start` auto-installs after a pull that changes dependencies, so you never
 need to remember `npm install`. That's the fastest way to try it out, but for everyday use we'd
 recommend running it as a background service instead (below) so it survives restarts and reboots.
+
+`npm start` runs `bin/agent-wrangler`, which you can also run directly (or put on your PATH with
+`npm link`). It takes flags for the common settings; `agent-wrangler --help` lists them:
+
+```bash
+bin/agent-wrangler --port 7999 --data-dir ~/aw-scratch --open
+```
+
+- `--port <n>` — same as `AW_PORT`
+- `--data-dir <path>` — same as `AW_DATA_DIR`
+- `--open` — same as `AW_OPEN_BROWSER=1`
+- `--host <addr>` — same as `AW_BIND_HOST` (see the exposure warning below)
+- `-v`/`--version`, `-h`/`--help`
+
+A flag overrides its environment variable. Running the launcher directly never auto-installs
+dependencies; only `npm start` and the service start script do.
+
+The launcher preserves your locale settings. If `LC_ALL`, `LC_CTYPE`, and `LANG` are all
+empty or unset, it selects an installed UTF-8 locale for `LC_CTYPE` only, preferring
+`C.UTF-8`, then `en_US.UTF-8`. If your effective setting is unavailable or non-UTF-8,
+or no usable UTF-8 locale is installed, it warns and continues without changing it.
+Use `locale -a` to find an installed UTF-8 locale and configure `LC_CTYPE` for Unicode
+in tmux; a non-empty `LC_ALL` takes precedence and must be updated or unset first.
 
 Environment variables:
 
@@ -136,6 +171,10 @@ Environment variables:
 - `AW_ROLLBACK_AFTER_STARTS` — how many starts an update gets to come up healthy before
   `scripts/wrangler-start.sh` rolls it back (default `3`, i.e. two failed attempts)
 
+Start scripts and package wrappers set a few more variables (`AW_SUPERVISED`, `AW_GIT_UPDATES`,
+`AW_INSTALL_MANAGER`, `AW_NODE`, `AW_INSTALL_ROOT`) to describe how the install runs. They're
+documented in [Install signals](docs/install-signals.md), and sessions never inherit them.
+
 ### Run as a background service
 
 To keep it always-on, run it under launchd (macOS) or a systemd user unit (Linux).
@@ -153,11 +192,25 @@ placeholders, then load it:
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/net.portswigger.agent-wrangler.plist
 ```
 
-Restart it after changes with:
+Restart it with:
 
 ```bash
 launchctl kickstart -k gui/$(id -u)/net.portswigger.agent-wrangler
 ```
+
+launchd reads the plist only when it loads the job, so a restart doesn't pick up edits to the plist
+itself. Reload the job instead, or log out and back in:
+
+```bash
+launchctl bootout gui/$(id -u)/net.portswigger.agent-wrangler
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/net.portswigger.agent-wrangler.plist
+```
+
+If `bootstrap` fails with `5: Input/output error` straight after the `bootout`, the old job hadn't
+finished stopping; run it again.
+
+The template sets `ProcessType` to `Interactive`, so launchd doesn't throttle the service and its
+sessions as a background daemon. See [Snags](#snags) if your plist predates that.
 
 On Linux, copy `scripts/agent-wrangler.service.example` to
 `~/.config/systemd/user/agent-wrangler.service`, fill in the path placeholder, then load it:
@@ -167,8 +220,10 @@ systemctl --user daemon-reload
 systemctl --user enable --now agent-wrangler.service
 ```
 
-Both paths invoke `scripts/wrangler-start.sh`, which resolves Node via nvm (the repo's `.nvmrc`, falling back to your nvm default), pins a UTF-8 locale so
-tmux renders Unicode correctly, and auto-installs after a dependency change.
+Both paths invoke `scripts/wrangler-start.sh`, which resolves Node via nvm (the repo's `.nvmrc`,
+falling back to your nvm default), pins a UTF-8 locale so tmux renders Unicode correctly, and auto-installs
+after a dependency change.
+(see the locale guidance above).
 
 ### Desktop app (experimental)
 
@@ -218,6 +273,40 @@ The grant only applies to *new* processes, so the tmux server needs restarting (
 kill-server`, or just kill the process) — this kills every live session on that socket; mapping entries
 survive and each card just needs a manual Resume.
 
+**A browser an agent opens (Playwright, say) sits behind other windows, has no Dock icon and won't
+take typing (macOS only).** Your keystrokes land in whichever app was in front instead. This happens
+after you log out and back in without restarting the Mac. Logging out stops the wrangler service but
+not its tmux server, so the restarted wrangler reconnects to a tmux server that still belongs to the
+old login session. Every agent, and every app an agent starts, inherits that session, and macOS won't
+let its windows come to the front. Restarting the wrangler doesn't help. When the wrangler starts it
+checks for this and shows a banner on the board. Click **Restart tmux** on the banner to stop the old
+tmux server, then resume your sessions. The next session you start or resume gets a new tmux server
+in your current login session. As above, this stops every live session on that socket, but their
+cards survive.
+
+**Sessions take seconds to open and lag while the machine is busy (macOS only).** Heavy work
+elsewhere, such as containers running test suites, makes the board's sessions slow to open and slow
+to respond, while `claude` started from a terminal keeps up. launchd runs a service whose plist sets
+no `ProcessType` as a background daemon, with a lower CPU priority and throttled disk access, and the
+wrangler, its tmux server and every session inherit that. Check what launchd loaded:
+
+```bash
+launchctl print gui/$(id -u)/net.portswigger.agent-wrangler | grep 'spawn type'
+```
+
+`daemon (3)` is throttled; `interactive (4)` is not. The plist template sets `ProcessType` to
+`Interactive`. For a plist made from an older template, `scripts/wrangler-start.sh` adds it at
+startup and says so in `wrangler.log`. It leaves a plist alone if it already sets a `ProcessType`
+(set `Standard` to keep the old behaviour), belongs to a package manager's install, or can't be
+written; for that last one it logs a warning in `wrangler.err` instead.
+
+launchd applies the change from your next login, and sessions keep their old priority until their
+tmux server restarts. Restarting the Mac does both. After logging out and back in instead, click
+**Restart tmux** on the banner described above. To apply it without logging out, reload the job (see
+[Run as a background service](#run-as-a-background-service)), then stop the tmux server with
+`tmux -L <socket> kill-server`, where `<socket>` is `tmuxSocket` in `~/.agent-wrangler/config.json`.
+Each of these stops every live session, but their cards survive, so resume them.
+
 ## How it works
 
 - **State** is read through an adapter for each supported agent. Claude state and transcripts come
@@ -234,10 +323,13 @@ survive and each card just needs a manual Resume.
 ## Extensions
 
 Optional features are packaged as extensions — one manifest each, switched on and off from
-**Settings → Extensions**, and installable from a git URL. An extension can add MCP tools,
+**Settings → Extensions**, and installable from a git URL or by browsing GitHub repositories tagged
+`agent-wrangler-extension`. An extension can add MCP tools,
 control handlers, board state, settings, session hooks, skills and a browser-side half. See
 [docs/extensions.md](docs/extensions.md) for installation, a minimal authoring example, and the
-complete implementation constraints.
+complete implementation constraints. Client extensions can build model pickers with
+core’s frozen benchmark data and pure quality/cost/time maths through
+`api.modelFront` (host API 1.56.0), using their own UI and presets.
 
 An extension runs inside the wrangler with full access to the machine: its capability list is
 disclosure, not a sandbox. Install one only if you trust whoever wrote it.
@@ -280,7 +372,9 @@ cadence. A schedule is **a saved action + a "when"**, and the action is one of t
   it's **resumed** (delivering the message as its first prompt — e.g. "every weekday
   09:00, resume my review session and tell it to check overnight CI"); if it's **live**
   the message is **injected into its terminal** (a recurring nudge). With no message, a
-  dormant session is just woken and a live one is left alone.
+  dormant session is just woken and a live one is left alone. **Focus session when
+  task runs**, below the target-session selector, opens the target’s terminal in the
+  board after a successful run. It is off by default and also applies to **Run now**.
 
 - **New / Edit** reuses the dispatch dialog with an added **When** section and an
   **action selector**: pick **One-off** (a single date & time), **Daily** (a time), or
@@ -296,7 +390,12 @@ cadence. A schedule is **a saved action + a "when"**, and the action is one of t
 
 Agents can create schedules too, via the **`schedule_session` MCP tool** — including
 scheduling their own wake-up ("resume me at 3pm to check the deploy"): an existing-session
-action's target defaults to the calling session.
+action's target defaults to the calling session. One-off schedules delete themselves
+once they fire (or are missed); **`cancel_schedule`** removes a pending one-off or a cron.
+Use **`update_schedule`** with the existing id to edit its name, timing or action without
+recreating it. Omitted fields stay unchanged. Timing edits recompute the next run; name and
+action edits preserve it. For example, ask “Move my scheduled check to 3pm and keep its prompt.”
+See the [schedule tools](docs/agent-tools.md) for the MCP fields.
 
 Scheduling adds a dependency (`cron-parser`); a running background service needs a
 **restart** to pick it up (the startup dependency sync handles the install).
@@ -358,15 +457,22 @@ brought (back) onto the board from the same place you found it.
 ## Themes
 
 The **settings button** (the gear icon on the nav rail) opens **Settings**, whose **Appearance**
-section switches between built-in **dark** and **light** and any drop-in custom styles. A custom style
-is a folder under `styles/<id>/` with a `theme.json` manifest — a name,
-an icon, a `dark`/`light` base, and CSS-variable overrides — plus optional assets like a wallpaper for
-translucent themes. The server compiles each manifest to CSS-var overrides and serves it through a
-manifest-gated asset route (raw files are never exposed). See `styles/jurassic-park/` for a worked
-example. All UI colours — including the xterm terminal — flow through these variables, so both
-built-in and custom styles re-theme the whole app live.
+section switches between built-in **dark** and **light** and the themes extensions contribute, each shown with its icon and a swatch of its own colours. The core
+**Themes** extension, on by default, adds Cyberpunk, Dolphin, Pink, Pixel Cats and Wrangler, and
+**Settings › Extensions › Themes** switches each one off or on. A browser whose chosen theme is
+switched off, or whose extension is off or not installed, shows Dark until the theme is back, without
+forgetting its choice. Jurassic Park is a community extension:
+[psjamesh/agent-wrangler-jurassic-park-theme](https://github.com/psjamesh/agent-wrangler-jurassic-park-theme).
 
-![The Appearance section's theme picker, showing the built-in and drop-in custom styles](docs/images/theme-picker.png)
+A theme is a folder with a `theme.json` manifest — a name, an icon, a `dark`/`light` base, and
+CSS-variable overrides — plus optional assets like a wallpaper for translucent themes. It inherits
+everything it does not override from its base, so a light theme starts from the built-in Light. See
+`server/extensions/builtin/themes/themes/` for worked examples, and [Themes](docs/extensions.md#themes)
+for shipping one in an extension. The server compiles each manifest to CSS-var overrides and serves
+it through a manifest-gated asset route (raw files are never exposed). All UI colours — including the xterm terminal —
+flow through these variables, so both built-in and custom styles re-theme the whole app live.
+
+![The Appearance section's theme picker, showing the built-in and extension themes](docs/images/theme-picker.png)
 
 ## License
 

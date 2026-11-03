@@ -20,6 +20,13 @@ information about the task itself, not a channel for briefing another session.
 
 `agent` defaults to `claude`; pass `codex` to launch a Codex session instead.
 
+Call `get_model_front` when choosing a model and effort for the task. It lists
+launchable settings that nothing beats on quality, cost and time together, with
+units and source credit. Use `agent`, `maxUsd` or `minQuality` to filter the list,
+and `pick` to check a candidate against the whole installed-agent front. Auto
+uses the model's reported effort; `scored: false` means there is no benchmark
+verdict. Apply the task's capability needs and the user's model exclusions.
+
 **Choose `model` deliberately for the task — don't just accept whatever inherits or defaults.** Match the model to what the work actually needs: bounded, mechanical work (a rebase, reading logs, a small fix with a clear spec) doesn't need a frontier model; a genuinely hard, ambiguous, or high-stakes problem does. The `(default)` markers in the generated table below are just the wrangler's fallback when `model` is left unset — not a recommendation — so pick explicitly rather than relying on them.
 
 **Pass `model` explicitly whenever you spawn the *other* agent.** The "inherit
@@ -44,16 +51,17 @@ before launch with an error naming the valid options. Don't hand-edit it — cha
 - `fable` — Fable 5.1 · 1M context
 - `opus` — Opus 5.5 · 1M context (default)
 - `opusplan` — Opus plan · Sonnet execution
-- `sonnet` — Sonnet 5 · 200K context
-- `sonnet[1m]` — Sonnet 5 · 1M context
-- `haiku` — Haiku 4.5 · 200K context
+- `sonnet` — Sonnet 5.5 · 200K context
+- `sonnet[1m]` — Sonnet 5.5 · 1M context
+- `haiku` — Haiku 5.5 · 200K context
 - `effort`: `low`, `medium`, `high`, `xhigh`, `max`
 
 **Codex** (`agent: "codex"`):
+- `gpt-6.1-sol` — GPT-6.1-Sol · Latest workhorse model for coding and everyday work
 - `gpt-6-astra` — GPT-6-Astra · Frontier intelligence for the most demanding work
-- `gpt-6-sol` — GPT-6-Sol · Workhorse model for coding and everyday work (default)
+- `gpt-6-sol` — GPT-6-Sol · Previous generation workhorse model (default)
 - `gpt-6-luna` — GPT-6-Luna · Fast and affordable model for easier tasks
-- `gpt-5.6-sol` — GPT-5.6-Sol · Older coding model for complex work
+- `gpt-5.6-sol` — GPT-5.6-Sol · Older generation workhorse model
 - `gpt-5.6-terra` — GPT-5.6-Terra · Older balanced model for straightforward work
 - `gpt-5.6-luna` — GPT-5.6-Luna · Older fast and efficient model
 - `gpt-5.5` — GPT-5.5 · Legacy coding model
@@ -62,6 +70,22 @@ before launch with an error naming the valid options. Don't hand-edit it — cha
 The running wrangler's lists can be newer than this table. An unknown `model` is rejected with the current valid list, so an error there is the source of truth.
 
 <!-- END GENERATED MODELS -->
+
+## Remote Control
+
+When the user asks for Claude Code Remote Control on the new session, pass
+`remote_control: "Phone"` to `spawn_session` (using their requested name).
+For example: “Spawn a Claude session to investigate this issue with Remote
+Control named Phone.” Only Claude currently supports it; unsupported target
+agents are refused by name before any session or worktree is created.
+
+`agent` still defaults to `claude`, even for a Codex caller. The optional name
+is trimmed and must be non-empty, single-line, contain no control characters,
+and not start with `-`. Omit `remote_control` to leave it off: it never inherits
+from the caller. The name persists for every resume; forks do not inherit it.
+See [the tool guide](../../../docs/agent-tools.md#remote-control-on-spawn_session)
+for an example call and lifecycle details. Handoff, workflows and scheduling
+have no Remote Control option.
 
 ## Codex sandbox and `add_dirs`
 

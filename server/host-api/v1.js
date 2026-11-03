@@ -1,8 +1,15 @@
+import { agentError } from '../agents/index.js';
 import path from 'node:path';
 import { deepFreeze, projectSession, projectTask, worktreeSummary } from './project.js';
 import { cachedScan } from '../usage-scan-memo.js';
 import { ADHOC } from '../task-store.js';
 import { linkMatches } from '../mcp/links.js';
+import { MAX_ATTACHMENTS_PER_MESSAGE, isPasteFileName } from '../paste-image.js';
+import { imageAvailable, claimExtImages, keepStagedPaste, readKeptPaste, removeKeptPaste } from '../paste-store.js';
+import { collectLaunchContext } from '../launch-context.js';
+import { deliverFirstPrompt } from '../dispatch-runner.js';
+import { requestOrigin } from '../request-origin.js';
+import { supportsRemoteControl } from '../agents/index.js';
 
 // One builder per v1 capability. A builder receives the wiring bag index.js
 // composed (the core singletons plus the board primitives) and returns the
@@ -14,13 +21,14 @@ import { linkMatches } from '../mcp/links.js';
 // the point: the vocabulary is closed and declared, not a second implementation
 // of session lifecycle that can drift from the board's.
 //
-// THREE FORCED VALUES live here — `broadcast`'s `type`, `mail.send`'s `from`,
-// and `wake`/`kill`'s `reason`. All three are closed over from the extension's
-// own id and are not caller-passable: narrowness of signature IS the access
-// control (the same reasoning as createExtDeliver's two arguments and the
+// FOUR FORCED VALUES live here — `broadcast`'s `type`, `mail.send`'s `from`,
+// `wake`/`kill`'s `reason` and `terminals.create`'s `key` namespace. All four are
+// closed over from the extension's own id and are not caller-passable:
+// narrowness of signature IS the access control (the same reasoning as
+// createExtDeliver's two arguments and the
 // checklist tools' missing `session` parameter), because a runtime check the
 // caller can pass a value through is not a control at all. An extension can
-// never impersonate the core, or another extension, on any of the three.
+// never impersonate the core, or another extension, on any of the four.
 
 const sessionsRead = ({ core }) => ({
   sessions: {
@@ -97,7 +105,70 @@ function checkAddDirs(addDirs) {
   return { addDirs };
 }
 
-const sessionsSpawn = ({ core }) => ({
+// `{ name }` -> the session's Remote Control name, so its launch and every
+// resume pass `--remote-control <name>`. Claude only: Codex has no Remote
+// Control, and an option it would silently drop reads as phone control that is
+// on when it is not. An unknown key is refused like `worktree`'s.
+function checkRemoteControl(remoteControl, agent = 'claude') {
+  if (remoteControl === undefined || remoteControl === null) return {};
+  if (!isPlainObject(remoteControl)) spawnError('remoteControl must be an object like { name }');
+  const stray = Object.keys(remoteControl).filter((k) => k !== 'name');
+  if (stray.length) spawnError(`remoteControl has unknown option(s) ${stray.join(', ')} (known: name)`);
+  const { name } = remoteControl;
+  // eslint-disable-next-line no-control-regex
+  if (typeof name !== 'string' || !name.trim() || /[\x00-\x1f\x7f]/.test(name)) spawnError('remoteControl.name must be a non-empty single-line string');
+  // The flag's value is optional, so Claude would read a leading `-` as the next flag.
+  if (name.trim().startsWith('-')) spawnError('remoteControl.name must not start with "-"');
+  if (!supportsRemoteControl(agent)) spawnError(`Agent "${agent}" does not support Remote Control.`);
+  return { remoteControl: { name: name.trim() } };
+}
+
+function isPlainObject(value) {
+  if (!value || typeof value !== 'object') return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function checkExt(ext, fail = spawnError) {
+  if (ext === undefined) return {};
+  if (!isPlainObject(ext)) fail('ext must be an object keyed by extension id');
+  for (const [id, slice] of Object.entries(ext)) {
+    if (slice !== null && !isPlainObject(slice)) fail(`ext.${id} must be an object or null`);
+  }
+  return { ext };
+}
+
+// Names, never paths: each must be a name this server minted, held in the
+// staging dir (client `api.images.stage`) or in this extension's own kept store.
+// Checked BEFORE the launch, because a session started without the images its
+// caller meant it to have cannot be told apart from one that never wanted them.
+function checkImages(extId, images) {
+  if (images === undefined || images === null) return [];
+  if (!Array.isArray(images)) spawnError('images must be an array of staged image names');
+  if (images.length > MAX_ATTACHMENTS_PER_MESSAGE) spawnError(`images holds at most ${MAX_ATTACHMENTS_PER_MESSAGE} entries (got ${images.length})`);
+  for (const n of images) {
+    if (!isPasteFileName(n)) spawnError(`images entries must be staged image names (got ${JSON.stringify(n)})`);
+    if (!imageAvailable(extId, n)) spawnError(`image ${n} is not staged or kept (staged images are pruned after a week)`);
+  }
+  return images.slice();
+}
+
+const sessionsEnv = ({ core, hostApiFor, launchContext = collectLaunchContext }) => ({
+  sessions: {
+    launchEnv: async ({ agent = 'claude', sessionId = null, ext = null } = {}) => {
+      const fail = (message) => { throw new TypeError(`sessions.launchEnv: ${message}`); };
+      if (typeof agent !== 'string' || agentError(agent)) fail(`agent must name a registered provider. ${agentError(agent) || ''}`);
+      if (sessionId !== null && typeof sessionId !== 'string') fail('sessionId must be a string or null');
+      if (ext !== null) checkExt(ext, fail);
+      const task = sessionId === null ? null : core.taskStore.taskFor(sessionId);
+      const runtime = sessionId === null ? 'local' : core.sessionManager.entryFor(sessionId)?.runtime || 'local';
+      const { env } = await launchContext({ sid: sessionId, task, agent, runtime, reason: 'headless', ext }, { hostApiFor });
+      return { env };
+    },
+  },
+});
+
+const sessionsSpawn = ({ id, core, deliverFirstPrompt: deliver = deliverFirstPrompt }) => ({
   sessions: {
     // `parentSession` may name a card this extension did not create. Deliberate,
     // resolved decision — board nesting is not ownership, and the board itself
@@ -111,12 +182,15 @@ const sessionsSpawn = ({ core }) => ({
     // outbound value (`ext:<id>` on wake, kill, mail and broadcast).
     spawn: async ({
       cwd, intent, agent, model, effort, autoCompactTokens, parentSession,
-      worktree, addDirs, taskId, autoMergeOnPass, autoFixPrChecks,
+      worktree, addDirs, taskId, autoMergeOnPass, autoFixPrChecks, images, offBoard, ext, remoteControl,
     } = {}) => {
       const worktreeOpts = spawnWorktree(worktree);
+      const remoteControlOpt = checkRemoteControl(remoteControl, agent);
       const addDirsOpt = checkAddDirs(addDirs);
+      const extOpt = checkExt(ext);
+      const imageNames = checkImages(id, images);
       if (taskId !== undefined && taskId !== null && (typeof taskId !== 'string' || !taskId)) spawnError('taskId must be a non-empty task id');
-      for (const [name, v] of [['autoMergeOnPass', autoMergeOnPass], ['autoFixPrChecks', autoFixPrChecks]]) {
+      for (const [name, v] of [['autoMergeOnPass', autoMergeOnPass], ['autoFixPrChecks', autoFixPrChecks], ['offBoard', offBoard]]) {
         if (v !== undefined && typeof v !== 'boolean') spawnError(`${name} must be a boolean`);
       }
       const result = await core.sessionManager.dispatch({
@@ -129,6 +203,8 @@ const sessionsSpawn = ({ core }) => ({
         parentSession,
         ...worktreeOpts,
         ...addDirsOpt,
+        ...extOpt,
+        ...remoteControlOpt,
         // Dispatch's own default is off, so `false` is simply no override.
         ...(autoMergeOnPass === undefined ? {} : { autoMergeOnPass }),
         // `taskId` is the WHOLE task binding, and it has to be one option
@@ -139,8 +215,23 @@ const sessionsSpawn = ({ core }) => ({
         // sees it, so an assign after the fact would leave a Codex session
         // writing into its own scratch memory.
         ...(taskId ? { taskId } : {}),
+        // Images need the booted composer, so the intent is held back from the
+        // launch command and pasted after them (dispatch-runner.js).
+        ...(imageNames.length ? { deferIntent: true } : {}),
+        // A card the extension shows in its own view instead of the board's
+        // grid. The stamp is the caller's id, FORCED like wake's reason, so an
+        // extension can only ever claim a card for itself. Everything else
+        // (resume, archive, billing, mail) treats it as any other card.
+        ...(offBoard ? { offBoard: id } : {}),
         launchReason: 'spawn',
       });
+      if (imageNames.length) {
+        const agentId = agent || 'claude';
+        const imagePaths = claimExtImages(id, result.sessionId, agentId, imageNames);
+        // Not awaited, as in runDispatch: the TUI can take seconds to boot, and
+        // deliverFirstPrompt never throws.
+        deliver({ tmux: result.tmux, socket: core.sessionManager.entryFor(result.sessionId)?.socket ?? '', agent: agentId, text: intent || '', imagePaths });
+      }
       // The other half of that binding, exactly as the spawn_* tools and the
       // board's own dispatch do it — a no-op if the task was archived meanwhile,
       // so the session falls back to Ad-hoc rather than failing the launch. It
@@ -195,6 +286,31 @@ const sessionsBill = ({ core }) => ({
   },
 });
 
+// An extension's own copies of staged images. Staging is single-use (the first
+// session to claim a file takes it), so work that spawns several sessions with
+// the same pictures keeps them here and passes the names to spawn({ images }),
+// which copies a kept name rather than moving it. Per-extension by construction:
+// `id` is closed over, so a name only resolves in the caller's own store.
+const imagesKeep = ({ id }) => ({
+  images: {
+    keep: (name) => keepStagedPaste(id, name),
+    read: (name) => readKeptPaste(id, name),
+    remove: (name) => removeKeptPaste(id, name),
+  },
+});
+
+// The paths an extension offers the viewer (client `api.openFile`). Nothing is
+// readable until registered here, and `id` is closed over, so a path registered
+// by one extension never opens for another. allow() takes a path or an array and
+// returns how many it accepted (absolute, normalised, a type the viewer shows);
+// no disk is touched until the human opens one.
+const filesView = ({ id, extFiles }) => ({
+  files: {
+    allow: (paths) => (Array.isArray(paths) ? paths : [paths]).filter((p) => extFiles.allow(id, p)).length,
+    forget: (paths) => (Array.isArray(paths) ? paths : [paths]).filter((p) => extFiles.forget(id, p)).length,
+  },
+});
+
 const tasksRead = ({ core }) => ({
   tasks: {
     // The reserved id of the Unassigned (ad hoc) tile, which participates in
@@ -220,6 +336,16 @@ const tasksWrite = ({ core }) => ({
     rename: (taskId, name) => core.taskStore.renameTask(taskId, name),
     assign: (sid, taskId) => core.taskStore.assign(sid, taskId),
     unassign: (sid) => core.taskStore.unassign(sid),
+  },
+});
+
+// Archive the task and every live session assigned to it, exactly as the tile's
+// Archive does. Its own capability rather than part of `tasks:write`: an
+// existing consent to rename and assign must not silently grow into one that
+// kills panes.
+const tasksArchive = ({ archiveTask }) => ({
+  tasks: {
+    archive: (taskId) => archiveTask(taskId),
   },
 });
 
@@ -282,8 +408,29 @@ const boardBroadcast = ({ id, broadcast }) => ({
   broadcast: (payload) => broadcast({ ...(payload && typeof payload === 'object' ? payload : {}), type: `ext:${id}` }),
 });
 
-const terminalsCreate = ({ createTerminal }) => ({
-  terminals: { create: (opts) => createTerminal(opts) },
+const terminalError = (msg) => { throw new TypeError(`terminals.create: ${msg}`); };
+const PRESENTATIONS = ['sidebar', 'dialog'];
+
+// `key` FORCED into this extension's namespace, so one extension can never
+// re-present (and type into) a shell another one opened; `alive` answers only
+// for this extension's own terminals. The requesting tab is read here from the
+// handler's async context, never taken from the caller. A dialog needs a key:
+// closing it leaves the shell running, and the key is the only way back to it.
+const terminalsCreate = ({ id, extTerminals }) => ({
+  terminals: {
+    create: async (opts = {}) => {
+      const { presentation, title, key } = opts ?? {};
+      if (presentation !== undefined && !PRESENTATIONS.includes(presentation)) terminalError(`presentation must be one of ${PRESENTATIONS.join(', ')}`);
+      if (title !== undefined && (typeof title !== 'string' || title.length > 120)) terminalError('title must be a string of at most 120 characters');
+      if (key !== undefined && (typeof key !== 'string' || !key || key.length > 200)) terminalError('key must be a non-empty string of at most 200 characters');
+      if (presentation === 'dialog' && key === undefined) terminalError('a dialog needs a key, so a closed one can be presented again');
+      return extTerminals.create(
+        { ...opts, ...(key === undefined ? {} : { key: `${id}:${key}` }) },
+        { origin: requestOrigin(), owner: id },
+      );
+    },
+    alive: async (terminalId) => typeof terminalId === 'string' && extTerminals.alive(terminalId, id),
+  },
 });
 
 const schedulesRead = ({ scheduleStore }) => ({
@@ -396,9 +543,11 @@ export const V1_BUILDERS = {
   'sessions:wake': sessionsWake,
   'sessions:archive': sessionsArchive,
   'sessions:spawn': sessionsSpawn,
+  'sessions:env': sessionsEnv,
   'sessions:kill': sessionsKill,
   'tasks:read': tasksRead,
   'tasks:write': tasksWrite,
+  'tasks:archive': tasksArchive,
   'memory:read': memoryRead,
   'memory:append': memoryAppend,
   events: eventsCap,
@@ -414,4 +563,6 @@ export const V1_BUILDERS = {
   'sessions:bill': sessionsBill,
   'sessions:interrupt': sessionsInterrupt,
   'links:write': linksWrite,
+  'images:keep': imagesKeep,
+  'files:view': filesView,
 };

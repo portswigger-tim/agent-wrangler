@@ -59,6 +59,25 @@ test('list_tasks collapses wrangler `-worktree-` cwds back to the base repo', as
   assert.equal(t1.sessionCount, 3);
 });
 
+test('list_tasks discovers worktrees from both the noindex and legacy sibling layouts', async () => {
+  const nx = '/Users/x/vcs/worktrees.noindex/agent-wrangler-fix-xyz';
+  const out = await listTasksTool.handler({
+    deps: deps({
+      tasks: [{ id: 'T1', name: 'Agent Wrangler' }],
+      sessions: [
+        { sessionId: 'C1', cwd: nx, worktree: { path: nx, branch: 'renamed', repoRoot: '/Users/x/vcs/agent-wrangler' } },
+        { sessionId: 'C2', cwd: '/Users/x/vcs/worktrees.noindex/agent-wrangler-b', worktree: { branch: 'b' } },
+        { sessionId: 'C3', cwd: '/Users/x/vcs/agent-wrangler-worktree-old' },
+      ],
+      assignments: { C1: 'T1', C2: 'T1', C3: 'T1' },
+    }),
+    caller: null,
+  });
+  const t1 = out.structuredContent.tasks.find((t) => t.id === 'T1');
+  assert.equal(t1.bestFolder, '/Users/x/vcs/agent-wrangler');
+  assert.equal(t1.sessionCount, 3);
+});
+
 test('list_tasks collapses `.claude/worktrees/` cwds back to the base repo', async () => {
   const out = await listTasksTool.handler({
     deps: deps({
@@ -187,4 +206,11 @@ test('list_tasks ignores unassigned (adhoc) sessions — they belong to no task'
   const t1 = out.structuredContent.tasks.find((t) => t.id === 'T1');
   assert.equal(t1.sessionCount, 1);
   assert.equal(t1.bestFolder, '/Users/x/vcs/agent-wrangler');
+});
+
+test('list_tasks archived: true lists only archived tasks with their cascaded session counts', async () => {
+  const d = deps({ tasks: [{ id: 'T1', name: 'Live' }, { id: 'T2', name: 'Gone', archivedAt: 9 }] });
+  d.sessionManager = { archivedEntries: () => [{ sessionId: 'A', viaTaskArchive: 'T2' }, { sessionId: 'B', viaTaskArchive: 'T2' }, { sessionId: 'C' }] };
+  const out = await listTasksTool.handler({ deps: d }, { archived: true });
+  assert.deepEqual(out.structuredContent.tasks, [{ id: 'T2', name: 'Gone', archivedAt: 9, archivedSessionCount: 2 }]);
 });

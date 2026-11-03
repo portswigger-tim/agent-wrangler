@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
-import { createRenderer } from './markdown-preview.js';
+import { createRenderer, sessionHashHref } from './markdown-preview.js';
 
 // Load the vendored markdown-it UMD the same way the browser's classic <script>
 // does — by executing it for its side effect of assigning module.exports. We
@@ -47,10 +47,40 @@ test('escapes raw HTML — neither lower- nor upper-case <script> survives (html
 test('drops a javascript: link target — no live href', () => {
   assert.doesNotMatch(render('[x](javascript:alert(1))'), /href="javascript:/i);
 });
+test('a remote image is shown as a link to it, never fetched on render', () => {
+  const html = render('![chart](https://example.com/c.png?d=secret)');
+  assert.ok(!html.includes('<img'));
+  assert.match(html, /<a href="https:\/\/example\.com\/c\.png\?d=secret" target="_blank" rel="noopener noreferrer">chart<\/a>/);
+});
+test('an image with no alt text links by its URL, and a relative one is a link too', () => {
+  assert.match(render('![](https://example.com/c.png)'), />https:\/\/example\.com\/c\.png<\/a>/);
+  assert.ok(!render('![x](docs/c.png)').includes('<img'));
+});
+test('an image inside a link is reduced to its label, not a nested link', () => {
+  const html = render('[![badge](https://example.com/b.svg)](https://example.com/ci)');
+  assert.ok(!html.includes('<img'));
+  assert.equal((html.match(/<a /g) || []).length, 1);
+  assert.match(html, /<a href="https:\/\/example\.com\/ci"[^>]*>badge<\/a>/);
+});
+test('an image\'s alt text and URL are escaped', () => {
+  const html = render('![<b>x</b>](https://example.com/a.png?q="x")');
+  assert.ok(!html.includes('<b>'));
+  assert.ok(!html.includes('<img'));
+  assert.match(html, /href="https:\/\/example\.com\/a\.png\?q=%22x%22"/);
+});
+test('an inline data: raster image is kept, since it loads nothing', () => {
+  assert.match(render('![dot](data:image/png;base64,iVBORw0KGgo=)'), /<img src="data:image\/png;base64,iVBORw0KGgo=" alt="dot">/);
+});
 
 // ── link handling ──────────────────────────────────────────────────────────────
 test('external http(s) link opens in a new tab with rel guard', () => {
   const html = render('[site](https://example.com)');
+  assert.match(html, /target="_blank"/);
+  assert.match(html, /rel="noopener noreferrer"/);
+});
+test('a protocol-relative link is external: new tab with rel guard', () => {
+  const html = render('[site](//example.com/page)');
+  assert.match(html, /href="\/\/example\.com\/page"/);
   assert.match(html, /target="_blank"/);
   assert.match(html, /rel="noopener noreferrer"/);
 });
@@ -134,4 +164,37 @@ test('text around a preview control is still escaped', () => {
 test('renders empty string for null/undefined source', () => {
   assert.equal(render(null), '');
   assert.equal(render(undefined), '');
+});
+
+// ── session deep links ────────────────────────────────────────────────────────
+test('a #session= link stays a same-tab fragment link', () => {
+  const html = createRenderer(markdownit, { boardOrigin: 'http://localhost:7777' })('[x](#session=abc-123)');
+  assert.match(html, /<a href="#session=abc-123">x<\/a>/);
+  assert.doesNotMatch(html, /target=/);
+});
+test('an absolute same-origin session URL is rewritten to the fragment, no new tab', () => {
+  const html = createRenderer(markdownit, { boardOrigin: 'http://localhost:7777' })('[x](http://localhost:7777/#session=abc)');
+  assert.match(html, /<a href="#session=abc">x<\/a>/);
+  assert.doesNotMatch(html, /target=/);
+});
+test('a session URL on another origin stays an external new-tab link', () => {
+  const html = createRenderer(markdownit, { boardOrigin: 'http://localhost:7777' })('[x](http://evil.test/#session=abc)');
+  assert.match(html, /target="_blank"/);
+  assert.match(html, /href="http:\/\/evil.test\/#session=abc"/);
+});
+test('a 127.0.0.1 session URL counts as the localhost board, but not on another port', () => {
+  assert.equal(sessionHashHref('http://127.0.0.1:7777/#session=a', 'http://localhost:7777'), '#session=a');
+  assert.equal(sessionHashHref('http://127.0.0.1:8888/#session=a', 'http://localhost:7777'), null);
+});
+test('sessionHashHref rejects non-session fragments and bad input', () => {
+  assert.equal(sessionHashHref('#session='), null);
+  assert.equal(sessionHashHref('#view=search', 'http://a'), null);
+  assert.equal(sessionHashHref('http://a/#view=search', 'http://a'), null);
+  assert.equal(sessionHashHref('not a url', 'http://a'), null);
+  assert.equal(sessionHashHref('http://a/#session=x'), null);
+});
+test('an IPv6 loopback session URL is rewritten after markdown-it encodes its brackets', () => {
+  const html = createRenderer(markdownit, { boardOrigin: 'http://localhost:7777' })('[x](http://[::1]:7777/#session=abc)');
+  assert.match(html, /<a href="#session=abc">x<\/a>/);
+  assert.doesNotMatch(html, /target=/);
 });

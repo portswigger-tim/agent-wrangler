@@ -60,3 +60,109 @@ export function resolvePasteNames(sessionId, agent, names) {
   }
   return out;
 }
+
+// Images pasted into the dispatch dialog's intent box. There is no session yet,
+// so no pastes dir to write into: they wait here, under a name the server minted,
+// until the dispatch that carries those names claims them into the new session's
+// own dir (claimStagedPastes). The leading underscore keeps it apart from the
+// per-session fallback folders beside it, whose names are UUIDs. Abandoned ones
+// are pruned by age like any other paste.
+export const STAGED_PASTES_DIR = path.join(PASTES_DIR, '_dispatch-staging');
+
+// Moves each named staged image into `sessionId`'s pastes dir and returns the
+// agent-facing paths, in order. The same gate as resolvePasteNames: a name must
+// have exactly the minted shape and exist in the staging dir, or it is dropped —
+// so a dispatch frame can only ever claim a file this server staged.
+export function claimStagedPastes(sessionId, agent, names) {
+  if (!Array.isArray(names) || !names.length) return [];
+  const { realDir, agentDir } = pasteDirs(sessionId, agent);
+  const out = [];
+  for (const name of names.slice(0, MAX_ATTACHMENTS_PER_MESSAGE)) {
+    if (!isPasteFileName(name)) continue;
+    const from = path.join(STAGED_PASTES_DIR, name);
+    try {
+      if (!fs.statSync(from).isFile()) continue;
+      fs.mkdirSync(realDir, { recursive: true });
+      try { fs.renameSync(from, path.join(realDir, name)); }
+      catch (err) {
+        // The task-memory grant can sit on another volume than the data dir.
+        if (err?.code !== 'EXDEV') throw err;
+        fs.copyFileSync(from, path.join(realDir, name));
+        fs.rmSync(from, { force: true });
+      }
+    } catch { continue; }
+    out.push(path.join(agentDir, name));
+  }
+  return out;
+}
+
+// Images an extension keeps for itself (host.images, capability `images:keep`).
+// A staged image is single-use by design — the first session to claim it takes
+// the file — so a job that has to hand the same screenshots to several sessions
+// keeps its own copy here first. One folder per extension id, so a name only
+// ever resolves against the caller's own files, and nothing prunes it: the
+// extension owns the lifecycle and drops what it no longer needs.
+const KEPT_DIR = path.join(DATA_DIR, 'ext-images');
+const MIME_BY_EXT = { png: 'image/png', jpg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
+
+function keptDir(extId) {
+  if (typeof extId !== 'string' || !SAFE_SEGMENT.test(extId) || extId === '.' || extId === '..') throw new Error('invalid extension id');
+  return path.join(KEPT_DIR, extId);
+}
+
+const isFile = (p) => { try { return fs.statSync(p).isFile(); } catch { return false; } };
+
+// Copies a staged image into the extension's own store. Same gate as a claim: the
+// name must have the minted shape and exist in the staging dir. The staged file
+// is left for its normal prune, so a failed spawn can still be retried from it.
+export function keepStagedPaste(extId, name) {
+  if (!isPasteFileName(name)) return false;
+  const dir = keptDir(extId);
+  const from = path.join(STAGED_PASTES_DIR, name);
+  if (!isFile(from)) return false;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.copyFileSync(from, path.join(dir, name));
+  return true;
+}
+
+export function hasKeptPaste(extId, name) {
+  return isPasteFileName(name) && isFile(path.join(keptDir(extId), name));
+}
+
+// The kept image's bytes, for an extension to show back to the human.
+export function readKeptPaste(extId, name) {
+  if (!hasKeptPaste(extId, name)) return null;
+  const bytes = fs.readFileSync(path.join(keptDir(extId), name));
+  return { mime: MIME_BY_EXT[path.extname(name).slice(1)], bytes };
+}
+
+export function removeKeptPaste(extId, name) {
+  if (!isPasteFileName(name)) return false;
+  const p = path.join(keptDir(extId), name);
+  if (!isFile(p)) return false;
+  fs.rmSync(p, { force: true });
+  return true;
+}
+
+// Does `name` resolve for this extension: kept first, then staged.
+export function imageAvailable(extId, name) {
+  return hasKeptPaste(extId, name) || (isPasteFileName(name) && isFile(path.join(STAGED_PASTES_DIR, name)));
+}
+
+// Puts each named image into `sessionId`'s pastes dir and returns the
+// agent-facing paths, in order. A kept name is COPIED (the extension keeps its
+// file for the next session); anything else is a staged claim, which moves.
+export function claimExtImages(extId, sessionId, agent, names) {
+  if (!Array.isArray(names) || !names.length) return [];
+  const { realDir, agentDir } = pasteDirs(sessionId, agent);
+  const out = [];
+  for (const name of names.slice(0, MAX_ATTACHMENTS_PER_MESSAGE)) {
+    if (!hasKeptPaste(extId, name)) { out.push(...claimStagedPastes(sessionId, agent, [name])); continue; }
+    try {
+      fs.mkdirSync(realDir, { recursive: true });
+      fs.copyFileSync(path.join(keptDir(extId), name), path.join(realDir, name));
+    } catch { continue; }
+    out.push(path.join(agentDir, name));
+  }
+  return out;
+}

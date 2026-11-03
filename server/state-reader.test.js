@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { liveState, sessionLabel, withForkMark, buildGraph, apiErrorPromotion, resolveRuntimeForGraph } from './state-reader.js';
+import { liveState, sessionLabel, withForkMark, buildGraph, apiErrorPromotion, apiErrorReason, applyRuntimeCost, resolveRuntimeForGraph } from './state-reader.js';
+import { SessionManager } from './session-manager.js';
+import { workerStatusWord } from '../public/cards.js';
+import { SESSIONS_DIR as HOOK_SESSIONS_DIR } from './claude-paths.js';
 
 // A sessions/ dir like ~/.claude/sessions: <pid>.json written by the status hook.
 function makeSessionsDir() {
@@ -167,6 +170,19 @@ test('sessionLabel ignores a truncated auto agent-name (long basename cut mid-wo
   );
 });
 
+test('sessionLabel ignores an auto agent-name slugged from a basename with punctuation, case or spaces', () => {
+  for (const [cwd, liveTitle] of [
+    ['/Users/charlie.goldstraw', 'charlie-goldstraw-5c'],
+    ['/x/My_Repo', 'my-repo-0a'],
+    ['/x/foo..bar+baz', 'foo-bar-baz-1f'],
+    ['/x/.dotfiles', 'dotfiles-e2'],
+    ['/x/a b c d e', 'a-b-c-d-77'],
+    ['/x/___', 'claude-9b'],
+  ]) {
+    assert.equal(sessionLabel({ names: [], liveTitle, intent: 'Fix the bug', cwd }), 'Fix the bug', cwd);
+  }
+});
+
 test('sessionLabel ignores a poisoned cached lastLabel (auto agent-name) in the names array', () => {
   // Dormant sessions feed [entry.name, entry.lastLabel] as names; lastLabel can
   // have been snapshotted from a moment the live title was Claude's auto name.
@@ -288,6 +304,28 @@ test('buildGraph derives a short model pill from the transcript model', async ()
   const node = graph.sessions.find((s) => s.sessionId === 'model-sid');
   assert.equal(node.currentModel, 'claude-sonnet-4');
   assert.deepEqual(node.modelPill, { label: 'sonnet', title: 'claude-sonnet-4' });
+});
+
+test('buildGraph carries the launch effort onto board session nodes, null when absent', async () => {
+  const mgr = makeDormantManager([
+    { sessionId: 'eff-sid', agent: 'claude', cwd: '/nonexistent/c', intent: 'x', model: 'opus', effort: 'xhigh' },
+    { sessionId: 'noeff-sid', agent: 'claude', cwd: '/nonexistent/c', intent: 'y', model: 'opus' },
+  ]);
+  const graph = await buildGraph(mgr, async () => ({}));
+  const byId = Object.fromEntries(graph.sessions.map((s) => [s.sessionId, s]));
+  assert.equal(byId['eff-sid'].effort, 'xhigh');
+  assert.equal(byId['noeff-sid'].effort, null);
+});
+
+test('buildGraph carries the hosting extension of an off-board card onto its node, null for a board card', async () => {
+  const mgr = makeDormantManager([
+    { sessionId: 'hosted-sid', agent: 'claude', cwd: '/nonexistent/c', intent: 'x', offBoard: 'jobs' },
+    { sessionId: 'board-sid', agent: 'claude', cwd: '/nonexistent/c', intent: 'y' },
+  ]);
+  const graph = await buildGraph(mgr, async () => ({}));
+  const byId = Object.fromEntries(graph.sessions.map((s) => [s.sessionId, s]));
+  assert.equal(byId['hosted-sid'].offBoard, 'jobs', 'still in the graph, so the extension can show it');
+  assert.equal(byId['board-sid'].offBoard, null);
 });
 
 test('buildGraph falls back to the launch model when no transcript model is available', async () => {
@@ -428,22 +466,28 @@ function makeArchiveManager(entries) {
   };
 }
 
-test('buildGraph history record carries exactly the six fields the client reads', async () => {
+test('buildGraph history record carries exactly the seven fields the client reads', async () => {
   const mgr = makeArchiveManager([
     { sessionId: 'arch-sid', agent: 'claude', name: 'Named', intent: 'a very long dispatch intent',
-      cwd: '/x', archivedAt: 9, createdAt: 1, model: 'opus', task: { id: 'T1', name: 'Task' },
+      cwd: '/x', archivedAt: 9, createdAt: 1, model: 'opus', effort: 'high', task: { id: 'T1', name: 'Task' },
       worktree: { path: '/x-worktree-f', branch: 'f' }, parentSession: 'p',
       workflow: { issue: 'ENT-1', phase: { label: 'opened PR' } } },
   ]);
   const graph = await buildGraph(mgr, async () => ({}));
   assert.deepEqual(
     Object.keys(graph.history[0]).sort(),
-    ['archivedAt', 'cwd', 'label', 'model', 'sessionId', 'viaTaskArchive'],
+    ['archivedAt', 'cwd', 'effort', 'label', 'model', 'sessionId', 'viaTaskArchive'],
     'a field added here is paid for over the whole archive on every send — it needs a consumer in app.js',
   );
   assert.deepEqual(graph.history[0], {
-    sessionId: 'arch-sid', label: 'Named', cwd: '/x', archivedAt: 9, model: 'opus', viaTaskArchive: null,
+    sessionId: 'arch-sid', label: 'Named', cwd: '/x', archivedAt: 9, model: 'opus', effort: 'high', viaTaskArchive: null,
   });
+});
+
+test('buildGraph history record carries effort as null when the entry has none', async () => {
+  const mgr = makeArchiveManager([{ sessionId: 'no-eff', agent: 'claude', cwd: '/x', archivedAt: 1 }]);
+  const graph = await buildGraph(mgr, async () => ({}));
+  assert.equal(graph.history[0].effort, null);
 });
 
 test('buildGraph history record carries viaTaskArchive, null when absent', async () => {
@@ -509,12 +553,72 @@ test('buildGraph prefers the runtime analyze hook for a devcontainer entry; loca
 // running session off readSessions()/~/.claude/sessions — no injection seam —
 // so the promotion logic is pulled out into its own exported function purely
 // to stay testable.
-test('apiErrorPromotion: promotes an idle/unknown status to needs-you with a structured waitingReason', () => {
-  assert.deepEqual(apiErrorPromotion('idle', true), {
+test('apiErrorPromotion: promotes an idle/unknown status to needs-you, carrying the error text as waitingFor', () => {
+  const text = 'API Error: Your computer went to sleep mid-response. The response above may be incomplete.';
+  assert.deepEqual(apiErrorPromotion('idle', true, text), {
     status: 'needs-you',
-    waitingFor: 'API error — connection closed mid-response',
+    waitingFor: text,
     waitingReason: 'api-error',
   });
+});
+
+test('apiErrorPromotion: a login error is promoted as api-error-blocking', () => {
+  assert.deepEqual(apiErrorPromotion('idle', true, 'Login expired · Please run /login'), {
+    status: 'needs-you',
+    waitingFor: 'Login expired · Please run /login',
+    waitingReason: 'api-error-blocking',
+  });
+});
+
+test('apiErrorPromotion: an error with no text is blocking, under a generic waitingFor', () => {
+  assert.deepEqual(apiErrorPromotion('unknown', true), {
+    status: 'needs-you',
+    waitingFor: 'API error',
+    waitingReason: 'api-error-blocking',
+  });
+});
+
+// Claude Code's own wording for each error, copied from its bundle and from real
+// transcripts. Transient ones are worth retrying once the machine is awake and
+// online again; everything else needs a person (or a different prompt).
+const TRANSIENT_API_ERROR_TEXTS = [
+  'API Error: The response stopped arriving. The response above may be incomplete.',
+  'API Error: Server error mid-response. The response above may be incomplete.',
+  'API Error: Part of the response never arrived. The response above may be incomplete.',
+  'API Error: The response stream was malformed. The response above may be incomplete.',
+  'API Error: Your computer went to sleep mid-response. The response above may be incomplete.',
+  'API Error: Connection lost mid-response. The response above may be incomplete.',
+  'API Error: Connection closed mid-response. The response above may be incomplete.',
+  'API Error: The response stalled before a response was produced. Try again.',
+  'API Error: Part of the response never arrived and no response was produced. Try again.',
+  'API Error: The response stream was malformed and no response was produced. Try again.',
+  'API Error: Your computer went to sleep before a response was produced. Try again.',
+  'API Error: Connection lost before a response was produced. Try again.',
+  "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)",
+  'API Error: Request timed out.',
+  'API Error: Repeated 529 Overloaded errors',
+  'API Error: Connection error.',
+];
+
+const BLOCKING_API_ERROR_TEXTS = [
+  'Login expired · Please run /login',
+  'API Error: 401 Invalid API key · Please run /login',
+  'Credit balance is too low',
+  "You've hit your usage limit · resets 3pm",
+  'Prompt is too long',
+  'API Error: 400 orphaned tool_result in conversation history.',
+  'API Error: 400 duplicate tool_use ID in conversation history.',
+  'API Error: 400 due to tool use concurrency issues. Run /rewind to recover the conversation.',
+  'API Error: Something nobody has seen before',
+];
+
+test('apiErrorReason: each transient message is api-error', () => {
+  for (const text of TRANSIENT_API_ERROR_TEXTS) assert.equal(apiErrorReason(text), 'api-error', text);
+});
+
+test('apiErrorReason: login, auth, credit, usage-limit, prompt-too-long, 400 and unknown errors are api-error-blocking', () => {
+  for (const text of BLOCKING_API_ERROR_TEXTS) assert.equal(apiErrorReason(text), 'api-error-blocking', text);
+  assert.equal(apiErrorReason(null), 'api-error-blocking');
 });
 
 test('apiErrorPromotion: no-op when there is no apiError', () => {
@@ -572,6 +676,117 @@ function makeDiscoveredManager(entry, tmuxName) {
   };
 }
 
+test('buildGraph carries transcript availability from a discovered session enrichment', async () => {
+  const entry = { sessionId: 'codex-sid', agent: 'codex', liveSessionId: 'L1' };
+  const mgr = makeDiscoveredManager(entry, 'cx_s1');
+  const discover = async () => [{ tmuxName: 'cx_s1', claudePid: 4242, agent: 'codex', command: 'codex' }];
+  const runtimeResolver = () => ({ analyze: async () => ({ hasTranscript: true, lastActivity: null }) });
+
+  const graph = await buildGraph(mgr, async () => ({}), { discover, runtimeResolver, capture: async () => '' });
+
+  assert.equal(graph.sessions.find((s) => s.sessionId === entry.sessionId).hasTranscript, true);
+});
+
+test('buildGraph: live Codex self-update status reaches the board with its restart reason', async () => {
+  const entry = { sessionId: 'codex-update', agent: 'codex', liveSessionId: 'L1' };
+  const mgr = makeDiscoveredManager(entry, 'cx_update');
+  const discover = async () => [{ tmuxName: 'cx_update', claudePid: 4242, agent: 'codex', command: 'codex' }];
+  const runtimeResolver = () => ({ analyze: async () => ({}) });
+  for (const [pane, expected] of [
+    ['Updating Codex via `brew upgrade --cask codex`...\n==> Upgrading codex', 'working'],
+    ['🎉 Update ran successfully! Please restart Codex.', 'needs-you'],
+  ]) {
+    const graph = await buildGraph(mgr, async () => ({}), { discover, runtimeResolver, capture: async () => pane });
+    const node = graph.sessions.find((s) => s.sessionId === entry.sessionId);
+    assert.equal(node.status, expected);
+    assert.equal(node.managed, true);
+    if (expected === 'needs-you') assert.match(node.waitingFor, /restart Codex/i);
+  }
+});
+
+test('buildGraph: confirmed Codex update exit wins over discovery and preserves Resume, output and mail', async () => {
+  const mgr = new SessionManager();
+  const sid = 'codex-update-exit';
+  const entry = { tmux: 'cx_update_exit', agent: 'codex', liveSessionId: 'L1', socket: 'update-test', relaunchedAt: 1791451076706 };
+  mgr.map.set(sid, entry);
+  mgr.scanSockets = () => ['update-test'];
+  mgr._tmux = async () => ({ stdout: 'cx_update_exit\x1f1\x1f0\x1f1791451142\n' });
+  await mgr.refreshAlive();
+  assert.deepEqual(await mgr.reconcileExitedSessions(), []);
+  const exitOutput = '🎉 Update ran successfully! Please restart Codex.\nPane is dead (status 0, Thu Oct 8 10:19:02 2026)';
+  const discover = async () => [{ tmuxName: entry.tmux, socket: entry.socket, claudePid: 4242, agent: 'codex', command: 'codex' }];
+  const runtimeResolver = () => ({ readLive: async () => ({ liveSid: 'L1', status: 'working' }), analyze: async () => ({}) });
+  const mail = { unread: 6, undeliverable: 0 };
+  const graph = await buildGraph(mgr, async () => ({}), {
+    discover, runtimeResolver,
+    capture: async (name, lines, socket) => {
+      assert.equal(name, entry.tmux);
+      assert.equal(socket, entry.socket);
+      return exitOutput;
+    },
+    mailStore: { unreadInfo: (id) => { assert.equal(id, sid); return mail; } },
+  });
+  assert.equal(graph.sessions.length, 1);
+  const node = graph.sessions[0];
+  assert.equal(node.managed, false);
+  assert.equal(node.dormant, true);
+  assert.equal(node.tmux, null);
+  assert.equal(node.exitOutput, exitOutput);
+  assert.deepEqual(node.mail, mail);
+  assert.equal(workerStatusWord(node, { justFinished: new Set() }), 'resume');
+});
+
+function mockHookSession(t, session) {
+  const hookPath = path.join(HOOK_SESSIONS_DIR, 'frozen-update-test.json');
+  const readdir = fs.readdirSync;
+  const readFile = fs.readFileSync;
+  t.mock.method(fs, 'readdirSync', (dir, ...args) => dir === HOOK_SESSIONS_DIR
+    ? ['frozen-update-test.json'] : readdir(dir, ...args));
+  t.mock.method(fs, 'readFileSync', (file, ...args) => file === hookPath
+    ? JSON.stringify(session) : readFile(file, ...args));
+}
+
+test('buildGraph: a frozen busy session file cannot override a confirmed dead pane', async (t) => {
+  const entry = { sessionId: 'frozen-update', agent: 'codex', tmux: 'cx_frozen' };
+  const mgr = makeDormantManager([entry]);
+  mgr.deadTmuxNameFor = (id) => id === entry.sessionId ? entry.tmux : null;
+  mockHookSession(t, { sessionId: entry.sessionId, pid: process.pid, status: 'busy' });
+  const exitOutput = '🎉 Update ran successfully! Please restart Codex.';
+  const graph = await buildGraph(mgr, async () => ({}), {
+    discover: async () => [], runtimeResolver: () => ({ analyze: async () => ({}) }),
+    capture: async () => exitOutput,
+  });
+  assert.equal(graph.sessions.length, 1);
+  const node = graph.sessions[0];
+  assert.equal(node.managed, false);
+  assert.equal(node.dormant, true);
+  assert.equal(node.status, 'idle');
+  assert.equal(node.exitOutput, exitOutput);
+  assert.equal(workerStatusWord(node, { justFinished: new Set() }), 'resume');
+});
+
+for (const [label, discoveredTmux, live] of [
+  ['separately confirmed live pane', 'cc_running', true],
+  ['dead recorded pane still discovered', 'cc_dead', false],
+]) {
+  test(`buildGraph: ${label} takes its actual liveness from the snapshot`, async (t) => {
+    const entry = { sessionId: 'drifted-home', agent: 'claude', tmux: 'cc_dead' };
+    const mgr = makeDormantManager([entry]);
+    mgr.deadTmuxNameFor = (id) => id === entry.sessionId ? entry.tmux : null;
+    mgr.alive = new Set(live ? [discoveredTmux] : []);
+    mockHookSession(t, { sessionId: entry.sessionId, pid: process.pid, status: 'busy' });
+    const graph = await buildGraph(mgr, async () => ({}), {
+      discover: async () => [{ tmuxName: discoveredTmux, claudePid: process.pid, agent: 'claude' }],
+      capture: async () => '• Working (1s · esc to interrupt)',
+    });
+    assert.equal(graph.sessions.length, 1);
+    const node = graph.sessions[0];
+    assert.equal(node.managed, live);
+    assert.equal(node.tmux, live ? 'cc_running' : null);
+    assert.equal(node.status, live ? 'working' : 'idle');
+  });
+}
+
 test('buildGraph ignores a Codex pane title made from the truncated worktree name', async () => {
   const entry = { sessionId: 'cx1', agent: 'codex', cwd: '/nonexistent/agent-wrangler-worktree-codex-session-names', intent: 'Why are Codex session names sometimes the full initial prompt?', liveSessionId: 'L1' };
   const mgr = makeDiscoveredManager(entry, 'cx_1234');
@@ -617,12 +832,27 @@ test('buildGraph: an apiError from a discovered live session carries a structure
   const mgr = makeDiscoveredManager(entry, 'cc_errdisc');
   const discover = async () => [{ tmuxName: 'cc_errdisc', socket: '', claudePid: 9999, agent: 'claude', cwd: '/nonexistent/repo', command: 'claude', paneTitle: '' }];
   const capture = async () => 'nothing interesting here';
-  const runtimeResolver = () => ({ readLive: async () => null, analyze: async () => ({ apiError: true }) });
+  const text = 'API Error: Your computer went to sleep mid-response. The response above may be incomplete.';
+  const runtimeResolver = () => ({ readLive: async () => null, analyze: async () => ({ apiError: true, apiErrorText: text }) });
   const graph = await buildGraph(mgr, async () => ({}), { runtimeResolver, discover, capture });
   const node = graph.sessions.find((s) => s.sessionId === 'err-disc');
   assert.ok(node, 'discovered node present');
   assert.equal(node.status, 'needs-you');
+  assert.equal(node.waitingFor, text);
   assert.equal(node.waitingReason, 'api-error');
+});
+
+test('buildGraph: a login api-error from a discovered live session is api-error-blocking', async () => {
+  const entry = { sessionId: 'err-login', agent: 'claude', cwd: '/nonexistent/repo', liveSessionId: 'L1' };
+  const mgr = makeDiscoveredManager(entry, 'cc_errlogin');
+  const discover = async () => [{ tmuxName: 'cc_errlogin', socket: '', claudePid: 9999, agent: 'claude', cwd: '/nonexistent/repo', command: 'claude', paneTitle: '' }];
+  const capture = async () => 'nothing interesting here';
+  const runtimeResolver = () => ({ readLive: async () => null, analyze: async () => ({ apiError: true, apiErrorText: 'Login expired · Please run /login' }) });
+  const graph = await buildGraph(mgr, async () => ({}), { runtimeResolver, discover, capture });
+  const node = graph.sessions.find((s) => s.sessionId === 'err-login');
+  assert.equal(node.status, 'needs-you');
+  assert.equal(node.waitingFor, 'Login expired · Please run /login');
+  assert.equal(node.waitingReason, 'api-error-blocking');
 });
 
 // `/clear` starts a fresh conversation (new id, new transcript) inside the same pane,
@@ -732,6 +962,38 @@ test('buildGraph: a live-but-UNdiscovered buildLaunch-runtime tmux is synthesize
   assert.equal(node.tmux, 'cc_cl1');
 });
 
+// A `wrapLaunch` runtime whose pane runs a wrapper (`sbx exec … sh -lc '<agent>'`)
+// hides the agent from discovery too. `liveByTmux: true` opts it into the same
+// fallback; without the flag the same card stays dormant.
+const sandboxGraph = async (rt) => {
+  const entry = { sessionId: 'sb1', agent: 'claude', runtime: 'sbx', cwd: '/nonexistent/repo', liveSessionId: 'L9', tmux: 'cc_sb1' };
+  const mgr = {
+    activeEntries: () => [entry],
+    archivedEntries: () => [],
+    entryFor: (id) => (id === 'sb1' ? entry : undefined),
+    entryByTmux: (t) => (t === 'cc_sb1' ? entry : null),
+    tmuxNameFor: (id) => (id === 'sb1' ? 'cc_sb1' : null),
+    tmuxOwner: () => null, deadTmuxNameFor: () => null,
+    isArchived: () => false, scanSockets: () => [''], socketOf: () => '',
+  };
+  const runtimeResolver = (id) => (id === 'sbx' ? rt : {});
+  const graph = await buildGraph(mgr, async () => ({}), { runtimeResolver, discover: async () => [], capture: async () => '' });
+  return graph.sessions.find((s) => s.sessionId === 'sb1');
+};
+
+test('buildGraph: a live-but-UNdiscovered wrapLaunch runtime with liveByTmux reads live', async () => {
+  const node = await sandboxGraph({ id: 'sbx', wrapLaunch: async ({ inner }) => inner, liveByTmux: true });
+  assert.ok(node, 'node present');
+  assert.equal(node.managed, true);
+  assert.equal(node.tmux, 'cc_sb1');
+});
+
+test('buildGraph: the same wrapLaunch runtime WITHOUT liveByTmux reads dormant', async () => {
+  const node = await sandboxGraph({ id: 'sbx', wrapLaunch: async ({ inner }) => inner });
+  assert.ok(node, 'node present');
+  assert.equal(node.managed, false);
+});
+
 // Negative: the fallback is scoped to a devcontainer entry with a genuinely
 // alive tmux. A devcontainer entry whose `tmuxNameFor` returns null (no tmux, or
 // a dead one) must NOT be synthesized — it stays on the ordinary dormant path
@@ -782,7 +1044,7 @@ test('buildGraph: a live-but-UNdiscovered LOCAL tmux is NOT synthesized (runtime
 // above — this exercises it directly rather than trusting the three copies
 // stay in sync by inspection alone.
 test('buildGraph (synthesized/discovered branch): carries autoCompactTokens and infers modelContextWindow, same as the dormant branch', async () => {
-  const entry = { sessionId: 'ctxdisc', agent: 'claude', cwd: '/nonexistent/repo', liveSessionId: 'L1', model: 'sonnet[1m]', autoCompactTokens: 500000 };
+  const entry = { sessionId: 'ctxdisc', agent: 'claude', cwd: '/nonexistent/repo', liveSessionId: 'L1', model: 'sonnet[1m]', effort: 'low', autoCompactTokens: 500000 };
   const mgr = makeDiscoveredManager(entry, 'cc_ctxdisc');
   const discover = async () => [{ tmuxName: 'cc_ctxdisc', socket: '', claudePid: 8181, agent: 'claude', cwd: '/nonexistent/repo', command: 'claude --resume L1', paneTitle: '' }];
   const capture = async () => '';
@@ -792,6 +1054,7 @@ test('buildGraph (synthesized/discovered branch): carries autoCompactTokens and 
   const node = graph.sessions.find((s) => s.sessionId === 'ctxdisc');
   assert.ok(node, 'synthesized node present');
   assert.equal(node.autoCompactTokens, 500000);
+  assert.equal(node.effort, 'low');
   // Also doubles as an integration check for the launch-model-disambiguates-
   // the-transcript-prefix fix: sonnet and sonnet[1m] share "claude-sonnet-".
   assert.equal(node.modelContextWindow, 1_000_000);
@@ -859,4 +1122,114 @@ test('buildGraph bounds a dormant fork\'s enrichment at its createdAt, and leave
   await buildGraph(mgr, async (sid, opts) => { seen.set(sid, opts); return {}; });
   assert.deepEqual(seen.get('fork-live'), { since: 4242 }, 'a fork must not be billed for the parent history replayed into its transcript');
   assert.deepEqual(seen.get('plain-live'), { since: 0 });
+});
+
+// ── runtime `cost` hook: replaces only usd ──
+const TRANSCRIPT = () => ({ usd: 9.99, tokens: { input: 5, output: 6, cacheWrite: 0, cacheRead: 0 }, subAgents: [{ id: 'a' }] });
+
+test('applyRuntimeCost: a valid usd overrides; null, throw, NaN, negative and off-shape keep the transcript figure', async () => {
+  const run = (cost) => applyRuntimeCost({ cost }, { entry: {}, liveSid: 'L' }, TRANSCRIPT());
+  const ok = await run(async () => ({ usd: 1.23 }));
+  assert.equal(ok.usd, 1.23);
+  assert.deepEqual(ok.tokens, TRANSCRIPT().tokens);
+  assert.deepEqual(ok.subAgents, TRANSCRIPT().subAgents);
+  assert.equal((await run(async () => ({ usd: 0 }))).usd, 0);
+  for (const bad of [async () => null, async () => { throw new Error('x'); }, async () => ({ usd: NaN }), async () => ({ usd: -1 }), async () => ({ usd: '2' }), async () => ({ usd: Infinity })]) {
+    assert.equal((await run(bad)).usd, 9.99);
+  }
+  assert.deepEqual(await applyRuntimeCost({}, {}, TRANSCRIPT()), TRANSCRIPT(), 'no hook: unchanged');
+  assert.deepEqual(await applyRuntimeCost({ cost: async () => ({ usd: 2 }) }, {}, null), { usd: 2 }, 'no enrichment still gets a usd');
+});
+
+test('buildGraph: a runtime cost hook overrides usd on a dormant card and keeps transcript tokens', async () => {
+  const seen = [];
+  const runtimeResolver = (id) => (id === 'gw' ? { cost: async (args) => { seen.push(args); return { usd: 1.23 }; } } : {});
+  const mgr = makeDormantManager([{ sessionId: 'gw-sid', agent: 'claude', runtime: 'gw', cwd: '/nonexistent/c', intent: 'x', liveSessionId: 'L1' }]);
+  const graph = await buildGraph(mgr, async () => TRANSCRIPT(), { runtimeResolver });
+  const node = graph.sessions.find((s) => s.sessionId === 'gw-sid');
+  assert.equal(node.usd, 1.23);
+  assert.equal(seen[0].liveSid, 'L1');
+  assert.equal(seen[0].entry.sessionId, 'gw-sid');
+});
+
+test('buildGraph: a runtime cost hook overrides usd on a live card', async () => {
+  const entry = { sessionId: 'gw-live', agent: 'claude', runtime: 'gw', cwd: '/nonexistent/repo', liveSessionId: 'L1' };
+  const mgr = makeDiscoveredManager(entry, 'cc_gwlive');
+  const discover = async () => [{ tmuxName: 'cc_gwlive', socket: '', claudePid: 9998, agent: 'claude', cwd: '/nonexistent/repo', command: 'claude', paneTitle: '' }];
+  const runtimeResolver = () => ({ readLive: async () => null, analyze: async () => TRANSCRIPT(), cost: async () => ({ usd: 1.23 }) });
+  const graph = await buildGraph(mgr, async () => ({}), { runtimeResolver, discover, capture: async () => '' });
+  const node = graph.sessions.find((s) => s.sessionId === 'gw-live');
+  assert.equal(node.usd, 1.23);
+});
+
+test('buildGraph: a managed codex session takes its status from codexStatus', async (t) => {
+  const entry = { sessionId: 'cx-managed', agent: 'codex', liveSessionId: 'thr' };
+  const mgr = makeDormantManager([entry]);
+  mgr.tmuxNameFor = (id) => (id === entry.sessionId ? 'cx_thr' : null);
+  mockHookSession(t, { sessionId: entry.sessionId, pid: process.pid });
+  const calls = [];
+  const codexStatus = async ({ liveSid, paneText }) => { calls.push([liveSid, paneText]); return { status: 'working', waitingFor: 'a hint' }; };
+  const graph = await buildGraph(mgr, async () => ({}), {
+    discover: async () => [{ tmuxName: 'cx_thr', claudePid: process.pid, agent: 'codex' }],
+    runtimeResolver: () => ({ analyze: async () => ({}) }),
+    capture: async () => 'quiet prompt',
+    codexStatus,
+  });
+  const node = graph.sessions.find((s) => s.sessionId === entry.sessionId);
+  assert.equal(node.status, 'working');
+  assert.equal(node.waitingFor, 'a hint');
+  assert.deepEqual(calls, [['thr', 'quiet prompt']]);
+});
+
+test('buildGraph: a discovered codex session takes its status from codexStatus', async () => {
+  const entry = { sessionId: 'cx-disc', agent: 'codex', liveSessionId: 'thr2' };
+  const mgr = makeDiscoveredManager(entry, 'cx_disc');
+  const discover = async () => [{ tmuxName: 'cx_disc', socket: '', claudePid: 4242, agent: 'codex', command: 'codex' }];
+  const runtimeResolver = () => ({ readLive: async () => null, analyze: async () => ({}) });
+  const calls = [];
+  const codexStatus = async ({ liveSid, paneText }) => { calls.push([liveSid, paneText]); return { status: 'working', waitingFor: null }; };
+  const graph = await buildGraph(mgr, async () => ({}), { discover, runtimeResolver, capture: async () => 'quiet prompt', codexStatus });
+  assert.equal(graph.sessions.find((s) => s.sessionId === entry.sessionId).status, 'working');
+  assert.deepEqual(calls, [['thr2', 'quiet prompt']]);
+});
+
+test('buildGraph: an empty capture for a claude session on the scrape branch is unknown', async () => {
+  const entry = { sessionId: 'cc-empty', agent: 'claude', cwd: '/nonexistent/repo', liveSessionId: 'L1' };
+  const mgr = makeDiscoveredManager(entry, 'cc_empty');
+  const discover = async () => [{ tmuxName: 'cc_empty', socket: '', claudePid: 4243, agent: 'claude', cwd: '/nonexistent/repo', command: 'claude', paneTitle: '' }];
+  const runtimeResolver = () => ({ readLive: async () => null, analyze: async () => ({}) });
+  const graph = await buildGraph(mgr, async () => ({}), { discover, runtimeResolver, capture: async () => '' });
+  assert.equal(graph.sessions.find((s) => s.sessionId === entry.sessionId).status, 'unknown');
+});
+
+test('buildGraph captures by the pane target when the session manager provides one', async (t) => {
+  const entry = { sessionId: 'cx-pane', agent: 'codex', liveSessionId: 'thr' };
+  const mgr = makeDormantManager([entry]);
+  mgr.tmuxNameFor = (id) => (id === entry.sessionId ? 'cx_pane' : null);
+  mgr.paneTargetFor = () => '%7';
+  mockHookSession(t, { sessionId: entry.sessionId, pid: process.pid });
+  const targets = [];
+  await buildGraph(mgr, async () => ({}), {
+    discover: async () => [{ tmuxName: 'cx_pane', claudePid: process.pid, agent: 'codex' }],
+    runtimeResolver: () => ({ analyze: async () => ({}) }),
+    capture: async (target) => { targets.push(target); return ''; },
+    codexStatus: async () => ({ status: 'idle', waitingFor: null }),
+  });
+  assert.ok(targets.includes('%7'));
+  assert.ok(!targets.includes('cx_pane'));
+});
+
+test('buildGraph: a discovered session captures by its pane id, else its tmux name', async () => {
+  for (const [paneId, want] of [['%12', '%12'], [undefined, 'cx_disc2']]) {
+    const entry = { sessionId: 'cx-disc2', agent: 'codex', liveSessionId: 'thr' };
+    const mgr = makeDiscoveredManager(entry, 'cx_disc2');
+    const targets = [];
+    await buildGraph(mgr, async () => ({}), {
+      discover: async () => [{ tmuxName: 'cx_disc2', paneId, socket: '', claudePid: 4242, agent: 'codex', command: 'codex' }],
+      runtimeResolver: () => ({ readLive: async () => null, analyze: async () => ({}) }),
+      capture: async (target) => { targets.push(target); return ''; },
+      codexStatus: async () => ({ status: 'idle', waitingFor: null }),
+    });
+    assert.deepEqual(targets, [want]);
+  }
 });

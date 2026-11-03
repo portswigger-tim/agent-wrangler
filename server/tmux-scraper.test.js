@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { tmuxesForSession, claudeTitle, hasBackgroundShell, prefillPane, sendText, classify, findAgentPid, parsePaneLine, paneModelLabel, paneContextPercent, trustDialogState } from './tmux-scraper.js';
+import { tmuxesForSession, claudeTitle, hasBackgroundShell, prefillPane, sendText, classify, findAgentPid, parsePaneLine, paneModelLabel, paneContextPercent, trustDialogState, isCompacting } from './tmux-scraper.js';
 
 const ID = '53fa5416-3437-4126-897c-e1c0b3daa2ac';
 
@@ -143,6 +143,59 @@ const REAL_BANNER_LINES = [
   '  2. Skip', '  3. Skip until next version', '',
   '  Press enter to continue',
 ];
+const CODEX_UPDATING = 'Updating Codex via `brew upgrade --cask codex`...';
+const CODEX_UPDATED = '🎉 Update ran successfully! Please restart Codex.';
+
+test('classify: Codex self-update progress reads working beyond the default tail', () => {
+  for (const width of [80, 40, 24, 20]) {
+    const lines = [CODEX_UPDATING, '==> Fetching downloads for: codex', '==> Upgrading codex', '  0.160.1 -> 0.161.0', ...Array(20).fill('==> Downloading Homebrew API data')];
+    const pane = lines.flatMap((l) => wordWrap(l, width)).join('\n');
+    assert.equal(classify(pane).status, 'working', `width ${width}`);
+    assert.equal(classify(pane, { tailLines: 60, strictWorking: true }).status, 'working');
+  }
+  assert.equal(classify(CODEX_UPDATING).status, 'working');
+});
+
+test('classify: raw updater output survives terminal hard wrapping', () => {
+  for (const width of [40, 24, 20, 16, 12]) {
+    for (const [text, status] of [[CODEX_UPDATING, 'working'], [CODEX_UPDATED, 'needs-you']]) {
+      const lines = [];
+      for (let i = 0; i < text.length; i += width) lines.push(text.slice(i, i + width));
+      assert.equal(classify(lines.join('\n')).status, status, `width ${width}: ${text}`);
+    }
+  }
+});
+
+test('classify: completed Codex update requires a restart even with stale working output', () => {
+  for (const width of [80, 40, 24, 20, 12]) {
+    const pane = ['• Working (1s · esc to interrupt)', CODEX_UPDATING, CODEX_UPDATED]
+      .flatMap((l) => wordWrap(l, width)).join('\n');
+    const result = classify(pane);
+    assert.equal(result.status, 'needs-you', `width ${width}`);
+    assert.match(result.waitingFor, /restart Codex/i);
+  }
+  assert.equal(classify(`${CODEX_UPDATED}\nPane is dead (status 0, Thu Oct 8 10:19:02 2026)`).status, 'needs-you');
+});
+
+test('classify: updater prose, quoted output and update scrollback after resume stay idle', () => {
+  const panes = [
+    'I am updating Codex via brew upgrade --cask codex.',
+    `The output says: ${CODEX_UPDATED}`,
+    `> ${CODEX_UPDATING}\n> ==> Upgrading codex`,
+    `    ${CODEX_UPDATING}\n    ==> Upgrading codex\n    ${CODEX_UPDATED}`,
+    `\`\`\`text\n${CODEX_UPDATING}\n==> Upgrading codex\n${CODEX_UPDATED}\n\`\`\``,
+    `${CODEX_UPDATING}\n==> Upgrading codex\n${CODEX_UPDATED}\n› Ask Codex to do anything\n? for shortcuts`,
+    `${CODEX_UPDATING}\n==> Upgrading codex\n› Explain the update output\n• The update completed successfully.`,
+  ];
+  for (const pane of panes) assert.equal(classify(pane).status, 'idle', pane);
+});
+test('classify: Codex update completion accepts a plain dead-pane trailer', () => {
+  for (const heading of ['', `${CODEX_UPDATING}\n`]) {
+    const result = classify(`${heading}${CODEX_UPDATED}\nPane is dead`);
+    assert.equal(result.status, 'needs-you');
+    assert.match(result.waitingFor, /restart Codex/i);
+  }
+});
 test('classify: the real banner reads as needs-you at every realistic (and several unrealistic) pane widths', () => {
   // 40 down to 12 columns — well past anything this product would actually
   // render a terminal at, which is the point: the fix must not depend on
@@ -249,6 +302,16 @@ test('classify: the footer phrase in ordinary prose plus two option-shaped lines
   // to confirm" check above is already line-anchored against.
   const pane = 'Earlier we discussed that Codex can say: press enter to continue.\n\n1. Yes, continue with the plan\n2. No, quit early';
   assert.equal(classify(pane).status, 'idle');
+});
+
+test('classify: Codex\'s "Replace goal?" dialog reads as needs-you with a reason', () => {
+  const pane = '• Worked for 17m 31s\n\n  Replace goal?\n  New objective: complete each of the 6 checklist items we\'ve defined\n\n› 1. Replace current goal  Set the new objective and start it now\n  2. Cancel                Keep the current goal\n\n  enter select · esc back';
+  const c = classify(pane);
+  assert.equal(c.status, 'needs-you');
+  assert.match(c.waitingFor, /replace the current goal/i);
+});
+test('classify: prose listing goal options without the dialog footer stays idle', () => {
+  assert.equal(classify('1. Replace current goal\n2. Cancel').status, 'idle');
 });
 
 test('matches the original session tmux launched with --session-id', () => {
@@ -383,6 +446,38 @@ test('hasBackgroundShell ignores an unrelated "Running N shell command" tool lin
   assert.equal(hasBackgroundShell(pane), false);
 });
 
+test('hasBackgroundShell detects a monitor-only footer "1 monitor"', () => {
+  const pane = [
+    '❯ ',
+    '  ◆ Sonnet 5 | ⎇ main | 📁 repo',
+    '  ⏵⏵ auto mode on · 1 monitor',
+  ].join('\n');
+  assert.equal(hasBackgroundShell(pane), true);
+});
+
+test('hasBackgroundShell detects the plural footer form "2 monitors"', () => {
+  assert.equal(hasBackgroundShell('  ⏵⏵ auto mode on · 2 monitors · ← for agents'), true);
+});
+
+test('hasBackgroundShell detects a shell and a monitor together', () => {
+  assert.equal(hasBackgroundShell('  ⏵⏵ auto mode on · 1 shell, 1 monitor · ← for agents'), true);
+});
+
+test('hasBackgroundShell detects a monitor footer truncated by a narrow pane', () => {
+  assert.equal(hasBackgroundShell('  ⏵⏵ auto mode on · 1 monitor · ←'), true);
+  assert.equal(hasBackgroundShell('  ⏵⏵ auto mode on · 1 monitor'), true);
+  assert.equal(hasBackgroundShell('  ⏵⏵ auto mode on · 1 shell, 1 mon'), true);
+});
+
+test('hasBackgroundShell ignores unrelated "monitor" text in the scrollback', () => {
+  const pane = [
+    '⏺ Started 1 monitor for the deploy, will check back.',
+    '  The dashboard · 3 monitoring panels are green.',
+    '  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents',
+  ].join('\n');
+  assert.equal(hasBackgroundShell(pane), false);
+});
+
 test('hasBackgroundShell is false for empty pane text', () => {
   assert.equal(hasBackgroundShell(''), false);
 });
@@ -420,9 +515,9 @@ test('hasBackgroundShell defaults to the claude pattern when no agent is given (
   assert.equal(hasBackgroundShell(pane), true);
 });
 
-test('hasBackgroundShell returns false for an unrecognized agent rather than matching everything', () => {
+test('hasBackgroundShell rejects an unknown explicit provider', () => {
   const pane = '  ⏵⏵ auto mode on · 1 shell · ← for agents';
-  assert.equal(hasBackgroundShell(pane, 'some-future-agent'), false);
+  assert.throws(() => hasBackgroundShell(pane, 'some-future-agent'), /Unknown agent/);
 });
 
 test('hasBackgroundShell detects Claude\'s footer even when the pane is too narrow for the trailing middot to render (verified against a real truncated capture)', () => {
@@ -686,4 +781,26 @@ test('trustDialogState: reports which option the cursor is on, and nothing for a
   assert.equal(trustDialogState('⏺ I pressed "Yes, I trust this folder" in the other pane and it started fine.\n❯ '), null);
   assert.equal(trustDialogState('❯ Try "fix typecheck errors"'), null);
   assert.equal(trustDialogState(''), null);
+});
+
+test('sendText pads a trailing backslash so Enter submits instead of continuing the line', async () => {
+  const pasted = [];
+  const run = (socket, args) => { if (args[0] === 'load-buffer') pasted.push(fs.readFileSync(args[3], 'utf8')); return Promise.resolve(); };
+  await sendText('cc_y', 'see src\\', '', run, { wait: async () => {} });
+  await sendText('cc_y', 'see src/', '', run, { wait: async () => {} });
+  assert.deepEqual(pasted, ['see src\\ ', 'see src/']);
+});
+
+test('sendText with empty text skips the paste (tmux has no buffer for an empty file) but still presses Enter', async () => {
+  const calls = [];
+  const run = async (socket, args) => { calls.push(args[0]); return { stdout: '' }; };
+  await sendText('cc_z', '', '', run, { wait: async () => {} });
+  assert.deepEqual(calls, ['send-keys']);
+});
+
+test('isCompacting: needs both the compaction text and the working footer', () => {
+  assert.equal(isCompacting('✻ Compacting conversation… (8s · esc to interrupt)\n'), true);
+  assert.equal(isCompacting('• Compacting context (3s • esc to interrupt)\n'), true);
+  assert.equal(isCompacting('I read about Compacting conversation earlier\n❯ \n'), false);
+  assert.equal(isCompacting('✻ Thinking… (esc to interrupt)\n'), false);
 });

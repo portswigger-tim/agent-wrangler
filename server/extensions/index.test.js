@@ -9,7 +9,7 @@ import {
   BUILTIN, RESERVED_GRAPH_KEYS, SESSION_HOOKS, CAPABILITIES, DISPATCH_FIELDS,
   validateManifest, assertGraphKeys, loadExtensions, getExtensions, extensionsForGraph,
   createSkillGate, createCodexPolicyResolver, createToolFilter, createTaskDeleteNotifier, quarantineExtension, registerExtension, unregisterExtension,
-  primeExtensions, extensionsPrimed, _resetExtensionsForTests,
+  primeExtensions, extensionsPrimed, _resetExtensionsForTests, themeSources,
 } from './index.js';
 import { FORBIDDEN_IMPORTS } from './external.js';
 import { MAX_TEXT_LENGTH, MAX_TEXTAREA_LENGTH, MAX_PATTERN_LENGTH } from './setting-constraints.js';
@@ -115,7 +115,7 @@ test('enabled filtering: a disabled extension is listed but contributes nothing 
     id: 'fake', label: 'Fake extension', help: 'Does fake things.', defaultEnabled: true, enabled: false,
     description: '', author: '', homepage: '',
     requires: [], range: null, storeNames: ['fake'], settings: [], skills: ['mail'], handlerTypes: [],
-    hideDispatchField: [], runtimes: [], external: false, dir: path.join(HERE, 'fake'), provenance: null, quarantine: null,
+    hideDispatchField: [], keybindings: [], runtimes: [], external: false, dir: path.join(HERE, 'fake'), provenance: null, earlyAdopterBranch: null, quarantine: null,
   }], 'a disabled extension still reports its facade inputs, but claims no handler types');
   assert.deepEqual(out.tools, []);
   assert.deepEqual(out.allowedToolNames, []);
@@ -186,8 +186,8 @@ test('BUILTIN: every directory under builtin/ is registered', () => {
 // The real builtin set. Asserted by id so a stray extra manifest (which would
 // register tools and handlers on every install) is noticed, and so the
 // invariants below never quietly pass over an empty list.
-test('BUILTIN: the shipped set is exactly adversarial-review, checklist, jira, task-memory and todos', () => {
-  assert.deepEqual(BUILTIN.map((e) => e.id).sort(), ['adversarial-review', 'checklist', 'jira', 'task-memory', 'todos']);
+test('BUILTIN: the shipped set is exactly adversarial-review, checklist, jira, sounds, task-memory, themes and todos', () => {
+  assert.deepEqual(BUILTIN.map((e) => e.id).sort(), ['adversarial-review', 'checklist', 'jira', 'sounds', 'task-memory', 'themes', 'todos']);
 });
 
 const ownedBy = (id, xs) => xs.filter((x) => x.extId === id);
@@ -747,7 +747,7 @@ test('an already-quarantined entry (discovery could not read it) becomes a row a
   assert.deepEqual(out.list, [{
     id: 'dud', label: 'dud', help: '', description: '', author: '', homepage: '',
     defaultEnabled: false, enabled: false, requires: [], range: null, storeNames: [], settings: [], skills: [],
-    handlerTypes: [], hideDispatchField: [], runtimes: [], external: true, dir: null, provenance: null, quarantine: 'no index.js',
+    handlerTypes: [], hideDispatchField: [], keybindings: [], runtimes: [], external: true, dir: null, provenance: null, earlyAdopterBranch: null, quarantine: 'no index.js',
   }]);
   assert.deepEqual(out.tools, []);
 });
@@ -1004,12 +1004,12 @@ test('hideDispatchField must be an array of known dispatch field names', () => {
   rejects(manifest({ hideDispatchField: 'effort' }), /Extension fake: hideDispatchField must be an array of dispatch field names/);
   rejects(manifest({ hideDispatchField: [7] }), /Extension fake: hideDispatchField must be an array of dispatch field names/);
   rejects(manifest({ hideDispatchField: [''] }), /Extension fake: hideDispatchField must be an array of dispatch field names/);
-  rejects(manifest({ hideDispatchField: ['cwd'] }), /Extension fake: unknown dispatch field "cwd" \(known: autoCompactTokens, effort, model, runtime, worktree\)/);
+  rejects(manifest({ hideDispatchField: ['cwd'] }), /Extension fake: unknown dispatch field "cwd" \(known: autoCompactTokens, effort, model, quickLaunch, runtime, worktree\)/);
   assert.ok(validateManifest(manifest({ hideDispatchField: [...DISPATCH_FIELDS] })));
 });
 
 test('the dispatch field vocabulary is closed', () => {
-  assert.deepEqual([...DISPATCH_FIELDS].sort(), ['autoCompactTokens', 'effort', 'model', 'runtime', 'worktree']);
+  assert.deepEqual([...DISPATCH_FIELDS].sort(), ['autoCompactTokens', 'effort', 'model', 'quickLaunch', 'runtime', 'worktree']);
 });
 
 test('the declared hideDispatchField lands on the entry, the announcement and the graph, as a COPY', () => {
@@ -1101,8 +1101,27 @@ test('a valid runtime stages: claimed in _reg, tagged on out.runtimes, listed {i
   assert.equal(out.list[0].quarantine, null);
   assert.ok(out._reg.runtimeIds.has('toyrt'));
   assert.deepEqual(out.runtimes.map((r) => [r.id, r.extId, typeof r.wrapLaunch]), [['toyrt', 'fake', 'function']]);
-  assert.deepEqual(out.list[0].runtimes, [{ id: 'toyrt', label: 'Toy' }]);
-  assert.deepEqual(extensionsForGraph(out.list, () => true)[0].runtimes, [{ id: 'toyrt', label: 'Toy' }]);
+  assert.deepEqual(out.list[0].runtimes, [{ id: 'toyrt', label: 'Toy', ownsModel: false, ownLaunch: false, agents: ['claude'] }]);
+  assert.deepEqual(extensionsForGraph(out.list, () => true)[0].runtimes, [{ id: 'toyrt', label: 'Toy', ownsModel: false, ownLaunch: false, agents: ['claude'] }]);
+});
+
+test('a runtime that defines validateModel is listed with ownsModel: true, for api.dispatch.submit', () => {
+  const out = loadExtensions({ cfg: {}, builtin: [manifest({ runtimes: [toyRuntime({ validateModel: () => null })] })], ...CORE_RUNTIMES });
+  assert.deepEqual(extensionsForGraph(out.list, () => true)[0].runtimes, [{ id: 'toyrt', label: 'Toy', ownsModel: true, ownLaunch: false, agents: ['claude'] }]);
+});
+
+test('a runtime\'s agents ride to the graph, for the dialog to gate the option by', () => {
+  const out = loadExtensions({ cfg: {}, builtin: [manifest({ runtimes: [toyRuntime({ agents: ['claude', 'codex'] })] })], ...CORE_RUNTIMES });
+  assert.equal(out.list[0].quarantine, null);
+  assert.deepEqual(extensionsForGraph(out.list, () => true)[0].runtimes, [{ id: 'toyrt', label: 'Toy', ownsModel: false, ownLaunch: false, agents: ['claude', 'codex'] }]);
+});
+
+test('a bad runtime agents list quarantines', () => {
+  rejects(manifest({ runtimes: [toyRuntime({ agents: 'codex' })] }), /runtime toyrt agents must be a non-empty array of agent ids/);
+  rejects(manifest({ runtimes: [toyRuntime({ agents: [] })] }), /agents must be a non-empty array/);
+  rejects(manifest({ runtimes: [toyRuntime({ agents: ['codex', ''] })] }), /agents must be a non-empty array/);
+  rejects(manifest({ runtimes: [toyRuntime({ agents: ['codex', 'codex'] })] }), /runtime toyrt agents has a duplicate/);
+  assert.ok(validateManifest(manifest({ runtimes: [toyRuntime({ agents: ['codex'] })] })));
 });
 
 test('a runtime colliding with a built-in quarantines the extension', () => {
@@ -1133,9 +1152,14 @@ test('a bad runtime shape quarantines', () => {
   rejects(manifest({ runtimes: [toyRuntime({ wrapLaunch: undefined, buildLaunch: async () => '', resumable: true })] }), /must declare resumable: false/);
   rejects(manifest({ runtimes: [toyRuntime({ deliver: 'yes' })] }), /runtime toyrt deliver must be a function/);
   rejects(manifest({ runtimes: [toyRuntime({ preflight: {} })] }), /runtime toyrt preflight must be a function/);
+  rejects(manifest({ runtimes: [toyRuntime({ launchStatus: 'ok' })] }), /runtime toyrt launchStatus must be a function/);
+  rejects(manifest({ runtimes: [toyRuntime({ cost: { usd: 1 } })] }), /runtime toyrt cost must be a function/);
   rejects(manifest({ runtimes: [toyRuntime({ resumable: 'no' })] }), /runtime toyrt resumable must be a boolean/);
   rejects(manifest({ runtimes: [toyRuntime({ skipsHostResumeGuard: 1 })] }), /skipsHostResumeGuard must be a boolean/);
+  rejects(manifest({ runtimes: [toyRuntime({ liveByTmux: 'yes' })] }), /runtime toyrt liveByTmux must be a boolean/);
+  assert.ok(validateManifest(manifest({ runtimes: [toyRuntime({ liveByTmux: true })] })));
   rejects(manifest({ runtimes: [toyRuntime(), toyRuntime({ label: 'Again' })] }), /duplicate runtime id "toyrt"/);
+  assert.ok(validateManifest(manifest({ runtimes: [toyRuntime({ cost: async () => null })] })));
   assert.ok(validateManifest(manifest({ runtimes: [toyRuntime({ wrapLaunch: undefined, buildLaunch: async () => '', resumable: false, deliver: async () => ({ ok: true }) })] })));
 });
 
@@ -1148,7 +1172,7 @@ test('unregister releases a runtime id, so a re-enable re-stages it', () => {
   assert.deepEqual(out.list[0].runtimes, []);
   registerExtension(out, manifest({ runtimes: [toyRuntime()] }), { cfg: {} });
   assert.deepEqual(out.runtimes.map((r) => r.id), ['toyrt']);
-  assert.deepEqual(out.list[0].runtimes, [{ id: 'toyrt', label: 'Toy' }]);
+  assert.deepEqual(out.list[0].runtimes, [{ id: 'toyrt', label: 'Toy', ownsModel: false, ownLaunch: false, agents: ['claude'] }]);
 });
 
 test('a disabled extension claims no runtime id', () => {
@@ -1167,4 +1191,100 @@ test('onTaskDelete: an extension with no façade at fire time is skipped', async
   const loaded = loadExtensions({ cfg: {}, builtin: [manifest({ tools: [], handlers: [], stores: {}, graph: undefined, session: undefined, skills: [], onTaskDelete: ({ taskId }) => { seen.push(taskId); } })] });
   await createTaskDeleteNotifier(loaded, () => undefined)('t_1');
   assert.deepEqual(seen, []);
+});
+
+// ── `keybindings` — the disclosure half of api.keys.bind ──
+test('keybindings must be an array of { combo, scope } with a parsable combo and a known scope', () => {
+  rejects(manifest({ keybindings: 'ctrl+k' }), /Extension fake: keybindings must be an array of \{ combo, scope \}/);
+  rejects(manifest({ keybindings: [{ combo: 'ctrl+k' }] }), /keybindings must be an array of \{ combo, scope \}/);
+  rejects(manifest({ keybindings: [{ combo: 'hyper+k', scope: 'board' }] }), /keybindings: unknown modifier "hyper"/);
+  rejects(manifest({ keybindings: [{ combo: 'ctrl+k', scope: 'everywhere' }] }), /keybindings: unknown scope "everywhere" \(known: dispatch, modal, board, global\)/);
+  assert.ok(validateManifest(manifest({ keybindings: [{ combo: 'mod+shift+l', scope: 'dispatch' }, { combo: 'ctrl+cmd+k', scope: 'global' }] })));
+});
+
+test('declared keybindings land on the announcement and the graph as copies, omitted when empty', () => {
+  const ext = manifest({ client: 'public/index.js', keybindings: [{ combo: 'ctrl+cmd+k', scope: 'global' }] });
+  const out = loadExtensions({ cfg: {}, builtin: [ext] });
+  ext.keybindings.push({ combo: 'ctrl+cmd+j', scope: 'global' });
+  assert.deepEqual(out.clientManifest, [{ id: 'fake', client: '/ext/fake/index.js', handlerTypes: ['fake-do'], keybindings: [{ combo: 'ctrl+cmd+k', scope: 'global' }] }]);
+  assert.deepEqual(extensionsForGraph(out.list, () => true)[0].keybindings, [{ combo: 'ctrl+cmd+k', scope: 'global' }]);
+  const none = loadExtensions({ cfg: {}, builtin: [manifest({ client: 'public/index.js', handlers: [] })] });
+  assert.deepEqual(none.clientManifest, [{ id: 'fake', client: '/ext/fake/index.js' }]);
+});
+
+test('earlyAdopter: a plain branch reaches the graph and the client announcement; anything else quarantines', () => {
+  rejects(manifest({ earlyAdopter: 'next' }), /Extension fake: earlyAdopter must be \{ branch \}/);
+  rejects(manifest({ earlyAdopter: { branch: '--upload-pack=x' } }), /earlyAdopter must be \{ branch \}/);
+  rejects(manifest({ earlyAdopter: {} }), /earlyAdopter must be \{ branch \}/);
+
+  const plain = loadExtensions({ cfg: {}, builtin: [manifest({ client: 'public/index.js' })] });
+  assert.equal(extensionsForGraph(plain.list)[0].earlyAdopter, null, 'no block, no facts');
+  assert.ok(!('earlyAdopter' in plain.clientManifest[0]), 'and the announcement is unchanged');
+
+  const provenance = { originUrl: 'https://example.invalid/x.git', sha: 'a'.repeat(40), earlyAdopter: true };
+  const ea = loadExtensions({ cfg: {}, builtin: [manifest({ client: 'public/index.js', earlyAdopter: { branch: 'next' }, provenance })] });
+  assert.deepEqual(extensionsForGraph(ea.list)[0].earlyAdopter, { branch: 'next', enabled: true });
+  assert.deepEqual(ea.clientManifest[0].earlyAdopter, { branch: 'next', enabled: true });
+  ea.list[0].provenance = { ...provenance, earlyAdopter: false };
+  assert.deepEqual(extensionsForGraph(ea.list)[0].earlyAdopter, { branch: 'next', enabled: false }, 'the graph reads the live opt-in');
+});
+
+test('themes must be a path inside the manifest dir', () => {
+  rejects(manifest({ themes: '../themes' }), /themes "\.\.\/themes" must resolve inside .*fake/);
+  rejects(manifest({ themes: '/etc' }), /must resolve inside/);
+  rejects(manifest({ themes: '.' }), /must resolve inside/);
+  rejects(manifest({ themes: 42 }), /themes must be a relative path string/);
+  rejects(manifest({ themes: 'themes', dir: undefined }), /themes requires the manifest to export its absolute `dir`/);
+  assert.ok(validateManifest(manifest({ themes: 'themes' })));
+});
+
+test('an enabled extension\'s themes dir is staged in list order and released on disable', () => {
+  const a = manifest({ id: 'a', stores: {}, handlers: [], tools: [], skills: [], graph: undefined, session: undefined, themes: 'themes', dir: path.join(HERE, 'a') });
+  const b = { ...a, id: 'b', dir: path.join(HERE, 'b') };
+  const out = loadExtensions({ cfg: {}, builtin: [a, b] });
+  assert.deepEqual(out.themeDirs, [{ id: 'a', dir: path.join(HERE, 'a', 'themes'), toggles: {} }, { id: 'b', dir: path.join(HERE, 'b', 'themes'), toggles: {} }]);
+  unregisterExtension(out, 'a');
+  assert.deepEqual(out.themeDirs.map((t) => t.id), ['b']);
+  registerExtension(out, a, { cfg: {} });
+  assert.deepEqual(out.themeDirs.map((t) => t.id), ['a', 'b']);
+  const off = loadExtensions({ cfg: { extensions: { a: false } }, builtin: [a, b] });
+  assert.deepEqual(off.themeDirs.map((t) => t.id), ['b']);
+});
+
+test('a toggle def\'s `theme` must name a theme id on a manifest with themes, once', () => {
+  const toggle = (extra) => ({ key: 'pink', type: 'toggle', label: 'Pink', theme: 'pink', ...extra });
+  assert.ok(validateManifest(manifest({ themes: 'themes', settings: [toggle()] })));
+  rejects(manifest({ settings: [toggle()] }), /settings\.pink\.theme requires the manifest's themes/);
+  rejects(manifest({ themes: 'themes', settings: [toggle({ type: 'text' })] }), /theme is only valid on a toggle setting/);
+  rejects(manifest({ themes: 'themes', settings: [toggle({ theme: 'Pink!' })] }), /theme must be a theme id/);
+  rejects(manifest({ themes: 'themes', settings: [toggle(), toggle({ key: 'pinkToo' })] }), /already switched by another setting/);
+});
+
+test('themeSources stages each theme toggle and reads it at call time: false is off, unset is on', () => {
+  const a = manifest({ id: 'a', stores: {}, handlers: [], tools: [], skills: [], graph: undefined, session: undefined, themes: 'themes', dir: path.join(HERE, 'a'),
+    settings: [{ key: 'pink', type: 'toggle', label: 'Pink', theme: 'pink' }, { key: 'pixelCats', type: 'toggle', label: 'Pixel Cats', theme: 'pixel-cats' }] });
+  const out = loadExtensions({ cfg: {}, builtin: [a] });
+  assert.deepEqual(out.themeDirs[0].toggles, { pink: 'pink', 'pixel-cats': 'pixelCats' });
+  let values = {};
+  const read = () => themeSources(out.themeDirs, (id) => (id === 'a' ? values : {}));
+  assert.deepEqual(read(), [{ id: 'a', dir: path.join(HERE, 'a', 'themes'), off: [] }]);
+  values = { pink: true, pixelCats: false };
+  assert.deepEqual(read()[0].off, ['pixel-cats']);
+  values = { pink: false };
+  assert.deepEqual(read()[0].off, ['pink']);
+});
+
+
+test('runtime announcement and graph identify own-launch and wrapping runtimes', () => {
+  const out = loadExtensions({ cfg: {}, builtin: [manifest({ runtimes: [
+    toyRuntime({ id: 'own', label: 'Own', wrapLaunch: undefined, buildLaunch: async () => 'x', resumable: false }),
+    toyRuntime(),
+  ] })], ...CORE_RUNTIMES });
+  assert.equal(out.list[0].quarantine, null);
+  assert.deepEqual(out.list[0].runtimes.map(({ id, ownLaunch }) => ({ id, ownLaunch })), [
+    { id: 'own', ownLaunch: true }, { id: 'toyrt', ownLaunch: false },
+  ]);
+  assert.deepEqual(extensionsForGraph(out.list, () => true)[0].runtimes.map(({ id, ownLaunch }) => ({ id, ownLaunch })), [
+    { id: 'own', ownLaunch: true }, { id: 'toyrt', ownLaunch: false },
+  ]);
 });

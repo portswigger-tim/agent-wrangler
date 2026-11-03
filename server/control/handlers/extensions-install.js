@@ -2,10 +2,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
+import semver from 'semver';
 import { validateManifest } from '../../extensions/index.js';
-import { externalDir, tmpDir, ensureDirs, isValidExtensionId, readProvenance, recordFor, putRecord, removeRecord } from '../../extensions/provenance.js';
+import { externalDir, tmpDir, ensureDirs, isValidExtensionId, readProvenance, recordFor, putRecord, removeRecord, setAutoUpdate, setEarlyAdopter, trackedBranch } from '../../extensions/provenance.js';
 import { unconsentedCapabilities, admitExternal, importViolation } from '../../extensions/external.js';
-import { assertAllowedUrl, cloneTo, readHead, lockDependencies, npmCi, lsRemoteHead, readDeclaration, MissingLockfileError, MissingDeclarationError } from '../../extensions/install.js';
+import { assertAllowedUrl, cloneTo, readHead, lockDependencies, npmCi, lsRemoteHead, commitsSince, readDeclaration, MissingLockfileError, MissingDeclarationError } from '../../extensions/install.js';
+import { HOST_API_VERSION, servesRange, isValidRange } from '../../host-api/version.js';
 import { log } from '../../log.js';
 
 // Installing an external extension, in two frames with a human decision between
@@ -64,7 +66,7 @@ const pending = new Map();
 // with no process and no network. Deliberately a MODULE seam and never an option
 // on the incoming frame: a control frame is browser-supplied, so a `_clone` a
 // client could set would be arbitrary code execution offered as an API.
-const REAL_RUNNERS = { clone: cloneTo, head: readHead, npm: npmCi, lsRemote: lsRemoteHead };
+const REAL_RUNNERS = { clone: cloneTo, head: readHead, npm: npmCi, lsRemote: lsRemoteHead, commits: commitsSince };
 let runners = REAL_RUNNERS;
 
 export function _setInstallRunnersForTests(next = null) {
@@ -130,6 +132,10 @@ function reclaim(lock) {
 // missed. Routed through ctx.broadcast, which is sendGuarded-backed like every
 // other broadcast.
 function progress(ctx, phase, extra = {}) {
+  // Released BEFORE the terminal frame goes out: "Update all" starts the next
+  // install the moment it sees one, and the handler still has a rebuild to
+  // await, so a release left to its `finally` would refuse that next install.
+  if (phase === 'done' || phase === 'failed' || phase === 'cancelled') busy = null;
   ctx.broadcast?.({ type: 'ext-install-progress', phase, ...extra });
 }
 
@@ -186,6 +192,31 @@ function updateDiff(record, declared, deps) {
   };
 }
 
+// Why an extension declaring host API `range` cannot run on this server, or null
+// when it can. Applying one anyway is no refusal at all: the install or update
+// lands, then fails at activation or at the next BOOT (host-api/index.js), with
+// an update having already replaced the version that worked. Said in terms of
+// the wrangler rather than the API, because "update Agent Wrangler" is the
+// thing a human can actually do about it.
+function engineMismatch(range) {
+  if (servesRange(range)) return null;
+  if (!isValidRange(range)) return `declares engines.wranglerApi ${JSON.stringify(range)}, which is not a valid semver range`;
+  if (semver.gtr(HOST_API_VERSION, range)) return `was written for an older Agent Wrangler (needs host API ${range}, this is ${HOST_API_VERSION})`;
+  return `requires a newer Agent Wrangler (needs host API ${range}, this is ${HOST_API_VERSION})`;
+}
+
+// A REFUSAL, not a failure: nothing went wrong, this server simply cannot run
+// that code, so the reply is its own frame (the panel puts the reason where
+// the update button was) rather than a thrown error toast. The `failed` phase
+// is still broadcast, because it is what releases the lock and moves "Update
+// all" on to the next one. Every caller has already removed its staging dir.
+function refuseIncompatible(ctx, { id, label, range, reason }) {
+  const update = Boolean(recordFor(id));
+  const message = `${label || id} ${reason}. ${update ? 'The installed version was left as it is.' : 'Nothing was installed.'}`;
+  progress(ctx, 'failed', { id, message });
+  ctx.reply({ type: 'ext-install-incompatible', id, update, range, hostVersion: HOST_API_VERSION, message });
+}
+
 // Loaded ONLY after consent and `npm ci`, which is the first moment the
 // manifest's own imports resolve and the first moment running its code is
 // something the human has agreed to. `declared` is what they agreed to, so the
@@ -196,6 +227,9 @@ function updateDiff(record, declared, deps) {
 function assertManifestMatchesDeclaration(manifest, declared) {
   if (manifest.id !== declared.id) {
     throw new Error(`The extension's index.js declares id "${manifest.id}" but its package.json disclosed "${declared.id}" — refusing to install a manifest that does not match what was consented to.`);
+  }
+  if ((manifest.earlyAdopter?.branch ?? null) !== declared.earlyAdopterBranch) {
+    throw new Error(`The extension's index.js declares early-adopter branch ${JSON.stringify(manifest.earlyAdopter?.branch ?? null)} but its package.json disclosed ${JSON.stringify(declared.earlyAdopterBranch)} — refusing to install a manifest that does not match what was consented to.`);
   }
   const consented = new Set(declared.requires);
   const extra = [...new Set((manifest.requires || []).filter((c) => !consented.has(c)))];
@@ -277,7 +311,11 @@ export const extInstallHandler = {
     try {
       ensureDirs();
       progress(ctx, 'cloning', { url });
-      await runners.clone(url, dir);
+      // An installed extension from this URL that opted in to early-adopter
+      // builds is reinstalled from its EA branch. Looked up server-side from the
+      // record, never taken from the frame.
+      const branch = earlyAdopterBranchFor(url);
+      await runners.clone(url, dir, { branch });
       progress(ctx, 'resolving');
       // Static read — the manifest module is NOT imported until after consent.
       let declared;
@@ -286,6 +324,16 @@ export const extInstallHandler = {
       } catch (err) {
         if (err instanceof MissingDeclarationError) throw new Error('This repository declares no "wranglerExtension" block in its package.json. An external extension must declare its id, label and requires there so they can be shown to you without running any of its code.');
         throw err;
+      }
+      // Refused BEFORE anything else is read or shown: there is no point asking
+      // a human to consent to an update this server would then fail to load.
+      // This reads the package.json copy of the range; ext-consent checks the
+      // manifest's own once it can be imported, for a repo that only put it there.
+      const mismatch = engineMismatch(declared.range);
+      if (mismatch) {
+        rmQuiet(dir);
+        refuseIncompatible(ctx, { id: declared.id, label: declared.label, range: declared.range, reason: mismatch });
+        return;
       }
       const sha = await runners.head(dir);
       // Refused BEFORE consent and before any registry fetch: an extension
@@ -299,6 +347,8 @@ export const extInstallHandler = {
         throw err;
       }
       const existing = recordFor(declared.id);
+      // Best effort: a missing list costs the human context, not the update.
+      const history = existing ? await runners.commits(dir, existing.sha || '').catch(() => null) : null;
       const reply = {
         type: 'ext-install-disclosure',
         tempId,
@@ -307,8 +357,9 @@ export const extInstallHandler = {
         dependencies: deps.direct,
         dependencyCount: deps.all.length,
         ...(existing ? updateDiff(existing, declared, deps) : { update: false, reconsentNeeded: true }),
+        ...(history ? { commits: history.commits, commitsTruncated: history.truncated } : {}),
       };
-      pending.set(tempId, { url, sha, declared, deps, dir });
+      pending.set(tempId, { url, sha, declared, deps, dir, branch });
       busy.awaitingConsent = true;
       busy.since = Date.now();
       // The lock is HELD across the human's decision, deliberately: the staging
@@ -332,7 +383,7 @@ export const extConsentHandler = {
     const staged = pending.get(msg.tempId);
     if (!staged) throw new Error('That install is no longer pending — start it again.');
     pending.delete(msg.tempId);
-    const { url, sha, declared, deps, dir } = staged;
+    const { url, sha, declared, deps, dir, branch } = staged;
     try {
       if (!msg.approve) {
         rmQuiet(dir);
@@ -347,6 +398,16 @@ export const extConsentHandler = {
       // manifest is validated and held to what was disclosed.
       const manifest = await loadStagedManifest(dir);
       assertManifestMatchesDeclaration(manifest, declared);
+      // The authoritative engines check — the declaration's copy is optional and
+      // may be missing or stale. Still before anything touches `dest`, so a
+      // refused update leaves the installed version exactly where it was.
+      const range = manifest.engines?.wranglerApi ?? null;
+      const mismatch = engineMismatch(range);
+      if (mismatch) {
+        rmQuiet(dir);
+        refuseIncompatible(ctx, { id: declared.id, label: declared.label, range, reason: mismatch });
+        return;
+      }
       const dest = safeExtPath(manifest.id);
       // Anything with a row already — an update, a reinstall over a live
       // install, or a fix-by-reinstall of a QUARANTINED one — takes the restart
@@ -369,8 +430,13 @@ export const extConsentHandler = {
         // against this record at every boot.
         requires: [...declared.requires],
         dependencies: deps.all,
+        // An update keeps the human's auto-update and early-adopter opt-ins; a
+        // fresh install (no record yet) starts with both off.
+        autoUpdate: recordFor(manifest.id)?.autoUpdate === true,
+        earlyAdopterBranch: declared.earlyAdopterBranch,
+        earlyAdopter: recordFor(manifest.id)?.earlyAdopter === true,
       });
-      log(`[agent-wrangler] extension ${manifest.id} installed from ${url} at ${sha.slice(0, 8)}`);
+      log(`[agent-wrangler] extension ${manifest.id} installed from ${url}${branch ? ` (early-adopter branch ${branch} if present)` : ''} at ${sha.slice(0, 8)}`);
       if (registered) {
         progress(ctx, 'done', { id: manifest.id, restartRequired: true });
         ctx.reply({ type: 'ext-install-done', id: manifest.id, installed: true, sha, restartRequired: true });
@@ -391,8 +457,6 @@ export const extConsentHandler = {
       rmQuiet(dir);
       progress(ctx, 'failed', { id: declared.id, message: String(err?.message || err) });
       throw err;
-    } finally {
-      busy = null;
     }
   },
 };
@@ -429,10 +493,11 @@ export const extUninstallHandler = {
 export const extCheckUpdatesHandler = {
   type: 'ext-check-updates',
   async handler(msg, ctx) {
-    // ON DEMAND ONLY — one `git ls-remote` per installed extension, off a
-    // button. No sweep, no background network, and nothing logged: a periodic
-    // check would be per-tick noise in the log and unasked-for traffic to
-    // whatever host an extension came from.
+    // One `git ls-remote` per installed extension, off a button, and nothing
+    // logged. The only background check is the core update tick's in Notify or
+    // Auto mode (extensions/update-check.js), which the user opted into there;
+    // with Automatic updates Off this button is the only traffic to whatever
+    // host an extension came from.
     const provenance = readProvenance();
     const out = [];
     for (const entry of ctx.ext.list) {
@@ -441,9 +506,10 @@ export const extCheckUpdatesHandler = {
       // `provenance: null` — a hand-dropped directory — has no originUrl to ask
       // about, so it is skipped rather than reported as up to date.
       if (!record?.originUrl) { out.push({ id: entry.id, updatable: false }); continue; }
+      const branch = trackedBranch(record);
       try {
-        const head = await runners.lsRemote(record.originUrl);
-        out.push({ id: entry.id, updatable: true, originUrl: record.originUrl, sha: record.sha || '', remoteSha: head, behind: Boolean(record.sha) && head !== record.sha });
+        const head = await runners.lsRemote(record.originUrl, { branch });
+        out.push({ id: entry.id, updatable: true, originUrl: record.originUrl, branch, sha: record.sha || '', remoteSha: head, behind: Boolean(record.sha) && head !== record.sha });
       } catch (err) {
         out.push({ id: entry.id, updatable: true, originUrl: record.originUrl, error: String(err?.message || err) });
       }
@@ -451,3 +517,113 @@ export const extCheckUpdatesHandler = {
     ctx.reply({ type: 'ext-updates', extensions: out });
   },
 };
+
+export const extSetAutoUpdateHandler = {
+  type: 'ext-set-auto-update',
+  async handler(msg, ctx) {
+    const id = String(msg.id || '');
+    const known = ctx.ext.list.find((e) => e.id === id);
+    if (!known) throw new Error(`Unknown extension: ${id}`);
+    if (!known.external) throw new Error(`${id} ships with the wrangler and is updated with it.`);
+    // setAutoUpdate refuses a record-less (hand-placed) extension itself.
+    const record = setAutoUpdate(id, msg.on === true);
+    // The loaded entry's record is what the graph reads, and it was taken at
+    // boot or install; only the flag is carried over, so its commit still
+    // names the code that is running.
+    known.provenance = { ...known.provenance, autoUpdate: record.autoUpdate };
+    log(`[agent-wrangler] extension ${id} auto-update ${record.autoUpdate ? 'on' : 'off'}`);
+    ctx.reply({ type: 'ext-auto-update', id, on: record.autoUpdate });
+    await ctx.rebuild();
+  },
+};
+
+// api.earlyAdopter.set (1.39.0): the client sends this frame with its own id
+// forced by slots.js, and the outcome is replied as `ext-early-adopter-result`
+// on `reqId` so the promise settles. Nothing is fetched here: the next update
+// check and update follow the new choice, which is how turning it off returns
+// to the default branch.
+export const extSetEarlyAdopterHandler = {
+  type: 'ext-set-early-adopter',
+  async handler(msg, ctx) {
+    const reqId = typeof msg.reqId === 'string' && msg.reqId && msg.reqId.length <= 64 ? msg.reqId : null;
+    let record;
+    try {
+      const id = String(msg.id || '');
+      const known = ctx.ext.list.find((e) => e.id === id);
+      if (!known) throw new Error(`Unknown extension: ${id}`);
+      if (!known.external) throw new Error(`${id} ships with the wrangler and is updated with it.`);
+      record = setEarlyAdopter(id, msg.on === true);
+      known.provenance = { ...known.provenance, earlyAdopter: record.earlyAdopter };
+      log(`[agent-wrangler] extension ${id} early-adopter builds ${record.earlyAdopter ? `on (${record.earlyAdopterBranch})` : 'off'}`);
+    } catch (err) {
+      if (!reqId) throw err;
+      ctx.reply({ type: 'ext-early-adopter-result', reqId, ok: false, error: String(err?.message || err) });
+      return;
+    }
+    if (reqId) ctx.reply({ type: 'ext-early-adopter-result', reqId, ok: true, on: record.earlyAdopter });
+    await ctx.rebuild();
+  },
+};
+
+// The branch a (re)install from `url` clones: the early-adopter branch of an
+// installed extension from that origin that opted in, else null (the default).
+function earlyAdopterBranchFor(url) {
+  for (const record of Object.values(readProvenance())) {
+    if (record.originUrl === url && trackedBranch(record)) return trackedBranch(record);
+  }
+  return null;
+}
+
+// The update tick's apply path for an extension whose record opts in
+// (provenance.js setAutoUpdate). It is ext-install then ext-consent, run back
+// to back through the SAME handlers, so the clone, the lockfile and host API
+// checks and the install lock are exactly the human path's; the only thing
+// skipped is the modal, and only when it has nothing new to ask: an update
+// whose `requires` does not widen. Anything else is left for the human, with
+// the reason, and the extension keeps its update button.
+//
+// Resolves `{ applied: true, sha }` or `{ applied: false, reason, incompatible? }`
+// and never throws. Progress frames are kept off the board (nobody pressed
+// anything, and the panel would show it as an install of its own); a finished
+// update's `ext-install-done` is broadcast instead, so every tab gets the
+// restart affordance.
+export async function autoUpdateExtension(id, ctx) {
+  const record = recordFor(id);
+  if (!record?.autoUpdate || !record.originUrl) return { applied: false, reason: 'Auto-update is off.' };
+  if (busy) return { applied: false, reason: 'another extension install was running; it is tried again at the next check' };
+  const replies = [];
+  const quiet = {
+    ...ctx,
+    broadcast: (frame) => { if (frame?.type !== 'ext-install-progress') ctx.broadcast?.(frame); },
+    reply: (frame) => {
+      replies.push(frame);
+      if (frame.type === 'ext-install-done' && frame.installed) ctx.broadcast?.({ ...frame, automatic: true });
+    },
+  };
+  const found = (type) => replies.find((f) => f.type === type);
+  const refused = () => {
+    const incompatible = found('ext-install-incompatible');
+    return incompatible ? { applied: false, reason: incompatible.message, incompatible: true } : null;
+  };
+  try {
+    await extInstallHandler.handler({ url: record.originUrl }, quiet);
+    const disclosure = found('ext-install-disclosure');
+    if (!disclosure) return refused() || { applied: false, reason: 'nothing was offered to install' };
+    let reason = null;
+    // A repository that now declares a different id would install as a new
+    // extension, which is never an update.
+    if (!disclosure.update || disclosure.id !== id) reason = `its repository now declares the id "${disclosure.id}"`;
+    else if (disclosure.reconsentNeeded) reason = `it now asks for ${disclosure.addedCapabilities.join(', ')}, which needs your consent`;
+    if (reason) {
+      await extConsentHandler.handler({ tempId: disclosure.tempId, approve: false }, quiet);
+      return { applied: false, reason };
+    }
+    await extConsentHandler.handler({ tempId: disclosure.tempId, approve: true }, quiet);
+    const done = found('ext-install-done');
+    if (!done?.installed) return refused() || { applied: false, reason: 'the update did not complete' };
+    log(`[agent-wrangler] extension ${id} auto-updated to ${done.sha.slice(0, 8)}; it loads when the wrangler restarts`);
+    return { applied: true, sha: done.sha };
+  } catch (err) {
+    return { applied: false, reason: String(err?.message || err) };
+  }
+}

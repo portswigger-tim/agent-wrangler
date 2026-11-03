@@ -50,7 +50,7 @@ export async function waitForBackgroundShellClear(tmux, socket, {
 // (its `.agent`/`.socket` are the fallbacks); `id` is the card id the socket is looked
 // up by. Callers differ only in how they interpret the returned boolean.
 export async function nudgeAndWaitForJobs(tmux, session, { ctx, id } = {}) {
-  const agent = session?.agent || 'claude';
+  const agent = session?.agent ?? 'claude';
   const socket = ctx?.socketFor?.(id) ?? session?.socket ?? '';
   await sendText(tmux, KILL_JOBS_NUDGE[agent] || KILL_JOBS_NUDGE.claude, socket).catch(() => {});
   return waitForBackgroundShellClear(tmux, socket, { agent });
@@ -82,6 +82,10 @@ export function descendantsOf(target, sessions) {
     }
   }
   return result;
+}
+
+export function descendantIdsOf(sessionId, sessionManager) {
+  return descendantsOf(sessionId, sessionManager.activeEntries?.() ?? []).map((d) => d.sessionId);
 }
 
 // Archive a list of session ids in order, auto-detecting each one's OWN live

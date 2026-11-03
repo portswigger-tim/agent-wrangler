@@ -4,8 +4,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { isOwnedTmux, adapterForProcess, adapterForContainerProcess } from './agents/index.js';
+import { isOwnedTmux, adapterFor, adapterForProcess, adapterForContainerProcess } from './agents/index.js';
+import { gentleKill } from './tmux-gentle-kill.js';
 import { tmuxSocketArgs } from './tmux-socket.js';
+import { boundedPs } from './bounded-ps.js';
+import { logWarn } from './log.js';
 import { paneComposerIsEmpty, paneHasWorkingStatus } from './ghost-suggestion.js';
 
 const exec = promisify(execFile);
@@ -68,25 +71,28 @@ export function claudeTitle(paneTitle) {
 }
 
 // Build a pid -> {ppid, command} forest from a single `ps` call.
-async function processTree() {
+export async function processTree(opts) {
   const children = new Map();
   const cmd = new Map();
-  try {
-    const { stdout } = await exec('ps', ['-axo', 'pid=,ppid=,command=']);
-    for (const line of stdout.split('\n')) {
-      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
-      if (!m) continue;
-      const pid = Number(m[1]);
-      const ppid = Number(m[2]);
-      cmd.set(pid, m[3]);
-      if (!children.has(ppid)) children.set(ppid, []);
-      children.get(ppid).push(pid);
-    }
-  } catch {
-    /* ps failed */
+  const stdout = await boundedPs(['-axo', 'pid=,ppid=,command='], opts);
+  if (stdout === null) {
+    if (!treeSkipped) logWarn('process tree scan skipped');
+    treeSkipped = true;
+    return { children, cmd };
+  }
+  treeSkipped = false;
+  for (const line of stdout.split('\n')) {
+    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    const ppid = Number(m[2]);
+    cmd.set(pid, m[3]);
+    if (!children.has(ppid)) children.set(ppid, []);
+    children.get(ppid).push(pid);
   }
   return { children, cmd };
 }
+let treeSkipped = false;
 
 // Walk a pane's process subtree to find an agent pid, if any → { pid, agent }.
 // Checks the executable matcher first (a plain host agent process), then the
@@ -189,12 +195,45 @@ export async function capturePaneStyled(name, lines = 6, socket = '') {
   }
 }
 
+// Both agents summarise their context mid-turn ("Compacting conversation…" in
+// Claude Code, "Compacting context" in Codex) while still showing the working
+// footer. Requiring the working status as well keeps prose that merely mentions
+// the phrase from reading as a compaction in progress.
+export function isCompacting(paneText, { tailLines = 12 } = {}) {
+  const plain = stripAnsi(paneText);
+  const recent = plain.split('\n').filter((l) => l.trim()).slice(-tailLines).join('\n');
+  return /compacting\s+(?:conversation|context)|compacting(?:\u2026|\.\.\.)/i.test(recent)
+    && classify(plain).status === 'working';
+}
+
+export function codexUpdateState(paneText) {
+  const text = stripAnsi(paneText);
+  const starts = [...text.matchAll(/^(?:Updating\b|🎉)/gm)];
+  for (const start of starts.reverse()) {
+    const fences = text.slice(0, start.index).match(/^[ \t]*(?:```|~~~)/gm) || [];
+    if (fences.length % 2) continue;
+    const output = text.slice(start.index);
+    const compact = output.replace(/\s/g, '');
+    if (/^🎉Updateransuccessfully!PleaserestartCodex\.(?:Paneisdead(?:\([^)]*\))?)?$/.test(compact)) {
+      return { status: 'needs-you', waitingFor: 'Codex update finished — restart Codex' };
+    }
+    if (/^UpdatingCodexvia`[^`]+`\.\.\./.test(compact)
+      && !/^[ \t]*(?:[›❯>•]|```|~~~|╭)|\? for shortcuts/m.test(output)) {
+      return { status: 'working' };
+    }
+  }
+  return null;
+}
+
 // Derive live state from the pane: only the "esc to interrupt" working signal
 // vs idle. The "needs you" (waiting) state comes from Claude's own session
 // file (status: 'waiting'), not from scraping the pane — pane scraping produced
 // false positives (e.g. a newline in the prompt looked like a selection menu).
 export function classify(paneText, { tailLines = 12, strictWorking = false } = {}) {
-  const recent = stripAnsi(paneText).split('\n').filter((l) => l.trim()).slice(-tailLines).join('\n');
+  const plain = stripAnsi(paneText);
+  const update = codexUpdateState(plain);
+  if (update) return update;
+  const recent = plain.split('\n').filter((l) => l.trim()).slice(-tailLines).join('\n');
   if (strictWorking ? paneHasWorkingStatus(recent) : /esc to interrupt/i.test(recent)) return { status: 'working' };
   // Verified against the real fresh-container login flow (Group G E2E capture):
   // the method-picker ("Select login method: 1. Claude account with
@@ -319,6 +358,17 @@ export function classify(paneText, { tailLines = 12, strictWorking = false } = {
   ) {
     return { status: 'needs-you', waitingFor: 'Codex is asking whether to trust this folder' };
   }
+  // Codex's "Replace goal?" confirmation, raised when /goal is sent while a goal
+  // already exists. Same hazard as the dialogs above: TUI chrome never written
+  // to the rollout, defaulting to option 1 on a bare Enter, so without this the
+  // chat view's Send sits queued with no hint that the terminal is blocked.
+  if (
+    /^[\s›]*1\.\s*replace\s+current\s+goal\b/im.test(recent)
+    && /^[\s›]*2\.\s*cancel\b/im.test(recent)
+    && /^[\s›]*enter\s+select\b/im.test(recent)
+  ) {
+    return { status: 'needs-you', waitingFor: 'Codex is asking whether to replace the current goal' };
+  }
   // A COLD devcontainer dispatch runs `devcontainer up` + postCreateCommand (1-2 min)
   // in the pane before claude starts. That window shows CLI/build output, not claude,
   // so without this it reads as idle and the suspend gate could reap it; surface it as
@@ -362,16 +412,17 @@ export function trustDialogState(paneText) {
 // the trailing-middot form silently stopped matching once the pane was
 // narrower than the full "· N shell(s) · …" segment, while requiring only the
 // leading middot survives down to the word "shell(s)" itself being cut.
+// A running Monitor tool shows in the same footer ("· 1 monitor", or
+// "· 1 shell, 1 monitor" alongside a shell) and dies with the pane just the
+// same, so it counts as a background job too; it gets the same leading-middot
+// rule, which a monitor-only footer needs because no shell segment precedes it.
 // Codex's "N background terminal(s) running · /ps to view · /stop to close" is
 // distinctive enough on its own (verified against a real `codex` session).
 // Killing the pane kills these jobs regardless of agent; only Claude's CLI
 // surfaces an ambiguous message about it on the next resume ("No completion
 // record was found") — Codex degrades gracefully instead — but both leave the
 // job dead all the same, so both are worth the same suspend/archive caution.
-const BACKGROUND_SHELL_PATTERNS = {
-  claude: /·\s*\d+\s+shells?\b/,
-  codex: /\d+\s+background terminals?\s+running/i,
-};
+
 
 // A user's custom statusline (see the `statusline-builder` plugin) renders
 // independently SELECTABLE and REORDERABLE components joined by " | " — e.g.
@@ -451,8 +502,12 @@ export function paneContextPercent(paneText) {
   return pct >= 0 && pct <= 100 ? pct : null;
 }
 
+export function classifyPane(paneText, agent, options, parse = classify) {
+  return adapterFor(agent).terminal.classify?.(paneText, options, parse) || { status: 'unknown' };
+}
+
 export function hasBackgroundShell(paneText, agent = 'claude') {
-  const pattern = BACKGROUND_SHELL_PATTERNS[agent];
+  const pattern = adapterFor(agent).terminal.backgroundShellPattern;
   if (!pattern) return false;
   const recent = stripAnsi(paneText).split('\n').filter((l) => l.trim()).slice(-12).join('\n');
   return pattern.test(recent);
@@ -482,6 +537,9 @@ export async function sendKeys(name, keys, socket = '') {
 // per agent. Ordering keeps sendText's trailing Enter a submit and not a swallowed
 // newline: the end marker precedes it on the same byte stream.
 async function pasteBlock(name, text, socket = '', run = tmux) {
+  // tmux's load-buffer of an empty file creates no buffer, so the paste-buffer
+  // after it fails with "no buffer" — an image-only message has no prose to paste.
+  if (!text) return;
   const tmpFile = path.join(os.tmpdir(), `cm-${crypto.randomBytes(5).toString('hex')}.txt`);
   const buf = `cm${crypto.randomBytes(3).toString('hex')}`;
   fs.writeFileSync(tmpFile, text, 'utf8');
@@ -511,15 +569,15 @@ async function pasteBlock(name, text, socket = '', run = tmux) {
 // and it fails safe by reporting NOT empty when it cannot tell. Returns true only
 // on a confirmed-empty composer, so a caller can decide what to do when the pane
 // will not come clean rather than pasting into it blind.
-export async function clearComposer(name, socket = '', { capture = capturePaneStyled, run = tmux, maxPresses = 12 } = {}) {
+export async function clearComposer(name, socket = '', { capture = capturePaneStyled, run = tmux, maxPresses = 12, agent } = {}) {
   for (let i = 0; i <= maxPresses; i += 1) {
-    if (paneComposerIsEmpty(await capture(name, 6, socket))) return true;
-    await run(socket, ['send-keys', '-t', name, 'C-u']);
+    if (paneComposerIsEmpty(await capture(name, 6, socket), agent)) return true;
+    await run(socket, ['send-keys', '-t', name, ...adapterFor(agent).terminal.clearKeys]);
     // The TUI redraws asynchronously, so re-reading immediately would judge the
     // previous frame and burn the whole budget in a few milliseconds.
     await new Promise((r) => setTimeout(r, 60));
   }
-  return paneComposerIsEmpty(await capture(name, 6, socket));
+  return paneComposerIsEmpty(await capture(name, 6, socket), agent);
 }
 
 // Prefill a pane's input with text but DON'T submit it — no Enter, so a human reviews
@@ -543,15 +601,19 @@ export async function paneTitle(name, socket = '') {
 }
 
 export async function killSession(name, socket = '') {
-  await tmux(socket, ['kill-session', '-t', name]);
+  await gentleKill((a) => tmux(socket, a), { session: name });
 }
 
 // Deliver a (possibly multi-line) follow-up message via the paste buffer (avoids the
 // shell-escaping pitfalls of `send-keys -l`) AND submit it with a trailing Enter.
 // Shares the paste-block mechanism with prefillPane, which omits the Enter. `run` is
 // the low-level tmux runner (test seam).
+// A trailing backslash is held back by Claude Code's composer: `\` + Enter is its
+// line-continuation, so the Enter becomes a newline and the prompt is never
+// submitted (verified against a live pane). A trailing space defuses it without
+// altering the message.
 export async function sendText(name, text, socket = '', run = tmux, { wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
-  await pasteBlock(name, text, socket, run);
+  await pasteBlock(name, text.endsWith('\\') ? `${text} ` : text, socket, run);
   await wait(120);
   await run(socket, ['send-keys', '-t', name, 'Enter']);
 }

@@ -386,9 +386,40 @@ test('snapshot() has no todos; a legacy todos value survives load/save unchanged
   assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).todos, legacy);
 });
 
+test('a legacy todos value is dropped from memory once the file no longer has it, so a stale copy is not rewritten', () => {
+  const file = tmpFile();
+  const legacy = { adhoc: [{ id: 'td_y', text: 'keep', createdAt: 1 }] };
+  fs.writeFileSync(file, JSON.stringify({ tasks: [], order: ['adhoc'], assignments: {}, sessionOrder: {}, todos: legacy }));
+  const store = new TaskStore(file);
+  const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+  delete onDisk.todos;
+  fs.writeFileSync(file, JSON.stringify(onDisk));
+  store.createTask({ name: 'Work' });
+  assert.equal('todos' in JSON.parse(fs.readFileSync(file, 'utf8')), false);
+  store.createTask({ name: 'More' });
+  assert.equal('todos' in JSON.parse(fs.readFileSync(file, 'utf8')), false);
+});
+
 test('a file without todos is saved without a todos key', () => {
   const file = tmpFile();
   const store = new TaskStore(file);
   store.createTask({ name: 'Work' });
   assert.equal('todos' in JSON.parse(fs.readFileSync(file, 'utf8')), false);
+});
+
+
+test('reorderTask move inserts before or after its target and persists the shifted order', () => {
+  const file = tmpFile();
+  const store = new TaskStore(file);
+  const a = store.createTask({ name: 'A' });
+  const b = store.createTask({ name: 'B' });
+  const c = store.createTask({ name: 'C' });
+  store.reorderTask(a.id, c.id, { move: true, after: true });
+  assert.deepEqual(orderNames(store), ['adhoc', 'B', 'C', 'A']);
+  store.reorderTask(a.id, b.id, { move: true });
+  assert.deepEqual(orderNames(store), ['adhoc', 'A', 'B', 'C']);
+  store.reorderTask(ADHOC, c.id, { move: true, after: true });
+  assert.deepEqual(orderNames(new TaskStore(file)), ['A', 'B', 'C', 'adhoc']);
+  assert.equal(store.reorderTask(a.id, a.id, { move: true }), false);
+  assert.equal(store.reorderTask(a.id, 'missing', { move: true }), false);
 });

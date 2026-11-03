@@ -1,7 +1,16 @@
+import { adapterFor } from './agents/index.js';
 import { mcpSeenAt as defaultMcpSeenAt } from './mcp-activity.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import crypto from 'node:crypto';
+import { resolveResumeDir } from './transcript-reader.js';
+import { findClaudeSocket as defaultFindSocket, sendToClaudeSocket as defaultSendSocket } from './claude-socket.js';
 
-// Deliver mail only to a live session. A dormant recipient keeps its mail
-// unread until it is resumed by a human or another workflow.
+// Deliver mail to a live session. A dormant recipient keeps its mail unread
+// until it is resumed by a human or another workflow, unless `wakesDormant()`
+// is true: then it is resumed bare and the notification follows through the
+// gated live path on the next sweep, so it never pastes into a booting pane or
+// over a draft.
 export async function deliverMailNotification(to, text, deps) {
   const { tmuxFor, socketFor, sessionManager, paneDeferral } = deps;
   const mcpSeenAt = deps.mcpSeenAt ?? defaultMcpSeenAt;
@@ -11,7 +20,11 @@ export async function deliverMailNotification(to, text, deps) {
   if (!entry || entry.archivedAt) return { mode: 'skip' };
 
   const target = tmuxFor(to);
-  if (!target) return { mode: 'deferred', reason: 'no tmux target' };
+  if (!target) {
+    if (!deps.wakesDormant?.()) return { mode: 'deferred', reason: 'no tmux target' };
+    if (entry.snooze) return { mode: 'deferred', reason: 'snoozed, not waking' };
+    return wakeDormant(to, entry, deps);
+  }
 
   const beforeSend = async () => {
     const relaunchedAt = entry.relaunchedAt;
@@ -23,19 +36,55 @@ export async function deliverMailNotification(to, text, deps) {
   };
   let reason = null;
   const onDefer = (r) => { reason = r; };
-  const delivery = await liveTransport(to, target, text, socketFor(to), paneDeferral, beforeSend, onDefer);
+  const delivery = await liveTransport(to, entry, target, text, socketFor(to), paneDeferral, beforeSend, onDefer, deps);
   return delivery === 'deferred' ? { mode: 'deferred', reason } : { mode: 'live' };
 }
 
-// Today's only live transport: paste into the pane, gated by paneDeferral so it
-// can never land in the middle of a half-typed prompt. The swap point for a live
-// Claude session to instead use Claude Code's SendMessage socket (deferred past
-// Phase 1 — see the spec's "Claude Code cross-session messaging" section); that
-// swap would make the gate unnecessary for Claude, since a socket message does
-// not go through the composer at all.
-function liveTransport(id, tmux, text, socket, paneDeferral, beforeSend, onDefer) {
+async function wakeDormant(to, entry, deps) {
+  const { sessionManager, tmuxFor } = deps;
+  let dir = await resolveResumeDir(entry.liveSessionId || to, { entryCwd: entry.cwd });
+  if (!dir || !fs.existsSync(dir)) {
+    try { fs.mkdirSync(dir, { recursive: true }); } catch { dir = os.homedir(); }
+  }
+  const fresh = sessionManager.entryFor(to);
+  if (!fresh || fresh.archivedAt) return { mode: 'skip' };
+  if (fresh.snooze) return { mode: 'deferred', reason: 'snoozed, not waking' };
+  if (tmuxFor(to)) return { mode: 'deferred', reason: 'woken by another resume, delivering next sweep' };
+  try {
+    await sessionManager.resume(to, dir, { reason: 'mail', automatic: true });
+  } catch (err) {
+    const now = sessionManager.entryFor(to);
+    if (now?.archivedAt) return { mode: 'skip' };
+    if (now?.snooze) return { mode: 'deferred', reason: 'snoozed, not waking' };
+    throw err;
+  }
+  return { mode: 'deferred', reason: 'woken dormant session, delivering next sweep' };
+}
+
+// A live Claude session gets the notification over its cross-session socket: the
+// session reads it between tool calls or starts a turn when idle, and it never
+// touches the composer, so a half-typed draft is safe. Codex, a session with no
+// socket, or a failed send falls back to the pane paste, gated by paneDeferral so
+// it can never land in the middle of a prompt. beforeSend (the MCP-ready wait
+// after a relaunch) runs before either.
+async function liveTransport(id, entry, tmux, text, socket, paneDeferral, beforeSend, onDefer, deps) {
+  if (adapterFor(entry.agent).terminal.socketMail) {
+    const target = (deps.findSocket ?? defaultFindSocket)(entry.liveSessionId || id);
+    if (target) {
+      try {
+        await beforeSend();
+        // Claude suppresses identical peer content even after a successful
+        // socket write. Give each notification fresh content, including when
+        // successive batches have the same unread count. Keep pane text intact.
+        await (deps.sendSocket ?? defaultSendSocket)(target, `${text}\n[Notification: ${crypto.randomUUID()}]`);
+        return 'sent';
+      } catch { /* fall back to the paste below */ }
+    }
+  }
+  // Codex accepts guidance during a turn, but the paste still needs clear input
+  // and no dialog. Claude's paste fallback continues to wait until idle.
   return paneDeferral.deliverOrDefer({
-    id, text, tmux, socket, deferWhileWorking: true, queueOnDefer: false, beforeSend, onDefer,
+    id, text, tmux, socket, deferWhileWorking: true, allowWhileWorking: adapterFor(entry.agent).terminal.allowWhileWorking, queueOnDefer: false, beforeSend, onDefer,
   });
 }
 

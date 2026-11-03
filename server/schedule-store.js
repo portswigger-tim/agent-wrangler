@@ -50,7 +50,7 @@ function validateAction(action, { isCron }) {
     // client's {type:'error'}. Only reached from create/update — `_load` maps
     // stored rows through migrateStored alone, so an already-persisted legacy
     // value can never break startup.
-    const badTarget = launchTargetError(d.agent || 'claude', d.model);
+    const badTarget = launchTargetError(d.agent ?? 'claude', d.model);
     if (badTarget) throw new Error(badTarget);
     if (isCron && d.worktree && !d.workflow) d.worktreeAuto = true;
     return { kind: 'dispatch', dispatch: d };
@@ -59,7 +59,7 @@ function validateAction(action, { isCron }) {
     const sessionId = String(a.sessionId || '').trim();
     if (!sessionId) throw new Error('A session schedule needs a target session.');
     const message = typeof a.message === 'string' ? a.message.trim() : '';
-    return { kind: 'session', sessionId, message };
+    return { kind: 'session', sessionId, message, ...(a.focus === true ? { focus: true } : {}) };
   }
   throw new Error(`Unknown schedule action: ${a.kind}`);
 }

@@ -38,6 +38,35 @@ test('claude: isMeta and synthetic user turns are dropped', () => {
   assert.deepEqual(scanChatText(text, 'claude').events, []);
 });
 
+test('claude: an api-request-blob is a copy of the request, not a turn, so its reminders never draw', () => {
+  const blob = { type: 'api-request-blob', sessionId: 's', hash: 'h', message: { role: 'user', content: [
+    { type: 'text', text: '<system-reminder>\nContents of MEMORY.md …\n</system-reminder>' },
+    { type: 'text', text: 'why two keys?' },
+  ] } };
+  const text = claudeLines(
+    { type: 'user', timestamp: '2026-08-14T10:00:00.000Z', message: { role: 'user', content: 'why two keys?' } },
+    blob,
+  );
+  assert.equal(mightCarryChat(JSON.stringify(blob), 'claude'), false);
+  assert.deepEqual(scanChatText(text, 'claude').events.map((e) => e.text), ['why two keys?']);
+  // The parsed-entry check catches it even when `type` is not the first key.
+  const { type, ...rest } = blob;
+  assert.deepEqual(scanChatText(JSON.stringify({ ...rest, type }), 'claude').events, []);
+});
+
+test('claude: a compact summary becomes a collapsed context event, not a user bubble', () => {
+  const summary = 'This session is being continued from a previous conversation that ran out of context.';
+  const { events } = scanChatText(claudeLines(
+    { type: 'system', subtype: 'compact_boundary', content: 'Conversation compacted', timestamp: '2026-08-14T10:00:00.000Z' },
+    { type: 'user', isCompactSummary: true, isVisibleInTranscriptOnly: true, timestamp: '2026-08-14T10:00:01.000Z', message: { role: 'user', content: summary } },
+    { type: 'user', timestamp: '2026-08-14T10:00:02.000Z', message: { role: 'user', content: 'carry on' } },
+  ), 'claude');
+  assert.deepEqual(events, [
+    { kind: 'context', label: 'Conversation compacted', text: summary, ts: Date.parse('2026-08-14T10:00:01.000Z') },
+    { kind: 'user', text: 'carry on', ts: Date.parse('2026-08-14T10:00:02.000Z') },
+  ]);
+});
+
 test('a half-written trailing line is ignored, not thrown on', () => {
   const text = '{"type":"user","timestamp":"2026-08-14T10:00:00.000Z","message":{"role":"user","content":"hi"}}\n{"type":"user","message":{"role":"user","content":"hi';
   assert.deepEqual(scanChatText(text, 'claude').events.map((e) => e.kind), ['user']);
@@ -362,6 +391,25 @@ test('a blank Claude thinking block (content redacted into signature) still emit
   assert.equal(think.durationMs, 5000, 'a duration is still derivable even when the text is redacted');
 });
 
+test("claude: thinking text is marked visible only when the line says thinkingDisplay 'updates'", () => {
+  const line = (display) => claudeLines({
+    type: 'assistant', timestamp: '2026-08-14T10:00:05.000Z', ...(display ? { thinkingDisplay: display } : {}),
+    message: { role: 'assistant', content: [{ type: 'thinking', thinking: 'Visible reasoning.', signature: 'sig' }] },
+  });
+  const think = (display) => scanChatText(line(display), 'claude').events.find((e) => e.kind === 'thinking');
+  assert.equal(think('updates').visible, true);
+  assert.ok(!('visible' in think('omitted')));
+  assert.ok(!('visible' in think(undefined)));
+});
+
+test("claude: blank thinking is never marked visible, even under 'updates'", () => {
+  const text = claudeLines({
+    type: 'assistant', timestamp: '2026-08-14T10:00:05.000Z', thinkingDisplay: 'updates',
+    message: { role: 'assistant', content: [{ type: 'thinking', thinking: '', signature: 'sig' }] },
+  });
+  assert.ok(!('visible' in scanChatText(text, 'claude').events.find((e) => e.kind === 'thinking')));
+});
+
 // --- recap (Claude Code's end-of-turn "※ recap:" line) ---
 
 test('a recap line becomes a recap event, split into summary and next step', () => {
@@ -681,6 +729,220 @@ test('claude: a parallel tool fan-out is NOT a rewind — the newest line and it
   assert.deepEqual(events.filter((e) => e.kind === 'tool').map((e) => e.output), ['out toolu_a', 'out toolu_b']);
 });
 
+test('claude: an interrupt marker sibling does not prune the typed prompt queued during a tool call', () => {
+  const lines = [
+    say(1, null, 'start'),
+    uses(2, 1, 'toolu_interrupt'),
+    say(3, 2, 'look at the screenshots'),
+    at(4, 3, { type: 'attachment', attachment: { type: 'image' } }),
+    result(5, 2, 'toolu_interrupt'),
+    say(6, 5, '[Request interrupted by user for tool use]'),
+    said(7, 6, 'continuing after the interruption'),
+    say(8, 7, 'the next real prompt'),
+    said(9, 8, 'the next reply'),
+  ];
+  const { events } = scanChatText(claudeLines(...lines), 'claude');
+  assert.deepEqual(events.map((e) => e.text ?? e.name), [
+    'start', 'look at the screenshots', 'Bash',
+    '[Request interrupted by user for tool use]', 'continuing after the interruption',
+    'the next real prompt', 'the next reply',
+  ]);
+  const scanner = createChatScanner('claude');
+  for (const line of lines) scanner.pushTagged(JSON.stringify(line));
+  assert.equal(scanner.takeRewound(), false);
+});
+
+test('claude: multiple prompts queued before an interrupt stay live without rewinding', () => {
+  const lines = [
+    say(1, null, 'start'),
+    uses(2, 1, 'toolu_interrupt'),
+    say(3, 2, 'first queued prompt'),
+    say(4, 2, 'second queued prompt'),
+    result(5, 2, 'toolu_interrupt'),
+    say(6, 5, '[Request interrupted by user for tool use]'),
+    said(7, 6, 'continuing after the interruption'),
+  ];
+  const { events } = scanChatText(claudeLines(...lines), 'claude');
+  assert.deepEqual(events.map((e) => e.text ?? e.name), [
+    'start', 'first queued prompt', 'second queued prompt', 'Bash',
+    '[Request interrupted by user for tool use]', 'continuing after the interruption',
+  ]);
+  const scanner = createChatScanner('claude');
+  for (const line of lines) {
+    scanner.pushTagged(JSON.stringify(line));
+    assert.equal(scanner.takeRewound(), false);
+  }
+});
+
+test('claude: an interrupt marker on the tool result line does not rewind', () => {
+  const lines = [
+    say(1, null, 'start'),
+    uses(2, 1, 'toolu_interrupt'),
+    say(3, 2, 'queued prompt'),
+    at(4, 2, {
+      type: 'user',
+      timestamp: '2026-08-27T09:00:03.000Z',
+      message: { role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 'toolu_interrupt', content: 'out toolu_interrupt' },
+        { type: 'text', text: '[Request interrupted by user for tool use]' },
+      ] },
+    }),
+    said(5, 4, 'continuing after the interruption'),
+  ];
+  const { events } = scanChatText(claudeLines(...lines), 'claude');
+  assert.deepEqual(events.map((e) => e.text ?? e.name), [
+    'start', 'queued prompt', 'Bash', '[Request interrupted by user for tool use]',
+    'continuing after the interruption',
+  ]);
+  const scanner = createChatScanner('claude');
+  for (const line of lines) {
+    scanner.pushTagged(JSON.stringify(line));
+    assert.equal(scanner.takeRewound(), false);
+  }
+});
+
+test('claude: multiple prompts queued before a tool result stay live', () => {
+  const lines = [
+    say(1, null, 'start'),
+    uses(2, 1, 'toolu_interrupt'),
+    say(3, 2, 'first queued prompt'),
+    say(4, 2, 'second queued prompt'),
+    result(5, 2, 'toolu_interrupt'),
+    said(6, 5, 'tool finished'),
+  ];
+  const { events } = scanChatText(claudeLines(...lines), 'claude');
+  assert.deepEqual(events.map((e) => e.text ?? e.name), [
+    'start', 'first queued prompt', 'second queued prompt', 'Bash', 'tool finished',
+  ]);
+  const scanner = createChatScanner('claude');
+  for (const line of lines) {
+    scanner.pushTagged(JSON.stringify(line));
+    assert.equal(scanner.takeRewound(), false);
+  }
+});
+
+test('claude: multiple prompts below a running tool stay live before its result', () => {
+  const lines = [
+    say(1, null, 'start'),
+    uses(2, 1, 'toolu_running'),
+    say(3, 2, 'first queued prompt'),
+    say(4, 2, 'second queued prompt'),
+  ];
+  const { events } = scanChatText(claudeLines(...lines), 'claude');
+  assert.deepEqual(events.map((e) => e.text ?? e.name), [
+    'start', 'first queued prompt', 'second queued prompt',
+  ]);
+  const scanner = createChatScanner('claude');
+  for (const line of lines) {
+    scanner.pushTagged(JSON.stringify(line));
+    assert.equal(scanner.takeRewound(), false);
+  }
+});
+
+test('claude: an edit below a tool use without a result is still a rewind', () => {
+  const lines = [
+    say(1, null, 'start'),
+    uses(2, 1, 'toolu_orphan'),
+    say(3, 2, 'first prompt'),
+    said(4, 3, 'first reply'),
+    say(5, 2, 'edited prompt'),
+    said(6, 5, 'edited reply'),
+  ];
+  const { events } = scanChatText(claudeLines(...lines), 'claude');
+  assert.deepEqual(events.map((e) => e.text ?? e.name), [
+    'start', 'edited prompt', 'edited reply',
+  ]);
+  const scanner = createChatScanner('claude');
+  for (const line of lines) scanner.pushTagged(JSON.stringify(line));
+  assert.equal(scanner.takeRewound(), true);
+});
+
+test('claude: a tool-only reply below an orphaned tool use still marks an edit as a rewind', () => {
+  const lines = [
+    say(1, null, 'start'),
+    uses(2, 1, 'toolu_orphan'),
+    say(3, 2, 'first prompt'),
+    uses(4, 3, 'toolu_nested'),
+    result(5, 4, 'toolu_nested'),
+    say(6, 2, 'edited prompt'),
+    said(7, 6, 'edited reply'),
+  ];
+  const { events } = scanChatText(claudeLines(...lines), 'claude');
+  assert.deepEqual(events.map((e) => e.text ?? e.name), [
+    'start', 'edited prompt', 'edited reply',
+  ]);
+  const scanner = createChatScanner('claude');
+  for (const line of lines) scanner.pushTagged(JSON.stringify(line));
+  assert.equal(scanner.takeRewound(), true);
+});
+
+test('claude: rewinding to a queued prompt prunes both interrupted branches', () => {
+  const lines = [
+    say(1, null, 'start'),
+    uses(2, 1, 'toolu_interrupt'),
+    say(3, 2, 'look at the screenshots'),
+    at(4, 3, { type: 'attachment', attachment: { type: 'image' } }),
+    result(5, 2, 'toolu_interrupt'),
+    say(6, 5, '[Request interrupted by user for tool use]'),
+    said(7, 6, 'continuing after the interruption'),
+    say(8, 7, 'the next real prompt'),
+    said(9, 8, 'the next reply'),
+    say(10, 2, 'look at the screenshots again'),
+    said(11, 10, 'reply to the edited prompt'),
+  ];
+  const { events } = scanChatText(claudeLines(...lines), 'claude');
+  assert.deepEqual(events.map((e) => e.text ?? e.name), [
+    'start', 'look at the screenshots again', 'reply to the edited prompt',
+  ]);
+  const scanner = createChatScanner('claude');
+  for (const line of lines) scanner.pushTagged(JSON.stringify(line));
+  assert.equal(scanner.takeRewound(), true);
+});
+
+test('claude: rewinding after an interruption keeps the queued prompt', () => {
+  const lines = [
+    say(1, null, 'start'),
+    uses(2, 1, 'toolu_interrupt'),
+    say(3, 2, 'look at the screenshots'),
+    at(4, 3, { type: 'attachment', attachment: { type: 'image' } }),
+    result(5, 2, 'toolu_interrupt'),
+    say(6, 5, '[Request interrupted by user for tool use]'),
+    said(7, 6, 'continuing after the interruption'),
+    say(8, 7, 'the next real prompt'),
+    said(9, 8, 'the next reply'),
+    say(10, 7, 'the edited next prompt'),
+    said(11, 10, 'reply to the edited next prompt'),
+  ];
+  const { events } = scanChatText(claudeLines(...lines), 'claude');
+  assert.deepEqual(events.map((e) => e.text ?? e.name), [
+    'start', 'look at the screenshots', 'Bash', '[Request interrupted by user for tool use]',
+    'continuing after the interruption', 'the edited next prompt', 'reply to the edited next prompt',
+  ]);
+  const scanner = createChatScanner('claude');
+  for (const line of lines) scanner.pushTagged(JSON.stringify(line));
+  assert.equal(scanner.takeRewound(), true);
+});
+
+test('claude: editing a queued prompt without an interrupt marker reports a rewind', () => {
+  const lines = [
+    say(1, null, 'start'),
+    uses(2, 1, 'toolu_interrupt'),
+    say(3, 2, 'look at the screenshots'),
+    at(4, 3, { type: 'attachment', attachment: { type: 'image' } }),
+    result(5, 2, 'toolu_interrupt'),
+    said(6, 5, 'tool finished'),
+    say(7, 2, 'look at the screenshots again'),
+    said(8, 7, 'reply to the edited prompt'),
+  ];
+  const { events } = scanChatText(claudeLines(...lines), 'claude');
+  assert.deepEqual(events.map((e) => e.text ?? e.name), [
+    'start', 'Bash', 'tool finished', 'look at the screenshots again', 'reply to the edited prompt',
+  ]);
+  const scanner = createChatScanner('claude');
+  for (const line of lines) scanner.pushTagged(JSON.stringify(line));
+  assert.equal(scanner.takeRewound(), true);
+});
+
 test('claude: a compact_boundary root continues the conversation instead of replacing it', () => {
   // /compact starts a second root, same as a rewind-to-the-very-start does. Letting
   // it compete hid 2104 pre-compact messages of a real session.
@@ -836,6 +1098,41 @@ test('codex: injected role:user wrappers are dropped rather than shown as human 
   );
 });
 
+test('codex: a goal-continuation prompt becomes a collapsed context event, not a user bubble', () => {
+  const text = '<codex_internal_context source="goal">\nContinue working toward the active thread goal.\n</codex_internal_context>';
+  const { events } = scanChatText(codexLines({
+    type: 'response_item', timestamp: '2026-09-06T10:00:00.000Z',
+    payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
+  }), 'codex');
+  assert.equal(events.length, 1);
+  assert.equal(events[0].kind, 'context');
+  assert.equal(events[0].label, 'Codex goal');
+  assert.equal(events[0].text, text);
+});
+
+test('codex: a human message merely starting with the context tag stays a user turn', () => {
+  const say = (text, ts) => ({
+    type: 'response_item', timestamp: ts,
+    payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
+  });
+  const open = '<codex_internal_context source="goal">\nWhy is this shown?';
+  const wrapped = '<codex_internal_context source="goal">\nx\n</codex_internal_context>\nExplain this XML';
+  const { events } = scanChatText(codexLines(
+    say(open, '2026-09-06T10:00:00.000Z'),
+    say(wrapped, '2026-09-06T10:00:01.000Z'),
+  ), 'codex');
+  assert.deepEqual(events.map((e) => e.kind), ['user', 'user']);
+});
+
+test('codex: a context event advances lastTs so later reasoning durations are not inflated', () => {
+  const scanner = createChatScanner('codex');
+  const text = '<codex_internal_context source="goal">\nx\n</codex_internal_context>';
+  scanner.push(JSON.stringify({
+    type: 'response_item', timestamp: '2026-09-06T10:00:00.000Z',
+    payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
+  }));
+  assert.equal(scanner.lastTs(), Date.parse('2026-09-06T10:00:00.000Z'));
+});
 
 test('codex: an apply_patch arriving as a custom_tool_call still reports its +/- counts', () => {
   // apply_patch uses the custom-tool shape, with the whole diff as raw `input`
@@ -939,4 +1236,34 @@ test('claude: a queued prompt that is not text is dropped rather than throwing',
 test('claude: a queued slash command stays in the pane, like a typed one', () => {
   const line = claudeLines(queued('<command-name>/compact</command-name>'));
   assert.deepEqual(scanChatText(line, 'claude').events, []);
+});
+
+test('claude: a !command is rebuilt as the typed text and its output is dropped', () => {
+  const text = claudeLines(
+    { type: 'user', timestamp: '2026-08-14T10:00:00.000Z', message: { role: 'user', content: '<bash-input>echo hi</bash-input>' } },
+    { type: 'user', timestamp: '2026-08-14T10:00:01.000Z', message: { role: 'user', content: '<bash-stdout>hi</bash-stdout><bash-stderr></bash-stderr>' } },
+  );
+  assert.deepEqual(scanChatText(text, 'claude').events.map((e) => [e.kind, e.text]), [['user', '!echo hi']]);
+});
+
+test('codex: a !command is rebuilt as the typed text', () => {
+  const text = codexLines(
+    { type: 'response_item', timestamp: '2026-08-14T10:00:01.000Z', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<user_shell_command>\n<command>\necho hi\n</command>\n<result>\nExit code: 0\nOutput:\nhi\n\n</result>\n</user_shell_command>' }] } },
+  );
+  assert.deepEqual(scanChatText(text, 'codex').events.map((e) => [e.kind, e.text]), [['user', '!echo hi']]);
+});
+
+test('claude: a queued !command is not drawn twice when its turn arrives', () => {
+  const text = claudeLines(
+    { type: 'attachment', timestamp: '2026-08-14T10:00:00.000Z', attachment: { type: 'queued_command', commandMode: 'prompt', prompt: '!echo hi' } },
+    { type: 'user', timestamp: '2026-08-14T10:00:05.000Z', message: { role: 'user', content: '<bash-input>echo hi</bash-input>' } },
+  );
+  assert.deepEqual(scanChatText(text, 'claude').events.map((e) => e.text), ['!echo hi']);
+});
+
+test('claude: a !command containing its own closing tag is rebuilt whole', () => {
+  const text = claudeLines(
+    { type: 'user', timestamp: '2026-08-14T10:00:00.000Z', message: { role: 'user', content: "<bash-input>printf '</bash-input>'</bash-input>" } },
+  );
+  assert.deepEqual(scanChatText(text, 'claude').events.map((e) => e.text), ["!printf '</bash-input>'"]);
 });

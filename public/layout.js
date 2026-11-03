@@ -3,7 +3,7 @@
 // grid. Kept dependency-light (only snooze.js's tileWeight) and free of DOM/board state so it can be unit-tested —
 // the phase-dependent sorts take an injected `phaseOf(session)` predicate rather
 // than reaching for Date.now(), matching how snooze.js keeps `now` explicit.
-import { tileWeight } from './snooze.js';
+import { tileWeight, listedAsleep } from './snooze.js';
 
 // A nested child session (a workflow worker, or any other spawn absorbed into a
 // parent's spine — see workflow.js computeAbsorption) renders as a compact
@@ -58,9 +58,9 @@ export const SUBAGENT_ZONE_BASE_PX = 4;   // margin-top(12) + margin-bottom(-2) 
 // module stays untouched (multiply back to px, add the rest, divide back to units).
 export function tileWeightWithBody({
   activeCount, snoozedCount, cardStride, bodyPx = 0, childRowCount = 0,
-  workflowBoxCount = 0, subagentRowCount = 0, subagentZoneCount = 0, childFullViewCount = 0,
+  workflowBoxCount = 0, subagentRowCount = 0, subagentZoneCount = 0, childFullViewCount = 0, snoozedCollapsed = false,
 }) {
-  const px = tileWeight({ activeCount, snoozedCount, cardStride }) * cardStride
+  const px = tileWeight({ activeCount, snoozedCount, cardStride, snoozedCollapsed }) * cardStride
     + bodyPx
     + childRowCount * CHILD_STRIDE_PX
     // A full-view child draws as a real card, so it costs a whole cardStride,
@@ -167,6 +167,7 @@ export function perRowForRows(clientHeight, rows) {
 // stays DOM-free and testable with canned {rows, scroll} results.
 export function refinePerRow(perRow, packFor, clientHeight) {
   let canonical = packFor(perRow);
+  if (canonical.cols === 1) return { perRow, canonical };
   for (let i = 0; i < MAX_FIT_ROWS && canonical.rows > MAX_ONSCREEN_ROWS; i++) {
     const refined = perRowForRows(clientHeight, canonical.rows);
     if (refined >= perRow) break;
@@ -220,6 +221,14 @@ export function rowSpan(sessionCount, perRow) {
 // columnsForWidth(#grid) so a narrow grid stacks into fewer (down to one) full-width
 // columns instead of splitting into unreadably narrow ones.
 export function computeLayout(tiles, maxCols = MAX_COLS) {
+  if (maxCols <= 1) {
+    return {
+      placed: tiles.map((tile, rowStart) => ({ ...tile, col: 0, rowStart, span: 1 })),
+      cols: 1,
+      rows: Math.max(tiles.length, 1),
+      scroll: tiles.length > MAX_FIT_ROWS,
+    };
+  }
   const total = tiles.reduce((a, t) => a + t.span, 0);
   const maxSpan = Math.max(1, ...tiles.map((t) => t.span));
   const pack = (cols) => {
@@ -451,13 +460,14 @@ export function expandFocusToMinimised(orderIds, focusedId) {
 // content like the rest: part of the capped bucket.
 export function tileSpan(
   sessions, perRow, bodyPx = 0, phaseOf, childRowCount = 0, absorbedChildCount = childRowCount, workflowBoxCount = 0,
-  subagentRowCount = 0, subagentZoneCount = 0, childFullViewCount = 0,
+  subagentRowCount = 0, subagentZoneCount = 0, childFullViewCount = 0, snoozedCollapsed = false,
 ) {
-  const snoozedCount = sessions.filter((s) => phaseOf(s) === 'asleep').length;
-  const topLevelActiveCount = sessions.length - snoozedCount - absorbedChildCount;
+  const snoozedCount = listedAsleep(sessions, phaseOf).length;
+  const asleepCount = sessions.filter((s) => phaseOf(s) === 'asleep').length;
+  const topLevelActiveCount = sessions.length - asleepCount - absorbedChildCount;
   const totalWeight = tileWeightWithBody({
     activeCount: topLevelActiveCount, snoozedCount, cardStride: CARD_STRIDE_PX, bodyPx, childRowCount, workflowBoxCount,
-    subagentRowCount, subagentZoneCount, childFullViewCount,
+    subagentRowCount, subagentZoneCount, childFullViewCount, snoozedCollapsed,
   });
   const uncappedCount = topLevelActiveCount + childFullViewCount;
   const secondaryWeight = Math.min(totalWeight - uncappedCount, perRow);

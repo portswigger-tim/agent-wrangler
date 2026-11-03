@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { DATA_DIR } from './data-dir.js';
@@ -24,9 +25,12 @@ export const ADHOC = 'adhoc';
 // Board TODOs used to live here as `todos`; the builtin todos extension owns
 // them now (todos.json). DECISION: the raw `todos` value read from the file is
 // kept as an opaque pass-through (`_legacyTodos`) and written back unchanged,
-// never read or mutated. A downgrade within a release still finds them, and a
-// migration that failed (the extension retries every boot until todos.json is
-// marked migrated) still has its source. Remove once that window has passed.
+// never read or mutated, until the extension's migration moves it out of the
+// file: once a save finds the file no longer has `todos`, the pass-through is
+// dropped so a stale in-memory copy never resurrects it. A migration that
+// failed (the extension retries every boot until todos.json is marked
+// migrated) leaves the key in place as its source. Remove this pass-through
+// once the migration has shipped for a release.
 export class TaskStore {
   constructor(file = TASKS_FILE) {
     this.file = file;
@@ -69,7 +73,17 @@ export class TaskStore {
     if (raw.todos !== undefined) this._legacyTodos = raw.todos;
   }
 
+  _legacyTodosMoved() {
+    try {
+      const onDisk = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+      return onDisk && typeof onDisk === 'object' && !('todos' in onDisk);
+    } catch {
+      return false;
+    }
+  }
+
   _save() {
+    if (this._legacyTodos !== undefined && this._legacyTodosMoved()) this._legacyTodos = undefined;
     writeJsonAtomic(this.file, {
       tasks: this.tasks,
       order: this.order,
@@ -288,18 +302,16 @@ export class TaskStore {
     return true;
   }
 
-  // Drag-and-drop reorder over the combined `order` (tasks + the ADHOC sentinel):
-  // dropping `id` onto `targetId` SWAPS their two positions. Swap (not insert)
-  // because the tiles are column-packed in 2-D — exchanging two tiles keeps the
-  // columns balanced and matches the gesture, whereas a linear insert would pull
-  // a tile across columns and unbalance them. `id`/`targetId` may be the ADHOC
-  // sentinel. Returns false on no-op / unknown.
-  reorderTask(id, targetId) {
+  reorderTask(id, targetId, { move = false, after = false } = {}) {
     if (!targetId || id === targetId) return false;
     const i = this.order.indexOf(id);
     const j = this.order.indexOf(targetId);
     if (i < 0 || j < 0) return false;
-    [this.order[i], this.order[j]] = [this.order[j], this.order[i]];
+    if (move) {
+      this.order.splice(i, 1);
+      const target = this.order.indexOf(targetId);
+      this.order.splice(target + (after ? 1 : 0), 0, id);
+    } else [this.order[i], this.order[j]] = [this.order[j], this.order[i]];
     this._save();
     return true;
   }

@@ -78,21 +78,8 @@ test('parentSession passes through when given, and is undefined when absent', as
   assert.equal(d2.calls.dispatch[0].parentSession, undefined);
 });
 
-// Nesting only ever renders one level deep (see attachError's file comment in
-// server/control/handlers/attach.js) — this guard keeps that true regardless
-// of which path sets a brand-new parentSession (peer-review dispatch,
-// spawn_session nest:true, a scheduled dispatch), not just Attach.
-test('parentSession pointing at an already-nested session is refused before launch', async () => {
+test('parentSession pointing at an already-nested session is allowed (nesting has no depth limit)', async () => {
   const d = deps({ entries: { SRC1: { parentSession: 'ROOT' } } });
-  await assert.rejects(
-    () => runDispatch({ cwd: '/repo', intent: 'x', parentSession: 'SRC1' }, d),
-    /itself nested/,
-  );
-  assert.equal(d.calls.dispatch.length, 0);
-});
-
-test('parentSession pointing at a top-level session is allowed', async () => {
-  const d = deps({ entries: { SRC1: {} } });
   await runDispatch({ cwd: '/repo', intent: 'x', parentSession: 'SRC1' }, d);
   assert.equal(d.calls.dispatch[0].parentSession, 'SRC1');
 });
@@ -153,4 +140,81 @@ test('an ext bag passes through to sessionManager.dispatch; a non-object is drop
   await runDispatch({ cwd: '/repo', intent: 'x', ext: ['nope'] }, d);
   assert.deepEqual(d.calls.dispatch[0].ext, { a: { usd: 5 } });
   assert.equal(d.calls.dispatch[1].ext, undefined);
+});
+
+test('images in the intent: launch defers the intent, claims the staged files, and pastes images then prose', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const { STAGED_PASTES_DIR } = await import('./paste-store.js');
+  fs.mkdirSync(STAGED_PASTES_DIR, { recursive: true });
+  fs.writeFileSync(path.join(STAGED_PASTES_DIR, 'paste-1-aaaa.png'), 'x');
+  const delivered = [];
+  const d = deps({ deliverFirstPrompt: async (args) => { delivered.push(args); } });
+  d.sessionManager.dispatch = async (opts) => { d.calls.dispatch.push(opts); return { sessionId: 'IMGCARD', tmux: 'cc_img' }; };
+  const { firstPrompt } = await runDispatch({ cwd: '/repo', intent: 'what is this?', imageNames: ['paste-1-aaaa.png', '../../etc/passwd', 'paste-2-bbbb.png'] }, d);
+  await firstPrompt;
+  assert.equal(d.calls.dispatch[0].intent, 'what is this?', 'the card still records the intent');
+  assert.equal(d.calls.dispatch[0].deferIntent, true);
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].tmux, 'cc_img');
+  assert.equal(delivered[0].text, 'what is this?');
+  assert.equal(delivered[0].imagePaths.length, 1, 'only the real staged file survives the name gate');
+  assert.equal(path.basename(delivered[0].imagePaths[0]), 'paste-1-aaaa.png');
+  assert.ok(fs.existsSync(delivered[0].imagePaths[0]), 'moved into the session pastes dir');
+  assert.ok(!fs.existsSync(path.join(STAGED_PASTES_DIR, 'paste-1-aaaa.png')), 'and out of staging');
+});
+
+test('no images: the intent rides the launch as before and nothing is pasted', async () => {
+  const d = deps({ deliverFirstPrompt: async () => assert.fail('nothing to paste') });
+  const { firstPrompt } = await runDispatch({ cwd: '/repo', intent: 'x', imageNames: [] }, d);
+  assert.equal(firstPrompt, undefined);
+  assert.equal(d.calls.dispatch[0].deferIntent, undefined);
+});
+
+test('images in the intent need a local launch', async () => {
+  const d = deps();
+  await assert.rejects(runDispatch({ cwd: '/repo', intent: 'x', runtime: 'devcontainer', imageNames: ['paste-1-aaaa.png'] }, d), /local launch/);
+  assert.equal(d.calls.dispatch.length, 0);
+});
+
+test('deliverFirstPrompt waits for the composer, pastes each image alone, then sends the prose once', async () => {
+  const { deliverFirstPrompt } = await import('./dispatch-runner.js');
+  const steps = [];
+  await deliverFirstPrompt({ tmux: 'cc_x', socket: 's', agent: 'claude', text: 'hi', imagePaths: ['/p/1.png', '/p/2.png'] }, {
+    waitReady: async (t, s, a) => steps.push(['ready', t, s, a]),
+    paste: async (t, s, a, paths) => { steps.push(['paste', a, ...paths]); return true; },
+    send: async (t, text) => steps.push(['send', text]),
+    confirm: async () => true,
+    log: (m) => steps.push(['log', m]),
+  });
+  assert.deepEqual(steps, [['ready', 'cc_x', 's', 'claude'], ['paste', 'claude', '/p/1.png', '/p/2.png'], ['send', 'hi']]);
+  const logs = [];
+  await deliverFirstPrompt({ tmux: 'cc_y', agent: 'claude', text: 'hi', imagePaths: [] }, { waitReady: async () => { throw new Error('gone'); }, log: (m) => logs.push(m) });
+  assert.match(logs[0], /could not deliver/);
+});
+
+// The stray `[Image #2]` bug: a 4 MB screenshot took Claude Code ~1.6s to attach,
+// so the prose and Enter went first and the marker was left unsent behind them.
+test('deliverFirstPrompt sends the prose only after the composer shows the image marker', async () => {
+  const { deliverFirstPrompt } = await import('./dispatch-runner.js');
+  const { pasteImages } = await import('./pane-ready.js');
+  let composer = '❯ ';
+  let captures = 0;
+  const steps = [];
+  await deliverFirstPrompt({ tmux: 'cc_x', agent: 'claude', text: 'hi', imagePaths: ['/p/big.png'] }, {
+    waitReady: async () => true,
+    paste: (t, s, a, paths) => pasteImages(t, s, a, paths, {
+      prefill: async (n, p) => { steps.push(['prefill', p]); composer = '❯ \n  Pasting…'; },
+      // The marker turns up a few polls after the paste, as it does live.
+      capture: async () => { captures += 1; if (captures === 5) composer = '❯ [Image #1]'; return composer; },
+      sleep: async () => steps.push(['wait']),
+    }),
+    send: async (t, text) => steps.push(['send', text, composer]),
+    confirm: async () => true,
+    log: (m) => steps.push(['log', m]),
+  });
+  assert.deepEqual(steps.at(-1), ['send', 'hi', '❯ [Image #1]'], 'the prose is sent after the marker, not before');
+  assert.equal(steps.filter(([k]) => k === 'prefill').length, 1, 'the image is pasted exactly once');
+  assert.ok(steps.some(([k]) => k === 'wait'), 'and it waited for the attach');
+  assert.ok(!steps.some(([k]) => k === 'log'));
 });

@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  extensionSettingRowsEl, extensionsPanelEl, consentBodyEl, updateStatusText, progressText,
+  extensionSettingRowsEl, extensionsPanelEl, consentBodyEl, consentButtonLabels, updateStatusText, progressText,
   uninstallBodyText, TRANSIENT_PROGRESS_PHASES, TRUST_STATEMENT,
-  commitFocusedField, MAX_TEXTAREA_LENGTH,
+  commitFocusedField, focusedFieldState, restoreFocusedField, MAX_TEXTAREA_LENGTH, BROWSE_NOTICE, normalizeRepoUrl, updatedAgoText, AUTO_UPDATE_WARNING,
 } from './extensions-panel.js';
 import { MAX_TEXTAREA_LENGTH as SERVER_MAX_TEXTAREA_LENGTH } from '../server/extensions/setting-constraints.js';
 
@@ -88,6 +88,8 @@ const BEHIND = { updatable: true, sha: 'a'.repeat(40), remoteSha: 'b'.repeat(40)
 const listIds = (node) => byClass(node, 'ext-list-row').map((r) => r.dataset.extId);
 const groupTitles = (node) => byClass(node, 'ext-group-title').map((n) => n._text);
 const detailOf = (node) => byClass(node, 'ext-detail')[0];
+// A panel with `entry` selected, as a click on its row leaves it.
+const showing = (entry, opts = {}) => extensionsPanelEl({ entries: [entry], selectedId: entry.id, ...opts });
 const buttonTexts = (node) => byClass(node, 'ext-btn').map((b) => b._text || texts(b).join(''));
 // The only innerHTML the panel writes is a static icon from icons.js.
 const assertNoThirdPartyHtml = (node) => {
@@ -136,9 +138,15 @@ test('the selected extension is highlighted and shown; clicking another selects 
     assert.ok(texts(detailOf(panel)).includes('One'));
     byClass(rows[0], 'ext-list-item')[0].fire('click');
     assert.deepEqual(picked, ['a']);
-    // Nothing (or something gone) selected falls back to the first entry.
-    const fallback = extensionsPanelEl({ entries: [BUILTIN_A, EXT1], selectedId: 'gone' });
-    assert.ok(byClass(fallback, 'ext-list-row')[0].classList.contains('selected'));
+    // Nothing (or something gone) selected shows the add pane and its browser,
+    // with + Add extension highlighted and no row.
+    for (const selectedId of ['', 'gone']) {
+      const fallback = extensionsPanelEl({ entries: [BUILTIN_A, EXT1], selectedId, browse: { repos: [] } });
+      assert.deepEqual(byClass(fallback, 'ext-list-row').map((r) => r.classList.contains('selected')), [false, false]);
+      assert.ok(byClass(fallback, 'ext-add-btn')[0].classList.contains('selected'));
+      assert.equal(byClass(detailOf(fallback), 'ext-install-url').length, 0, 'Browse GitHub is the default');
+      assert.equal(byClass(detailOf(fallback), 'ext-gh').length, 1);
+    }
   });
 });
 
@@ -190,13 +198,17 @@ test('Update all and a per-item update button appear only once a check found a n
     assert.deepEqual(seen, [['one', 'ext2'], ['all', ['ext2']]]);
     // A pending removal is past updating.
     assert.equal(byClass(extensionsPanelEl({ ...opts, statuses: { ext2: BEHIND }, pendingRemoval: ['ext2'] }), 'ext-btn-square').length, 0);
+    // So is one the server refused as needing a newer host API.
+    const refused = extensionsPanelEl({ ...opts, statuses: { ext2: { ...BEHIND, incompatible: 'Two requires a newer Agent Wrangler.' } } });
+    assert.equal(byClass(refused, 'ext-btn-square').length, 0);
+    assert.deepEqual(buttonTexts(byClass(refused, 'ext-group-head')[1]), ['Check all']);
   });
 });
 
 test('the detail header: name, description, the enable toggle settings.js drives, and Uninstall for external only', () => {
   withDom(() => {
     const removed = [];
-    const panel = extensionsPanelEl({ entries: [EXT1], onUninstall: (e) => removed.push(e.id) });
+    const panel = showing(EXT1, { onUninstall: (e) => removed.push(e.id) });
     const head = byClass(panel, 'ext-detail-head')[0];
     assert.equal(head.dataset.id, 'ext:ext1', 'settings.js\'s delegated flip handler finds the def by this id');
     assert.ok(head.classList.contains('setting-row'));
@@ -206,7 +218,7 @@ test('the detail header: name, description, the enable toggle settings.js drives
     assert.equal(uninstall._text, 'Uninstall…');
     uninstall.fire('click');
     assert.deepEqual(removed, ['ext1']);
-    const core = byClass(extensionsPanelEl({ entries: [BUILTIN_A] }), 'ext-detail-head')[0];
+    const core = byClass(showing(BUILTIN_A), 'ext-detail-head')[0];
     assert.equal(byClass(core, 'ext-btn-danger').length, 0);
     assert.ok(byClass(core, 'setting-toggle')[0]);
   });
@@ -214,18 +226,18 @@ test('the detail header: name, description, the enable toggle settings.js drives
 
 test('the Source section: type, repository with an https-only Open link, and short commit', () => {
   withDom(() => {
-    const detail = detailOf(extensionsPanelEl({ entries: [INSTALLED] }));
+    const detail = detailOf(showing(INSTALLED));
     const all = texts(detail);
     for (const t of ['Source', 'Type', 'Installed from git', 'Repository', 'https://example.invalid/notes.git', 'Commit', 'abcdef01']) assert.ok(all.includes(t), t);
     assert.equal(all.includes('A Colleague'), false, 'no author');
     const open = byClass(detail, 'ext-kv-open')[0];
     assert.equal(open.href, 'https://example.invalid/notes.git');
     for (const bad of ['http://example.invalid', 'ssh://git@example.invalid/x.git', 'javascript:alert(1)']) {
-      const d = detailOf(extensionsPanelEl({ entries: [{ ...INSTALLED, origin: bad }] }));
+      const d = detailOf(showing({ ...INSTALLED, origin: bad }));
       assert.equal(byClass(d, 'ext-kv-open').length, 0, bad);
       assert.ok(texts(d).includes(bad));
     }
-    const core = texts(detailOf(extensionsPanelEl({ entries: [BUILTIN_A] })));
+    const core = texts(detailOf(showing(BUILTIN_A)));
     assert.ok(core.includes('Core'));
     assert.equal(core.includes('Repository'), false);
     assert.equal(core.includes('Commit'), false);
@@ -234,7 +246,7 @@ test('the Source section: type, repository with an https-only Open link, and sho
 
 test('quarantine is stated plainly in the detail pane, and only via textContent', () => {
   withDom(() => {
-    const panel = extensionsPanelEl({ entries: [{ ...INSTALLED, quarantine: 'tool name "list_sessions" is already registered' }] });
+    const panel = showing({ ...INSTALLED, quarantine: 'tool name "list_sessions" is already registered' });
     assert.ok(texts(panel).includes('tool name "list_sessions" is already registered'));
     assert.equal(byClass(panel, 'ext-row-quarantine')[0].getAttribute('role'), 'status');
   });
@@ -251,7 +263,7 @@ test('hostile third-party strings are inert text, not markup', () => {
 
 test('an uninstalled extension says so in its detail, with nothing left to toggle or uninstall', () => {
   withDom(() => {
-    const detail = detailOf(extensionsPanelEl({ entries: [WITH_SETTINGS], pendingRemoval: ['notes'] }));
+    const detail = detailOf(showing(WITH_SETTINGS, { pendingRemoval: ['notes'] }));
     assert.ok(texts(detail).some((t) => /Uninstalled\. .*stays in memory until the wrangler restarts/.test(t)));
     assert.equal(byClass(detail, 'setting-toggle').length, 0);
     assert.equal(byClass(detail, 'ext-btn-danger').length, 0);
@@ -292,15 +304,15 @@ const WITH_SETTINGS = {
 test('the selected extension\'s settings render inline under Settings; none means no section', () => {
   withDom(() => {
     const seen = [];
-    const detail = detailOf(extensionsPanelEl({ entries: [WITH_SETTINGS], onSettingChange: (c) => seen.push(c) }));
+    const detail = detailOf(showing(WITH_SETTINGS, { onSettingChange: (c) => seen.push(c) }));
     assert.ok(texts(detail).includes('Settings'));
     assert.deepEqual(byClass(detail, 'ext-setting-row').map((r) => r.dataset.key), ['registryUrl', 'pollMs', 'auto']);
     byClass(detail, 'setting-toggle').at(-1).fire('click');
     assert.deepEqual(seen, [{ id: 'notes', key: 'auto', value: false }]);
-    assert.equal(texts(detailOf(extensionsPanelEl({ entries: [INSTALLED] }))).includes('Settings'), false);
+    assert.equal(texts(detailOf(showing(INSTALLED))).includes('Settings'), false);
     // Only hidden defs (a settings.panel manages them) is still nothing to draw.
     const hiddenOnly = { ...INSTALLED, settings: [{ key: 'k', type: 'text', label: 'K', hidden: true }] };
-    assert.equal(texts(detailOf(extensionsPanelEl({ entries: [hiddenOnly] }))).includes('Settings'), false);
+    assert.equal(texts(detailOf(showing(hiddenOnly))).includes('Settings'), false);
   });
 });
 
@@ -309,24 +321,183 @@ test('a caller-supplied settingsEl replaces the default rows, and null omits the
     const custom = document.createElement('div');
     custom.textContent = 'custom';
     const asked = [];
-    const panel = extensionsPanelEl({ entries: [INSTALLED], settingsEl: (e) => { asked.push(e.id); return custom; } });
+    const panel = showing(INSTALLED, { settingsEl: (e) => { asked.push(e.id); return custom; } });
     assert.deepEqual(asked, ['notes']);
     assert.ok(walk(detailOf(panel)).includes(custom));
-    assert.equal(texts(detailOf(extensionsPanelEl({ entries: [WITH_SETTINGS], settingsEl: () => null }))).includes('Settings'), false);
+    assert.equal(texts(detailOf(showing(WITH_SETTINGS, { settingsEl: () => null }))).includes('Settings'), false);
   });
 });
 
-test('+ Add extension opens the install form in the detail pane', () => {
+test('+ Add extension opens the add pane in the detail pane', () => {
   withDom(() => {
     let adds = 0;
-    const panel = extensionsPanelEl({ entries: [INSTALLED], onAdd: () => { adds += 1; } });
+    const panel = showing(INSTALLED, { onAdd: () => { adds += 1; } });
     assert.equal(byClass(panel, 'ext-install-url').length, 0);
     byClass(panel, 'ext-add-btn')[0].fire('click');
     assert.equal(adds, 1);
     const adding = extensionsPanelEl({ entries: [INSTALLED], adding: true });
-    assert.equal(byClass(detailOf(adding), 'ext-install-url').length, 1);
+    assert.equal(byClass(detailOf(adding), 'chat-seg').length, 1);
     assert.equal(byClass(adding, 'ext-list-row')[0].classList.contains('selected'), false);
   });
+});
+
+const REPO = {
+  fullName: 'someone/wrangler-thing', name: 'wrangler-thing', owner: 'someone',
+  avatarUrl: 'https://avatars.githubusercontent.com/u/1?v=4', description: '<b>Does a thing</b>',
+  cloneUrl: 'https://github.com/someone/wrangler-thing.git', htmlUrl: 'https://github.com/someone/wrangler-thing',
+  stars: 1234, language: 'JavaScript', pushedAt: '2026-10-05T00:00:00Z',
+};
+const MINE = { ...REPO, fullName: 'charlie/notes', name: 'notes', owner: 'charlie', cloneUrl: 'https://github.com/charlie/notes.git', htmlUrl: 'https://github.com/charlie/notes' };
+
+test('the add pane lists GitHub repos as cards under the unvetted notice', () => {
+  withDom(() => {
+    const installs = [];
+    const installed = { ...INSTALLED, origin: 'git@github.com:Charlie/notes.git' };
+    const panel = extensionsPanelEl({
+      entries: [installed], adding: true, browse: { repos: [MINE, REPO] }, onInstall: (u) => installs.push(u),
+    });
+    const notice = byClass(panel, 'ext-gh-notice')[0];
+    assert.ok(texts(notice).includes(` ${BROWSE_NOTICE}`));
+    const cards = byClass(panel, 'ext-gh-card');
+    // Installed ones sink to the bottom and offer no Install button.
+    assert.deepEqual(cards.map((c) => texts(byClass(c, 'ext-gh-name')[0])[0]), ['wrangler-thing', 'notes']);
+    assert.equal(cards[1].classList.contains('installed'), true);
+    assert.equal(byClass(cards[1], 'ext-btn').length, 0);
+    byClass(cards[0], 'ext-btn')[0].fire('click');
+    assert.deepEqual(installs, [REPO.cloneUrl]);
+    assert.ok(texts(cards[0]).includes('1.2k'));
+    assert.equal(walk(cards[0]).find((n) => n.tagName === 'IMG').src, `${REPO.avatarUrl}&s=80`);
+    assertNoThirdPartyHtml(panel);
+  });
+});
+
+test('the GitHub browser shows loading, error and empty states, and Refresh asks again', () => {
+  withDom(() => {
+    let browses = 0;
+    const loading = extensionsPanelEl({ entries: [INSTALLED], adding: true, browse: { loading: true }, onBrowse: () => { browses += 1; } });
+    assert.equal(byClass(loading, 'ext-gh-skeleton').length, 3);
+    assert.equal(byClass(loading, 'ext-gh-refresh')[0].disabled, true);
+    const failed = extensionsPanelEl({ entries: [INSTALLED], adding: true, browse: { error: 'rate limited', repos: [] }, onBrowse: () => { browses += 1; } });
+    assert.ok(texts(failed).includes('Could not search GitHub: rate limited'));
+    byClass(failed, 'ext-gh-refresh')[0].fire('click');
+    assert.equal(browses, 1);
+    const empty = extensionsPanelEl({ entries: [INSTALLED], adding: true, browse: { repos: [] } });
+    assert.ok(texts(empty).includes('Nothing tagged yet.'));
+    assert.equal(byClass(extensionsPanelEl({ entries: [INSTALLED], adding: true }), 'ext-gh').length, 0);
+  });
+});
+
+const OTHER = {
+  ...REPO, fullName: 'tidepool/cost-guard', name: 'cost-guard', owner: 'tidepool', description: 'Pauses a session over budget.',
+  cloneUrl: 'https://github.com/tidepool/cost-guard.git', htmlUrl: 'https://github.com/tidepool/cost-guard',
+};
+const shownNames = (node) => byClass(node, 'ext-gh-card').filter((c) => !c.hidden).map((c) => texts(byClass(c, 'ext-gh-name')[0])[0]);
+
+test('the add pane switches between Browse GitHub and Git URL, Browse by default', () => {
+  withDom(() => {
+    const modes = [];
+    const browse = { repos: [REPO] };
+    const panel = extensionsPanelEl({ entries: [], adding: true, browse, onAddMode: (m) => modes.push(m) });
+    const [browseBtn, urlBtn] = byClass(panel, 'chat-seg-btn');
+    assert.equal(browseBtn.getAttribute('aria-pressed'), 'true');
+    assert.equal(urlBtn.getAttribute('aria-pressed'), 'false');
+    assert.equal(byClass(panel, 'ext-gh').length, 1);
+    assert.equal(byClass(panel, 'ext-install-url').length, 0);
+    browseBtn.fire('click');
+    urlBtn.fire('click');
+    assert.deepEqual(modes, ['url'], 'only a switch to the other mode is reported');
+    const url = extensionsPanelEl({ entries: [], adding: true, browse, addMode: 'url' });
+    assert.ok(byClass(url, 'chat-seg-btn')[1].classList.contains('on'));
+    assert.equal(byClass(url, 'ext-gh').length, 0);
+    assert.equal(byClass(url, 'ext-install-url')[0].dataset.refocus, 'url');
+    assertNoThirdPartyHtml(url);
+  });
+});
+
+test('the browse search filters the fetched cards in place by name, owner or description', () => {
+  withDom(() => {
+    const queries = [];
+    const installed = { ...INSTALLED, origin: 'https://github.com/charlie/notes' };
+    const panel = extensionsPanelEl({
+      entries: [installed], adding: true, browse: { repos: [MINE, REPO, OTHER] }, onBrowseQuery: (q) => queries.push(q),
+    });
+    const search = byClass(panel, 'ext-gh-search-input')[0];
+    const meta = byClass(panel, 'ext-gh-search-meta')[0];
+    const noMatch = byClass(panel, 'ext-gh-no-match')[0];
+    assert.equal(search.dataset.refocus, 'gh-search');
+    assert.deepEqual(shownNames(panel), ['wrangler-thing', 'cost-guard', 'notes']);
+    assert.equal(meta.textContent, '');
+    assert.equal(noMatch.hidden, true);
+    const type = (v) => { search.value = v; search.fire('input'); };
+    type('COST');
+    assert.deepEqual(shownNames(panel), ['cost-guard'], 'by name, ignoring case');
+    assert.equal(meta.textContent, '1 of 3');
+    type(' charlie ');
+    assert.deepEqual(shownNames(panel), ['notes'], 'by owner; installed cards still filter');
+    type('budget');
+    assert.deepEqual(shownNames(panel), ['cost-guard'], 'by description');
+    type('nothing like this');
+    assert.deepEqual(shownNames(panel), []);
+    assert.equal(meta.textContent, '0 of 3');
+    assert.equal(noMatch.hidden, false);
+    assert.ok(texts(noMatch).includes('No tagged extension matches “nothing like this”.'));
+    type('');
+    assert.equal(shownNames(panel).length, 3);
+    assert.equal(noMatch.hidden, true);
+    assert.deepEqual(queries, ['COST', ' charlie ', 'budget', 'nothing like this', '']);
+    assertNoThirdPartyHtml(panel);
+  });
+});
+
+test('the browse search text comes back on a remount, and stays up through a Refresh', () => {
+  withDom(() => {
+    const again = extensionsPanelEl({ entries: [], adding: true, browse: { repos: [REPO, OTHER] }, browseQuery: 'tidepool' });
+    assert.equal(byClass(again, 'ext-gh-search-input')[0].value, 'tidepool');
+    assert.deepEqual(shownNames(again), ['cost-guard']);
+    assert.equal(byClass(again, 'ext-gh-search-meta')[0].textContent, '1 of 2');
+    const typed = [];
+    const refreshing = extensionsPanelEl({
+      entries: [], adding: true, browse: { loading: true, repos: [REPO] }, browseQuery: 'x', onBrowseQuery: (q) => typed.push(q),
+    });
+    const box = byClass(refreshing, 'ext-gh-search-input')[0];
+    assert.equal(box.value, 'x');
+    box.value = 'xy';
+    box.fire('input');
+    assert.deepEqual(typed, ['xy'], 'typing while Refresh is in flight is kept for the next remount');
+    assert.equal(byClass(refreshing, 'ext-gh-no-match').length, 0, 'no verdict on skeletons');
+    assert.equal(byClass(extensionsPanelEl({ entries: [], adding: true, browse: { repos: [] } }), 'ext-gh-search-input').length, 0);
+  });
+});
+
+test('focusedFieldState and restoreFocusedField put the caret back after a remount', () => {
+  const field = (key) => {
+    const f = { dataset: { refocus: key }, selectionStart: 2, selectionEnd: 4, focused: null, range: null };
+    f.focus = (opts) => { f.focused = opts; };
+    f.setSelectionRange = (a, b) => { f.range = [a, b]; };
+    return f;
+  };
+  const before = field('gh-search');
+  const host = { contains: (n) => n === before };
+  assert.deepEqual(focusedFieldState(host, { activeElement: before }), { key: 'gh-search', start: 2, end: 4 });
+  assert.equal(focusedFieldState(host, { activeElement: { dataset: {} } }), null, 'outside the host');
+  assert.equal(focusedFieldState({ contains: () => true }, { activeElement: { dataset: {} } }), null, 'not a refocus field');
+  const after = field('gh-search');
+  const remounted = { querySelector: (sel) => (sel === '[data-refocus="gh-search"]' ? after : null) };
+  restoreFocusedField(remounted, { key: 'gh-search', start: 2, end: 4 });
+  assert.deepEqual(after.focused, { preventScroll: true });
+  assert.deepEqual(after.range, [2, 4]);
+  restoreFocusedField(remounted, { key: 'url' });
+  restoreFocusedField(remounted, null);
+});
+
+test('normalizeRepoUrl and updatedAgoText', () => {
+  for (const u of ['https://github.com/A/b.git', 'git@github.com:a/B.git', 'ssh://git@github.com/a/b', 'https://github.com/a/b/']) {
+    assert.equal(normalizeRepoUrl(u), 'https://github.com/a/b');
+  }
+  const now = Date.parse('2026-10-08T00:00:00Z');
+  assert.equal(updatedAgoText('2026-10-05T00:00:00Z', now), 'Updated 3 days ago');
+  assert.equal(updatedAgoText('2026-10-07T23:00:00Z', now), 'Updated 1 hour ago');
+  assert.equal(updatedAgoText('nope', now), '');
 });
 
 test('a setting row carries data-ext/data-key and NO data-id — the collision guard', () => {
@@ -446,7 +617,7 @@ test('a finished update that waits on a restart says so above the detail pane', 
 test('the install field submits a trimmed URL on click and on Enter, and never an empty one', () => {
   withDom(() => {
     const urls = [];
-    const panel = extensionsPanelEl({ entries: [], onInstall: (u) => urls.push(u) });
+    const panel = extensionsPanelEl({ entries: [], addMode: 'url', onInstall: (u) => urls.push(u) });
     const input = byClass(panel, 'ext-install-url')[0];
     const go = byClass(panel, 'ext-btn-primary')[0];
     go.fire('click');
@@ -465,8 +636,8 @@ test('the install field submits a trimmed URL on click and on Enter, and never a
 
 test('the install button is disabled while an install is running', () => {
   withDom(() => {
-    assert.equal(byClass(extensionsPanelEl({ busy: true }), 'ext-btn-primary')[0].disabled, true);
-    assert.equal(byClass(extensionsPanelEl({ busy: false }), 'ext-btn-primary')[0].disabled, false);
+    assert.equal(byClass(extensionsPanelEl({ busy: true, addMode: 'url' }), 'ext-btn-primary')[0].disabled, true);
+    assert.equal(byClass(extensionsPanelEl({ busy: false, addMode: 'url' }), 'ext-btn-primary')[0].disabled, false);
   });
 });
 
@@ -532,15 +703,33 @@ test('an UPDATE renders capability and dependency DIFFS, not full lists', () => 
     assert.equal(all.includes('deep@2.0.0'), false, 'an unchanged dependency is not drawn');
     // 9 added and 3 removed, 1 of each listed ⇒ 10 transitive entries hidden.
     assert.ok(all.some((t) => /the 10 not listed are transitive/.test(t)));
-    assert.ok(all.includes('was aaaaaaaa'), 'the previous commit is named');
+    assert.ok(all.includes('aaaaaaaa') && all.includes('bbbbbbbb'), 'both commits are named');
+    // A widened update re-makes the consent, so the trust statement returns.
+    assert.ok(all.some((t) => /full access to this machine/.test(t)));
   });
 });
 
 test('an update that widens nothing says so rather than showing an empty diff', () => {
   withDom(() => {
     const all = texts(consentBodyEl({ id: 'x', label: 'X', update: true, reconsentNeeded: false, addedCapabilities: [], removedCapabilities: [], addedCount: 0, removedCount: 0 }));
-    assert.ok(all.includes('Capabilities unchanged'));
-    assert.ok(all.includes('Nothing changed.'));
+    assert.ok(all.includes('No new capabilities or dependencies.'));
+    assert.equal(all.includes('Capabilities changed'), false);
+    assert.equal(all.includes('Dependencies changed'), false);
+    assert.equal(all.some((t) => /full access to this machine/.test(t)), false, 'the trust statement is not repeated on a no-new-consent update');
+  });
+});
+
+test('an update lists the commits it brings in, and says when older ones are cut off', () => {
+  withDom(() => {
+    const all = texts(consentBodyEl({
+      id: 'x', label: 'X', update: true, reconsentNeeded: false,
+      commits: [{ sha: 'bbbbbbbb', subject: 'Fix the thing' }, { sha: 'cccccccc', subject: 'Add a tab' }],
+    }));
+    assert.ok(all.includes('2 new commits'));
+    assert.ok(all.includes('bbbbbbbb') && all.some((t) => /Fix the thing/.test(t)));
+    const cut = texts(consentBodyEl({ id: 'x', update: true, commits: [{ sha: 'b', subject: 's' }], commitsTruncated: true }));
+    assert.ok(cut.includes('1+ new commits'));
+    assert.ok(cut.includes('Older commits not shown.'));
   });
 });
 
@@ -549,7 +738,19 @@ test('updateStatusText distinguishes behind, current, unreachable and provenance
   assert.equal(updateStatusText({ updatable: true, sha: 'a'.repeat(40), remoteSha: 'a'.repeat(40), behind: false }), 'Up to date.');
   assert.match(updateStatusText({ updatable: true, error: 'host unreachable' }), /Could not reach the origin: host unreachable/);
   assert.match(updateStatusText({ updatable: false }), /placed here by hand/);
+  assert.equal(updateStatusText({ updatable: true, sha: 'a'.repeat(40), remoteSha: 'b'.repeat(40), behind: true, incompatible: 'Two requires a newer Agent Wrangler (needs host API ^2.0.0, this is 1.31.0).' }), 'Two requires a newer Agent Wrangler (needs host API ^2.0.0, this is 1.31.0).');
   assert.equal(updateStatusText(null), '');
+});
+
+test('an update offers Update & restart first only where the wrangler can restart itself', () => {
+  const update = { update: true };
+  assert.deepEqual(consentButtonLabels(update, true), { ok: 'Update & restart', later: 'Update without restarting' });
+  assert.deepEqual(consentButtonLabels({ ...update, reconsentNeeded: true }, true), { ok: 'Approve, update & restart', later: 'Update without restarting' });
+  assert.deepEqual(consentButtonLabels(update, false), { ok: 'Update', later: null });
+  assert.deepEqual(consentButtonLabels({ ...update, reconsentNeeded: true }, false), { ok: 'Approve & update', later: null });
+  // An install goes live without a restart, so it never offers one.
+  assert.deepEqual(consentButtonLabels({}, true), { ok: 'Install', later: null });
+  assert.deepEqual(consentButtonLabels({ reconsentNeeded: true }, true), { ok: 'Approve & install', later: null });
 });
 
 test('progress never claims an install happened before consent ran', () => {
@@ -812,5 +1013,46 @@ test('a textarea with no declared maxLength still gets the server\'s cap nativel
     const entry = { id: 'x', settingValues: {}, settings: [{ key: 'process', type: 'textarea', label: 'Process' }] };
     const [area] = byClass(extensionSettingRowsEl(entry), 'ext-setting-input');
     assert.equal(area.maxLength, MAX_TEXTAREA_LENGTH);
+  });
+});
+
+test('an extension installed from git has an Auto-update switch, off by default, that asks to change', () => {
+  withDom(() => {
+    const asked = [];
+    const panel = showing(EXT1, { onAutoUpdate: (e, on) => asked.push([e.id, on]) });
+    const row = byClass(panel, 'ext-auto-update')[0];
+    assert.ok(row);
+    assert.equal(row.dataset.id, undefined, 'no data-id, so settings.js\'s delegated flip cannot reach it');
+    assert.ok(texts(row).includes('Auto-update'));
+    const toggle = byClass(row, 'setting-toggle')[0];
+    assert.equal(toggle.getAttribute('aria-checked'), 'false');
+    toggle.fire('click');
+    assert.deepEqual(asked, [['ext1', true]]);
+    assert.equal(toggle.getAttribute('aria-checked'), 'false', 'it moves when the graph says so, not on the click');
+    const on = byClass(showing({ ...EXT1, autoUpdate: true }, { onAutoUpdate: (e, v) => asked.push([e.id, v]) }), 'ext-auto-update')[0];
+    byClass(on, 'setting-toggle')[0].fire('click');
+    assert.deepEqual(asked.at(-1), ['ext1', false]);
+  });
+});
+
+test('builtin, hand-placed and just-uninstalled extensions have no Auto-update switch', () => {
+  withDom(() => {
+    assert.equal(byClass(showing(BUILTIN_A), 'ext-auto-update').length, 0);
+    assert.equal(byClass(showing({ ...EXT1, origin: '', sha: '' }), 'ext-auto-update').length, 0);
+    assert.equal(byClass(showing(EXT1, { pendingRemoval: ['ext1'] }), 'ext-auto-update').length, 0);
+  });
+});
+
+test('the auto-update warning names who can push code and that nobody reviews it', () => {
+  assert.match(AUTO_UPDATE_WARNING, /by its owner, or by anyone who gains control of it/);
+  assert.match(AUTO_UPDATE_WARNING, /without you reviewing the code/);
+  assert.match(AUTO_UPDATE_WARNING, /asks for no new capabilities/);
+});
+
+test('an update auto-update left for the human keeps its button and says why', () => {
+  withDom(() => {
+    const status = { ...BEHIND, autoUpdateBlocked: 'it now asks for sessions:kill, which needs your consent' };
+    assert.equal(updateStatusText(status), 'A newer commit is available (bbbbbbbb). Not updated automatically: it now asks for sessions:kill, which needs your consent.');
+    assert.equal(byClass(extensionsPanelEl({ entries: [EXT1], statuses: { ext1: status } }), 'ext-btn-square').length, 1);
   });
 });

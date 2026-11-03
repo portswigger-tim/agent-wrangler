@@ -1,7 +1,8 @@
-import { resolveResumeDir } from '../../transcript-reader.js';
+import { waitForComposerReady } from '../../pane-ready.js';
+import { adapterFor } from '../../agents/index.js';
 import { ensureLaunchDir } from './resume-dir.js';
 import { prefillPane, paneTitle, claudeTitle } from '../../tmux-scraper.js';
-import { nudgeAndWaitForJobs } from './archive.js';
+import { nudgeAndWaitForJobs, descendantIdsOf } from './archive.js';
 
 const READY_TIMEOUT_MS = 20000;
 const READY_POLL_MS = 400;
@@ -36,7 +37,10 @@ export async function waitForPaneReady(name, socket, {
 // gate and prefill are unit-testable without a real tmux pane; the resume handler
 // passes optional ctx overrides, else the real tmux impls run.
 export async function deliverWakeNote(name, socket, comment, {
-  waitReady = waitForPaneReady,
+  agent,
+  waitReady = (name, socket) => adapterFor(agent).terminal.readySignal === 'title'
+    ? waitForPaneReady(name, socket)
+    : waitForComposerReady(name, socket, agent),
   prefill = prefillPane,
 } = {}) {
   if (!comment || !name) return false;
@@ -65,6 +69,11 @@ export async function resumeSession(sessionId, ctx, { recreateDir, killJobsFirst
   // AFTER resume — not via the resume `intent`/`-- <prompt>` path, which auto-runs
   // it — so the human reviews and hits Enter (the suspended-long-snooze half).
   const snoozeComment = entry?.snooze?.comment || '';
+  const claim = {
+    snooze: entry?.snooze,
+    suspendPending: entry?.suspendPending,
+    generation: ctx.sessionManager.snoozeGeneration(sessionId),
+  };
   const claimed = ctx.sessionManager.clearSnooze(sessionId);
   // Resume from the session's launch dir (owns its project bucket), not its
   // latest cwd — a session that cd'd into a worktree is still bucketed under
@@ -75,13 +84,17 @@ export async function resumeSession(sessionId, ctx, { recreateDir, killJobsFirst
   // the card id, which is their live id). Archived sessions are off the
   // board, so s is null; fall back to the cwd persisted in the mapping rather
   // than stranding the resume in ~.
-  const dir = await resolveResumeDir(entry?.liveSessionId || sessionId, {
+  const dir = await adapterFor(entry?.agent ?? s?.agent).history.resolveResumeDir(entry?.liveSessionId || sessionId, {
     graphCwd: s?.cwd,
     entryCwd: entry?.cwd,
   });
   if (!ensureLaunchDir({ dir, recreateDir, reply: ctx.reply, sessionId })) {
+    // Refused before any launch: hand the claimed note back so the recreateDir
+    // retry can still deliver it.
+    if (claimed) ctx.sessionManager.restoreSnooze(sessionId, claim);
     return;
   }
+  if (claimed) ctx.sessionManager.clearSnoozeDescendants(descendantIdsOf(sessionId, ctx.sessionManager));
   // (The launch context — per-task state like task-memory's symlink — is
   // collected inside resume() itself, keyed on the owner id (sessionId), stable
   // across the fork, per the resume-fork invariant.)
@@ -117,6 +130,7 @@ export async function resumeSession(sessionId, ctx, { recreateDir, killJobsFirst
   // gating on `claimed` is the explicit single-delivery contract).
   if (claimed && snoozeComment) {
     await deliverWakeNote(tmux, socket, snoozeComment, {
+      agent: entry?.agent ?? s?.agent,
       waitReady: ctx.waitForPaneReady,
       prefill: ctx.prefillPane,
     });
