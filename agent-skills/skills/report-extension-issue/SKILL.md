@@ -5,14 +5,15 @@ description: Use when an Agent Wrangler extension misbehaves mid-session (one of
 
 # Report an extension issue or request a feature
 
-`report_extension_issue` drafts an issue for an extension's owner and returns a
-new-issue URL with the title and body filled in. **The human reviews and
-submits it.** You never post it: no `gh issue create`, no GitHub API call, no
-comment on an existing issue.
+`report_extension_issue` drafts a GitHub issue for an extension's owner and
+returns a new-issue URL with the title and body filled in. **The human reviews
+and submits it.** You never post it: no `gh issue create`, no GitHub API call,
+no comment on an existing issue.
 
-It covers extensions installed from git, and core extensions (whose issues go
-to Agent Wrangler's own repository). Find the extension id from a tool's name or
-description, or ask the human to check Settings → Extensions.
+It covers extensions installed from GitHub, any extension that declares an
+`issuesRepo`, and core extensions (whose issues go to Agent Wrangler's own
+repository). Find the extension id from a tool's name or description, or ask the
+human to check Settings → Extensions.
 
 ## Bugs: `kind: "bug"` (the default)
 
@@ -44,17 +45,21 @@ Then:
   unprompted.
 - A vague grumble ("this is slow", "I hate this UI") gets no offer unless it is
   clearly about one extension.
-- Pass `title` (the wish in a line), `description` (what they would like), `why`
+- Pass `title` (the wish in a line; the `[<extension id>]` prefix is added for
+  you), `description` (what they would like), `why`
   (what they were doing, or why it matters) and `how` if they described how it
   might look. Use their words; don't invent requirements.
 
 ## Then
 
-The tool adds the extension version and Agent Wrangler version itself, plus the
-commit, host API, state and OS for a bug, so don't repeat them. Give the human
-the `url` with one line on what it asks for. If `prefilled` is false, or
+The tool adds the extension id, version and repository and the Agent Wrangler
+version itself, plus the commit, host API, state and OS for a bug, so don't
+repeat them. Give the human the `url` with one line on what it asks for. If
 `truncated` is true, also give them the `title` and `body` to paste.
 
+`available: false` is an answer, not a failure: the extension has no issue
+repository, or GitHub says that repository takes no issues. Pass the `reason` on
+in a line and move on; don't retry or look for somewhere else to file it.
+
 Leave out secrets, tokens, customer data and private paths: the issue may be
-public. If the tool says the extension names no issue tracker, tell the human
-instead.
+public.

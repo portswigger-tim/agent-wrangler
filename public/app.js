@@ -40,7 +40,7 @@ import { createSlots } from './slots.js';
 import { MODEL_FRONT } from './model-front-api.js';
 import { createClientExtensionLoader } from './extensions.js';
 import { updatePanelEl, restartPanelEl, shouldReloadForVersion, updateAvailable, rolledBackText, updateToastText, outdatedExtensions, extUpdateKeys, extUpdateIsNew, extUpdateToastText, extUpdatesEl } from './update-panel.js';
-import { statsRepoOf } from './extension-issue.js';
+import { statsRepoOf, issueRepoOf } from './extension-issue.js';
 import { extensionsPanelEl, extensionSettingRowsEl, starResultText, unstarResultText, commitFocusedField, focusedFieldState, restoreFocusedField, consentBodyEl, consentButtonLabels, progressText, uninstallBodyText, AUTO_UPDATE_WARNING, TRANSIENT_PROGRESS_PHASES, RESTART_NOTE as EXT_RESTART_NOTE, AUTO_RESTART_NOTE as EXT_AUTO_RESTART_NOTE, UNINSTALL_RESTART_NOTE as EXT_UNINSTALL_RESTART_NOTE } from './extensions-panel.js';
 import { HINT_CHARS, hintLabels } from './hints.js';
 import { currentModelValue } from './model-menu.js';
@@ -6877,10 +6877,11 @@ let extBrowse = null;
 const searchExtBrowse = () => { extBrowse = { loading: true, repos: extBrowse?.repos || [] }; send({ type: 'ext-browse' }); };
 // The detail pane's settings.panel host, torn down before every remount.
 let extSettingsPanelHost = null;
-// Stars and open issues per extension id, asked for the first time each
-// GitHub-installed extension is shown and kept for the life of the page; the
-// server caches the GitHub side.
-const extRepoStats = new Map();
+// What GitHub says per extension id (stars and open issues, and whether its
+// issue repository takes issues), asked the first time each extension with a
+// GitHub repository is shown and kept for the life of the page; the server
+// caches the GitHub side.
+const extRepoInfo = new Map();
 // The wrangler's half of a "Report an issue" draft, from the connect config.
 let wranglerVersion = '';
 let wranglerPlatform = '';
@@ -6889,17 +6890,9 @@ const issueEnv = () => ({ version: wranglerVersion, codeVersion: wranglerCodeVer
 
 function requestExtRepoStats() {
   const selected = !extAdding && latestExtensions.find((e) => e.id === extSelectedId);
-  if (!selected || !statsRepoOf(selected) || extRepoStats.has(selected.id)) return;
-  extRepoStats.set(selected.id, { loading: true });
+  if (!selected || !(statsRepoOf(selected) || issueRepoOf(selected)) || extRepoInfo.has(selected.id)) return;
+  extRepoInfo.set(selected.id, { loading: true });
   send({ type: 'ext-repo-stats', id: selected.id });
-}
-
-// A tracker that takes no pre-filled text opens empty, so the draft goes on the
-// clipboard to paste. A GitHub one already carries it in the URL.
-function noteReportIssue(entry, draft) {
-  if (draft.prefill) return;
-  navigator.clipboard?.writeText(`${draft.title}\n\n${draft.body}`.trim())
-    .then(() => toast('Copied the issue details to paste', false, { duration: 3000 }), () => {});
 }
 
 const startExtUpdate = (entry) => { extInstallBusy = true; extInstallPhase = 'cloning'; extInstallProgress = progressText('cloning'); send({ type: 'ext-install', url: entry.origin }); remountExtensions(); };
@@ -7039,8 +7032,7 @@ function mountExtensionsPanel(host) {
     onRestart: restartForExtensions,
     settingsEl: extSettingsEl,
     issueEnv: issueEnv(),
-    repoStats: Object.fromEntries(extRepoStats),
-    onReportIssue: noteReportIssue,
+    repoInfo: Object.fromEntries(extRepoInfo),
   }));
   restoreFocusedField(host, refocus);
 }
@@ -7541,7 +7533,11 @@ function connect() {
     }
     else if (msg.type === 'ext-repo-stats-result') {
       if (typeof msg.id === 'string') {
-        extRepoStats.set(msg.id, msg.error ? { error: String(msg.error) } : { stars: Number(msg.stars) || 0, openIssues: Number(msg.openIssues) || 0, htmlUrl: typeof msg.htmlUrl === 'string' ? msg.htmlUrl : '' });
+        const stats = msg.stats && typeof msg.stats === 'object'
+          ? { stars: Number(msg.stats.stars) || 0, openIssues: Number(msg.stats.openIssues) || 0, htmlUrl: typeof msg.stats.htmlUrl === 'string' ? msg.stats.htmlUrl : '' }
+          : null;
+        const issues = msg.issues && typeof msg.issues === 'object' ? { available: msg.issues.available === true ? true : msg.issues.available === false ? false : null } : null;
+        extRepoInfo.set(msg.id, { stats, statsError: typeof msg.statsError === 'string' ? msg.statsError : '', issues });
         remountExtensions();
       }
     }

@@ -36,34 +36,43 @@ commit), its **Feedback** and its **Settings**.
 
 ### Report an issue, request a feature, and GitHub stats
 
-**Report an issue** in an extension's **Feedback** section opens a new issue on its tracker in a new
-tab, with the extension id, version, installed commit and branch (the early-adopter branch when you
-follow it), the Agent Wrangler version, the host API version and the extension's `wranglerApi` range,
-whether it is enabled or quarantined, and the OS already in the body. **Request a feature** beside
-it opens the same tracker with a feature-request template (what you'd like, why, and how it might
-look) and just the extension and Agent Wrangler versions. On GitHub the two are labelled `bug` and
-`enhancement` when you are allowed to label issues there. Nothing is posted: you fill in the rest,
-review it, and submit it yourself. Long reports are shortened to fit GitHub's URL limit.
+**Report an issue** in an extension's **Feedback** section opens a new GitHub issue in a new tab. The
+title starts with `[<extension id>]`, and the body already holds:
 
-The issue goes to the first of these that exists:
+- the extension id, version and the repository it was installed from
+- the installed commit and branch (the early-adopter branch when you follow it)
+- the Agent Wrangler version, the host API version and the extension's `wranglerApi` range
+- whether it is enabled or quarantined, and the OS
 
-1. The `bugs` URL in the extension's `package.json` (`https://` only).
-2. Agent Wrangler's own repository, for a core extension.
-3. The GitHub repository it was installed from.
+**Request a feature** beside it opens the same repository with a feature-request template (what
+you'd like, why, and how it might look) and just the extension, its repository and the Agent
+Wrangler version. The two are labelled `bug` and `enhancement` when you are allowed to label issues
+there. Nothing is posted: you fill in the rest, review it, and submit it yourself. Long reports are
+shortened to fit GitHub's URL limit.
 
-An extension with none of these has neither link. A `bugs` URL on GitHub opens that repository's
-new-issue form pre-filled; any other tracker opens as it is, and the draft is copied for you to paste.
+Issues always go to GitHub, to the first of these that applies:
+
+1. The extension's own `issuesRepo` (see [Minimal external extension](#minimal-external-extension)).
+2. The GitHub repository it was installed from.
+3. Agent Wrangler's own repository, for a core extension.
+
+An extension with none of these, such as one placed in the extensions folder by hand without an
+`issuesRepo`, has neither link. Both links are also hidden when GitHub says that repository takes no
+issues: issues are turned off, it is archived, or there is no public repository by that name. While
+that can't be checked (offline, or GitHub's rate limit), the links are shown anyway. A private
+repository you installed from counts as reachable, since you could clone it.
+
 An agent can draft the same issue with the `report_extension_issue` tool (see
 [Agent tools](agent-tools.md#extension-feedback)). When you wish out loud that an extension did
 something differently, an agent offers once to draft a feature request and drafts it only if you
 say yes.
 
-An extension installed from a GitHub URL also shows its stars and open issues (GitHub's count, which
-includes open pull requests), with a link to the issues and **Star on GitHub**, which opens the
-repository so you can star it there. Agent Wrangler never stars without your opt-in, and only
-unstars what it starred. The numbers come from GitHub's public API without a token, are cached for
-30 minutes, and reuse what the **Browse GitHub** list already fetched. Core and hand-placed
-extensions show no stats.
+An extension installed from a GitHub URL also shows its stars and open issues (GitHub's count for
+the repository it was installed from, which includes open pull requests), with a link to the issues
+and **Star on GitHub**, which opens the repository so you can star it there. Agent Wrangler never
+stars without your opt-in, and only unstars what it starred. The numbers come from GitHub's public
+API without a token, are cached for 30 minutes, and reuse what the **Browse GitHub** list already
+fetched. Core and hand-placed extensions show no stats.
 
 ### Star an extension when you install it
 
@@ -173,9 +182,9 @@ An installable repository needs `package.json` and an `index.js` with a default 
     "author": "Your team",
     "requires": [],
     "engines": { "wranglerApi": "^1.31.0" },
-    "earlyAdopter": { "branch": "next" }
-  },
-  "bugs": { "url": "https://github.com/acme/widgets-ext/issues" }
+    "earlyAdopter": { "branch": "next" },
+    "issuesRepo": "acme/widgets-issues"
+  }
 }
 ```
 
@@ -188,13 +197,18 @@ export default {
   requires: [],
   engines: { wranglerApi: '^1.31.0' },
   earlyAdopter: { branch: 'next' },
+  issuesRepo: 'acme/widgets-issues',
   defaultEnabled: true,
 };
 ```
 
-`bugs` is the standard npm field, a URL string or `{ "url": … }`, and is optional. It sets where
-**Report an issue** and **Request a feature** file issues; leave it out to use the GitHub repository
-the extension was installed from. Only an `https://` URL counts. The `version` field is shown in issue reports.
+`issuesRepo` is optional: the GitHub repository, as `owner/repo` and not a URL, where **Report an
+issue** and **Request a feature** open issues. Leave it out to use the repository the extension was
+installed from. It lets one maintainer collect issues for several extensions in one repository; each
+title starts with the extension id. The two copies must match, or install is refused. A value that
+isn't a valid GitHub `owner/repo`, or copies edited apart after install, are ignored with one line in
+the server log: the extension still loads, as if it declared none. The `version` field is shown in
+issue reports.
 
 `earlyAdopter` is optional (1.39.0). Its `branch` must be a branch name `git check-ref-format
 --branch` accepts and not start with `-`, and the two copies must match.
@@ -303,8 +317,8 @@ have no provenance or panel updates; use an isolated `AW_DATA_DIR`.
 - Declare `earlyAdopter.branch` (optional) in both places too: the `package.json` copy is what is
   consented to and recorded, so a reinstall can clone that branch before any manifest is imported.
 - Put browser assets under `public/`. Third-party strings render as text; homepages must use `https://`.
-- Set `bugs` in `package.json` to an `https://` URL when issues belong somewhere other than the
-  GitHub repository people install from, or when it is not on GitHub. Without one, an extension not
+- Declare `issuesRepo` (optional) in both places when issues belong in a GitHub repository other than
+  the one people install from, or when that one is not on GitHub. Without it, an extension not
   installed from GitHub gets no **Report an issue** or **Request a feature** link.
 - Handle cleanup explicitly: uninstall removes the extension and provenance, not files it wrote elsewhere.
 

@@ -2,7 +2,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { externalDir, readProvenance, tmpDir } from './provenance.js';
-import { bugsUrlOf } from '../../public/extension-issue.js';
 
 // Discovery of INSTALLED ("external") extensions: one immediate subdirectory of
 // <DATA_DIR>/extensions/ per extension, each with an index.js default-exporting
@@ -16,8 +15,7 @@ import { bugsUrlOf } from '../../public/extension-issue.js';
 // contributes nothing — see its failure-posture comment. A directory that can
 // only be half-understood must not take the board down with it.
 //
-// Stays a LEAF: node:fs / node:path / node:url, the provenance leaf and the
-// pure public/extension-issue.js only.
+// Stays a LEAF: node:fs / node:path / node:url and the provenance leaf only.
 
 // A static import of these breaks BOOT FOR THE WHOLE SERVER, not just one
 // extension: server/extensions/** is imported by mcp/client-config.js and
@@ -140,11 +138,12 @@ export function unconsentedCapabilities(requires, record) {
 //
 // `importViolation` is deliberately NOT part of this: it runs BEFORE the import,
 // and both callers have to run it there rather than after the fact.
-// What an installed extension's package.json says about itself beyond the
-// `wranglerExtension` block: its `version`, and its `bugs` tracker as an
-// https:// URL (see public/extension-issue.js). Read for "Report an issue",
-// never for anything that decides whether it loads, so a missing or unreadable
-// file is just empty strings — a hand-placed extension may have no package.json.
+// What an installed extension's package.json says for "Report an issue": its
+// `version`, and the raw `wranglerExtension.issuesRepo`, which the loader holds
+// to the manifest's copy (index.js issuesRepoFor). Never anything that decides
+// whether it loads, so a missing or unreadable file is just empty values — a
+// hand-placed extension may have no package.json at all.
+// `packageDeclares` says there was a `wranglerExtension` block to agree with.
 export function packageFacts(dir) {
   let pkg = null;
   try {
@@ -154,7 +153,8 @@ export function packageFacts(dir) {
   }
   return {
     version: typeof pkg?.version === 'string' ? pkg.version.slice(0, 64) : '',
-    bugsUrl: bugsUrlOf(pkg?.bugs),
+    packageDeclares: Boolean(pkg?.wranglerExtension && typeof pkg.wranglerExtension === 'object'),
+    packageIssuesRepo: pkg?.wranglerExtension?.issuesRepo ?? null,
   };
 }
 
