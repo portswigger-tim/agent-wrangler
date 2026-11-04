@@ -231,11 +231,6 @@ function assertManifestMatchesDeclaration(manifest, declared) {
   if ((manifest.earlyAdopter?.branch ?? null) !== declared.earlyAdopterBranch) {
     throw new Error(`The extension's index.js declares early-adopter branch ${JSON.stringify(manifest.earlyAdopter?.branch ?? null)} but its package.json disclosed ${JSON.stringify(declared.earlyAdopterBranch)} — refusing to install a manifest that does not match what was consented to.`);
   }
-  // Where issues go is not consent, but the two copies must still agree, like
-  // every other mirrored field.
-  if (JSON.stringify(manifest.issuesRepo ?? null) !== JSON.stringify(declared.issuesRepo ?? null)) {
-    throw new Error(`The extension's index.js declares issuesRepo ${JSON.stringify(manifest.issuesRepo ?? null)} but its package.json declares ${JSON.stringify(declared.issuesRepo ?? null)} — the two copies must match.`);
-  }
   const consented = new Set(declared.requires);
   const extra = [...new Set((manifest.requires || []).filter((c) => !consented.has(c)))];
   if (extra.length) {

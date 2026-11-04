@@ -653,8 +653,8 @@ function quarantinedEntry(ext, quarantine) {
     // Kept for a quarantined row too: a broken extension is exactly the one
     // whose "Report an issue" matters.
     version: typeof ext?.version === 'string' ? ext.version : '',
-    // No manifest to agree with here, so whichever copy there is.
-    issuesRepo: issuesRepoFor(ext, { checkAgreement: false }),
+    // From package.json, so a broken index.js does not lose it.
+    issuesRepo: issuesRepoFor(ext),
     defaultEnabled: false,
     enabled: false,
     requires: [],
@@ -675,30 +675,20 @@ function quarantinedEntry(ext, quarantine) {
 }
 
 // The `issuesRepo` "Report an issue" files to: `"owner/repo"` on GitHub, or ''.
-// Declared in the manifest and, for an installed extension, mirrored in
-// package.json's `wranglerExtension` (external.js packageFacts carries that
-// copy as `packageIssuesRepo`). Install refuses copies that disagree; one
-// edited on disk afterwards, or an invalid value, is IGNORED with one log line
-// — it only decides where issues go, so it is never worth a quarantine.
+// Read ONLY from package.json's `wranglerExtension` (external.js packageFacts
+// carries it as `packageIssuesRepo`); a manifest that sets one is ignored,
+// silently. An invalid value is IGNORED with one log line — it only decides
+// where issues go, so it is never worth a quarantine.
 const loggedIssuesRepo = new Set();
-function issuesRepoFor(ext, { checkAgreement = true } = {}) {
+function issuesRepoFor(ext) {
+  const value = ext?.packageIssuesRepo ?? null;
+  if (value == null || parseIssuesRepo(value)) return value ?? '';
   const id = typeof ext?.id === 'string' ? ext.id : '<no id>';
-  const manifest = ext?.issuesRepo ?? null;
-  const pkg = ext?.packageIssuesRepo ?? null;
-  const ignore = (why) => {
-    const key = `${id}:${why}`;
-    if (!loggedIssuesRepo.has(key)) {
-      loggedIssuesRepo.add(key);
-      log(`[agent-wrangler] extension ${id}: issuesRepo ignored (${why})`);
-    }
-    return '';
-  };
-  if (checkAgreement && ext?.packageDeclares && JSON.stringify(manifest) !== JSON.stringify(pkg)) {
-    return ignore(`index.js says ${JSON.stringify(manifest)} but package.json says ${JSON.stringify(pkg)}`);
+  if (!loggedIssuesRepo.has(id)) {
+    loggedIssuesRepo.add(id);
+    log(`[agent-wrangler] extension ${id}: issuesRepo ignored (${JSON.stringify(value)} is not a GitHub "owner/repo")`);
   }
-  const value = manifest ?? pkg;
-  if (value == null) return '';
-  return parseIssuesRepo(value) ? value : ignore(`${JSON.stringify(value)} is not a GitHub "owner/repo"`);
+  return '';
 }
 
 // Everything a manifest contributes is computed into locals FIRST and written to

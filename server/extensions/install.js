@@ -388,10 +388,6 @@ export function readDeclaration(dir) {
     requires: [...(d.requires || [])],
     range: engines?.wranglerApi ?? null,
     earlyAdopterBranch: ea?.branch ?? null,
-    // Raw, not validated: an invalid value only means no issue repo (index.js
-    // issuesRepoFor), never a refused install. ext-consent holds the manifest's
-    // copy to this one.
-    issuesRepo: d.issuesRepo ?? null,
   };
 }
 

@@ -183,7 +183,8 @@ test('admitExternal applies the id-match and consent checks the install path sha
   assert.equal(ok.entry.external, true);
 });
 
-// A manifest whose index.js and package.json both carry `issuesRepo`.
+// `pkg` goes in package.json's `wranglerExtension`, the only place issuesRepo
+// is read; `manifest` in index.js, where it is ignored.
 function writeWithIssuesRepo(root, id, { manifest, pkg, version = '1.0.0', idInManifest = id }) {
   const dir = writeExt(root, id, {
     body: `export default { id: ${JSON.stringify(idInManifest)}, label: 'X'${manifest === undefined ? '' : `, issuesRepo: ${JSON.stringify(manifest)}`} };\n`,
@@ -193,18 +194,29 @@ function writeWithIssuesRepo(root, id, { manifest, pkg, version = '1.0.0', idInM
   return dir;
 }
 
-test('package.json version and a matching issuesRepo ride the entry, quarantined or not, into the graph', async () => {
+async function graphRows(root, lines = []) {
+  const found = await discoverExternal({ dir: root, provenance: {} });
+  const original = console.log;
+  console.log = (...args) => lines.push(args.join(' '));
+  try {
+    const graph = extensionsForGraph(loadExtensions({ cfg: {}, builtin: found }).list, () => true, () => ({}));
+    loadExtensions({ cfg: {}, builtin: found });
+    return Object.fromEntries(graph.map((e) => [e.id, e]));
+  } finally {
+    console.log = original;
+  }
+}
+
+test('package.json version and issuesRepo ride the entry, quarantined or not, into the graph', async () => {
   const root = tempRoot();
-  writeWithIssuesRepo(root, 'notes', { manifest: 'acme/all-issues', pkg: 'acme/all-issues', version: '1.4.0' });
-  // Quarantined (id mismatch): no manifest to agree with, so the package copy is used.
-  writeWithIssuesRepo(root, 'broken', { manifest: 'acme/other', pkg: 'acme/broken-issues', idInManifest: 'other' });
+  writeWithIssuesRepo(root, 'notes', { pkg: 'acme/all-issues', version: '1.4.0' });
+  // Quarantined (id mismatch): index.js is not used, and package.json still is.
+  writeWithIssuesRepo(root, 'broken', { pkg: 'acme/broken-issues', idInManifest: 'other' });
   writeWithIssuesRepo(root, 'plain', {});
   const bare = writeExt(root, 'bare');
   fs.writeFileSync(path.join(bare, 'package.json'), JSON.stringify({ version: '0.0.1' }));
   writeExt(root, 'nopkg');
-  const found = await discoverExternal({ dir: root, provenance: {} });
-  const graph = extensionsForGraph(loadExtensions({ cfg: {}, builtin: found }).list, () => true, () => ({}));
-  const rows = Object.fromEntries(graph.map((e) => [e.id, e]));
+  const rows = await graphRows(root);
   assert.equal(rows.notes.version, '1.4.0');
   assert.equal(rows.notes.issuesRepo, 'acme/all-issues');
   assert.ok(rows.broken.quarantine);
@@ -214,30 +226,32 @@ test('package.json version and a matching issuesRepo ride the entry, quarantined
   assert.deepEqual([rows.nopkg.version, rows.nopkg.issuesRepo], ['', '']);
 });
 
-test('an invalid or mismatched issuesRepo is ignored with one log line, never a quarantine', async () => {
+test('issuesRepo comes from package.json only: a manifest copy is ignored silently, never compared', async () => {
   const root = tempRoot();
-  writeWithIssuesRepo(root, 'url', { manifest: 'https://github.com/acme/x', pkg: 'https://github.com/acme/x' });
-  writeWithIssuesRepo(root, 'drift', { manifest: 'acme/one', pkg: 'acme/two' });
-  writeWithIssuesRepo(root, 'half', { manifest: 'acme/one' });
-  const found = await discoverExternal({ dir: root, provenance: {} });
+  writeWithIssuesRepo(root, 'differs', { manifest: 'acme/one', pkg: 'acme/two' });
+  writeWithIssuesRepo(root, 'manifestonly', { manifest: 'acme/one' });
+  writeWithIssuesRepo(root, 'badmanifest', { manifest: 'not a repo', pkg: 'acme/three' });
   const lines = [];
-  const original = console.log;
-  console.log = (...args) => lines.push(args.join(' '));
-  let graph;
-  try {
-    graph = extensionsForGraph(loadExtensions({ cfg: {}, builtin: found }).list, () => true, () => ({}));
-    loadExtensions({ cfg: {}, builtin: found });
-  } finally {
-    console.log = original;
-  }
-  const rows = Object.fromEntries(graph.map((e) => [e.id, e]));
-  for (const id of ['url', 'drift', 'half']) {
+  const rows = await graphRows(root, lines);
+  assert.equal(rows.differs.issuesRepo, 'acme/two');
+  assert.equal(rows.manifestonly.issuesRepo, '');
+  assert.equal(rows.badmanifest.issuesRepo, 'acme/three');
+  for (const id of ['differs', 'manifestonly', 'badmanifest']) assert.equal(rows[id].quarantine, null, id);
+  assert.deepEqual(lines.filter((l) => l.includes('issuesRepo')), []);
+});
+
+test('an invalid package.json issuesRepo is ignored with one log line, never a quarantine', async () => {
+  const root = tempRoot();
+  writeWithIssuesRepo(root, 'url', { pkg: 'https://github.com/acme/x' });
+  writeWithIssuesRepo(root, 'number', { pkg: 42 });
+  const lines = [];
+  const rows = await graphRows(root, lines);
+  for (const id of ['url', 'number']) {
     assert.equal(rows[id].quarantine, null, id);
     assert.equal(rows[id].issuesRepo, '', id);
   }
   const ignored = lines.filter((l) => l.includes('issuesRepo ignored'));
-  assert.equal(ignored.length, 3, 'once each, however often the loader runs');
+  assert.equal(ignored.length, 2, 'once each, however often the loader runs');
   assert.ok(ignored.some((l) => l.includes('extension url') && l.includes('not a GitHub "owner/repo"')));
-  assert.ok(ignored.some((l) => l.includes('extension drift') && l.includes('"acme/one"') && l.includes('"acme/two"')));
-  assert.ok(ignored.some((l) => l.includes('extension half') && l.includes('package.json says null')));
+  assert.ok(ignored.some((l) => l.includes('extension number') && l.includes('42')));
 });

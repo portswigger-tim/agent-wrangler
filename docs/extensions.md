@@ -189,7 +189,6 @@ export default {
   requires: [],
   engines: { wranglerApi: '^1.31.0' },
   earlyAdopter: { branch: 'next' },
-  issuesRepo: 'acme/widgets-issues',
   defaultEnabled: true,
 };
 ```
@@ -197,10 +196,12 @@ export default {
 `issuesRepo` is optional: the GitHub repository, as `owner/repo` and not a URL, where **Report an
 issue** and **Request a feature** open issues. Leave it out to use the repository the extension was
 installed from. It lets one maintainer collect issues for several extensions in one repository; each
-title starts with the extension id. The two copies must match, or install is refused. A value that
-isn't a valid GitHub `owner/repo`, or copies edited apart after install, are ignored with one line in
-the server log: the extension still loads, as if it declared none. The `version` field is shown in
-issue reports.
+title starts with the extension id. Unlike `engines` and `earlyAdopter`, it goes in `package.json`
+only, not in the manifest: it is not a capability, so there is nothing to check again at runtime,
+and `package.json` is still read when `index.js` fails to load, which is when a report matters most.
+An `issuesRepo` in the manifest is ignored. A value that isn't a valid GitHub `owner/repo` is
+ignored with one line in the server log: the extension still loads, as if it declared none. The
+`version` field is shown in issue reports.
 
 `earlyAdopter` is optional (1.39.0). Its `branch` must be a branch name `git check-ref-format
 --branch` accepts and not start with `-`, and the two copies must match.
@@ -309,8 +310,8 @@ have no provenance or panel updates; use an isolated `AW_DATA_DIR`.
 - Declare `earlyAdopter.branch` (optional) in both places too: the `package.json` copy is what is
   consented to and recorded, so a reinstall can clone that branch before any manifest is imported.
 - Put browser assets under `public/`. Third-party strings render as text; homepages must use `https://`.
-- Declare `issuesRepo` (optional) in both places when issues belong in a GitHub repository other than
-  the one people install from, or when that one is not on GitHub. Without it, an extension not
+- Declare `issuesRepo` (optional) in `package.json` only when issues belong in a GitHub repository
+  other than the one people install from, or when that one is not on GitHub. Without it, an extension not
   installed from GitHub gets no **Report an issue** or **Request a feature** link.
 - Handle cleanup explicitly: uninstall removes the extension and provenance, not files it wrote elsewhere.
 

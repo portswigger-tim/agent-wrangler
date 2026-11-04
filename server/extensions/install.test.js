@@ -191,7 +191,7 @@ test('readDeclaration reads the disclosure statically, without importing anythin
     wranglerExtension: { id: 'notes', label: 'Notes', description: 'Keeps notes.', author: 'A Colleague', homepage: 'https://example.invalid', requires: ['tasks:read'] },
   }));
   assert.deepEqual(readDeclaration(dir), {
-    id: 'notes', label: 'Notes', description: 'Keeps notes.', author: 'A Colleague', homepage: 'https://example.invalid', requires: ['tasks:read'], range: null, earlyAdopterBranch: null, issuesRepo: null,
+    id: 'notes', label: 'Notes', description: 'Keeps notes.', author: 'A Colleague', homepage: 'https://example.invalid', requires: ['tasks:read'], range: null, earlyAdopterBranch: null,
   });
 
   // The declared host API range rides along for the pre-consent engines gate.
@@ -203,13 +203,7 @@ test('readDeclaration reads the disclosure statically, without importing anythin
   // Absent prose normalises to '' rather than undefined: every consumer renders
   // it through textContent, where undefined would print as "undefined".
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ wranglerExtension: { id: 'notes', label: 'Notes' } }));
-  assert.deepEqual(readDeclaration(dir), { id: 'notes', label: 'Notes', description: '', author: '', homepage: '', requires: [], range: null, earlyAdopterBranch: null, issuesRepo: null });
-
-  // issuesRepo rides along raw: an invalid one only means no issue repo, never a refused install.
-  for (const issuesRepo of ['acme/all-issues', 'https://github.com/acme/x', 42]) {
-    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ wranglerExtension: { id: 'notes', label: 'Notes', issuesRepo } }));
-    assert.equal(readDeclaration(dir).issuesRepo, issuesRepo);
-  }
+  assert.deepEqual(readDeclaration(dir), { id: 'notes', label: 'Notes', description: '', author: '', homepage: '', requires: [], range: null, earlyAdopterBranch: null });
 });
 
 test('commitsSince deepens the shallow clone and logs only what the update brings in', async () => {
