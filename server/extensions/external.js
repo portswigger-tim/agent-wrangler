@@ -139,11 +139,13 @@ export function unconsentedCapabilities(requires, record) {
 // `importViolation` is deliberately NOT part of this: it runs BEFORE the import,
 // and both callers have to run it there rather than after the fact.
 // What an installed extension's package.json says for "Report an issue": its
-// `version`, and the raw `wranglerExtension.issuesRepo`, which the loader holds
-// to the manifest's copy (index.js issuesRepoFor). Never anything that decides
-// whether it loads, so a missing or unreadable file is just empty values — a
+// `version`, and the raw `wranglerExtension.issuesRepo`, which index.js
+// issuesRepoFor validates. package.json is the ONLY place `issuesRepo` is read:
+// it is not a capability, so unlike `requires` or `engines` it has no
+// manifest copy to check at runtime, and package.json can be read even for an
+// extension whose index.js does not load. Never anything that decides whether
+// it loads, so a missing or unreadable file is just empty values — a
 // hand-placed extension may have no package.json at all.
-// `packageDeclares` says there was a `wranglerExtension` block to agree with.
 export function packageFacts(dir) {
   let pkg = null;
   try {
@@ -153,7 +155,6 @@ export function packageFacts(dir) {
   }
   return {
     version: typeof pkg?.version === 'string' ? pkg.version.slice(0, 64) : '',
-    packageDeclares: Boolean(pkg?.wranglerExtension && typeof pkg.wranglerExtension === 'object'),
     packageIssuesRepo: pkg?.wranglerExtension?.issuesRepo ?? null,
   };
 }

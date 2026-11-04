@@ -66,12 +66,14 @@ function reply(c, type) {
 // destination directory holds the repo afterwards.
 // `declared`/`declaredRequires` default to the manifest's own id/requires, which
 // is the honest case; a test passes them separately to stage a repo whose
-// package.json disclosure and index.js manifest DISAGREE.
+// package.json disclosure and index.js manifest DISAGREE. `issuesRepo` (the
+// manifest's, which is ignored) and `declaredIssuesRepo` (package.json's, the
+// one read) are set independently.
 function fakeClone({
   id = 'notes', requires = [], lock = true, declaration = true, deps = true,
   declaredId = id, declaredRequires = requires, indexThrows = false, defaultEnabled = true,
   range = null, declaredRange = range, earlyAdopter = null, declaredEarlyAdopter = earlyAdopter,
-  issuesRepo, declaredIssuesRepo = issuesRepo,
+  issuesRepo, declaredIssuesRepo,
 } = {}) {
   return async (_url, dest) => {
     fs.mkdirSync(dest, { recursive: true });
@@ -723,32 +725,25 @@ test('a manifest whose earlyAdopter branch differs from the disclosed one fails 
   reset();
 });
 
-test('issuesRepo copies must agree at install; an invalid one that agrees still installs', async () => {
+test('issuesRepo is read from package.json only: a manifest copy never refuses an install', async () => {
   reset();
-  const c = ctx();
-  useFakes({ issuesRepo: 'acme/one', declaredIssuesRepo: 'acme/two' });
-  await extInstallHandler.handler({ type: 'ext-install', url: URL_NOTES }, c);
-  await assert.rejects(
-    extConsentHandler.handler({ type: 'ext-consent', tempId: reply(c, 'ext-install-disclosure').tempId, approve: true }, c),
-    /issuesRepo "acme\/one" but its package.json declares "acme\/two"/,
-  );
-  assert.equal(readProvenance().notes, undefined);
+  const differs = ctx();
+  await install(differs, { issuesRepo: 'acme/one', declaredIssuesRepo: 'acme/two' });
+  assert.equal(reply(differs, 'ext-install-done').installed, true);
+  assert.equal(differs.loaded.list.find((e) => e.id === 'notes').issuesRepo, 'acme/two');
   reset();
-  const half = ctx();
-  useFakes({ issuesRepo: 'acme/one', declaredIssuesRepo: null });
-  await extInstallHandler.handler({ type: 'ext-install', url: URL_NOTES }, half);
-  await assert.rejects(
-    extConsentHandler.handler({ type: 'ext-consent', tempId: reply(half, 'ext-install-disclosure').tempId, approve: true }, half),
-    /issuesRepo "acme\/one" but its package.json declares null/,
-  );
+  const manifestOnly = ctx();
+  await install(manifestOnly, { issuesRepo: 'acme/one' });
+  assert.equal(reply(manifestOnly, 'ext-install-done').installed, true);
+  assert.equal(manifestOnly.loaded.list.find((e) => e.id === 'notes').issuesRepo, '');
   reset();
   const invalid = ctx();
-  await install(invalid, { issuesRepo: 'not a repo' });
+  await install(invalid, { declaredIssuesRepo: 'not a repo' });
   assert.equal(reply(invalid, 'ext-install-done').installed, true);
   assert.equal(invalid.loaded.list.find((e) => e.id === 'notes').issuesRepo, '');
   reset();
   const good = ctx();
-  await install(good, { issuesRepo: 'acme/all-issues' });
+  await install(good, { declaredIssuesRepo: 'acme/all-issues' });
   assert.equal(good.loaded.list.find((e) => e.id === 'notes').issuesRepo, 'acme/all-issues');
   reset();
 });
