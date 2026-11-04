@@ -23,11 +23,22 @@ export function hasExtensionsLine(body) {
   return EXTENSIONS_LINE.test(String(body ?? ''));
 }
 
+// Every name, uncapped (truncating would drop the attribution an owner searches
+// for), sorted case-insensitively and de-duplicated the same way, as GitHub
+// owner/repo names are: the line never depends on ledger or install order.
+export function extensionNames(extensions) {
+  const names = (Array.isArray(extensions) ? extensions : []).filter((x) => typeof x === 'string' && x);
+  const seen = new Set();
+  return names
+    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase(), 'en') || (a < b ? -1 : a > b ? 1 : 0))
+    .filter((n) => !seen.has(n.toLowerCase()) && seen.add(n.toLowerCase()));
+}
+
 // The footer lines this body still needs, in order: Model then Extensions.
 function footerLines(body, { model, extensions } = {}) {
   const lines = [];
   if (model && !hasModelLine(body)) lines.push(`Model: ${model}`);
-  const names = (Array.isArray(extensions) ? extensions : []).filter((x) => typeof x === 'string' && x);
+  const names = extensionNames(extensions);
   if (names.length && !hasExtensionsLine(body)) lines.push(`Extensions: ${names.join(', ')}`);
   return lines;
 }

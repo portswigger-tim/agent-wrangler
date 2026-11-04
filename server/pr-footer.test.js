@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { hasModelLine, hasExtensionsLine, withFooter, fetchFooterFacts, tagPr, runModelFooter } from './pr-footer.js';
+import { hasModelLine, hasExtensionsLine, extensionNames, withFooter, fetchFooterFacts, tagPr, runModelFooter } from './pr-footer.js';
 
 const withModelFooter = (body, model) => withFooter(body, { model });
 const fetchFooterModel = async (opts) => (await fetchFooterFacts(opts)).model;
@@ -91,10 +91,22 @@ test('hasExtensionsLine finds an Extensions line only at a line start', () => {
 test('withFooter puts Model and Extensions on consecutive lines after one blank line', () => {
   assert.equal(
     withFooter('Summary\n', { model: 'claude-opus-5-5', extensions: ['acme/widgets-ext', 'acme/gadgets-ext'] }),
-    'Summary\n\nModel: claude-opus-5-5\nExtensions: acme/widgets-ext, acme/gadgets-ext',
+    'Summary\n\nModel: claude-opus-5-5\nExtensions: acme/gadgets-ext, acme/widgets-ext',
   );
   assert.equal(withFooter('Summary', { extensions: ['acme/widgets-ext'] }), 'Summary\n\nExtensions: acme/widgets-ext');
   assert.equal(withFooter('Summary', { model: null, extensions: [] }), null);
+});
+
+test('the Extensions line names every extension, uncapped, sorted and de-duplicated case-insensitively', () => {
+  const repos = Array.from({ length: 15 }, (_, i) => `acme/ext-${String.fromCharCode(111 - i)}`);
+  const given = [...repos, 'Zeta/Tools', 'acme/EXT-o', 'acme/ext-a', 'beta/kit', 'acme/ext-c', 'zeta/tools'];
+  const names = extensionNames(given);
+  assert.equal(names.length, 17);
+  assert.deepEqual(names, [
+    ...repos.slice().sort().map((n) => (n === 'acme/ext-o' ? 'acme/EXT-o' : n)), 'beta/kit', 'Zeta/Tools',
+  ]); // case-only duplicates keep the spelling that sorts first by code point
+  assert.deepEqual(extensionNames([...given].reverse()).map((n) => n.toLowerCase()), names.map((n) => n.toLowerCase()));
+  assert.equal(withFooter('Summary', { extensions: given }), `Summary\n\nExtensions: ${names.join(', ')}`);
 });
 
 test('withFooter never touches an Extensions line the agent wrote, but still adds a missing Model', () => {

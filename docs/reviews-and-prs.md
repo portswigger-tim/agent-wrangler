@@ -150,9 +150,10 @@ Extensions: acme/widgets-ext, acme/gadgets-ext
 dispatched with its dispatch fields, or invoked a skill it ships or provides. Having an extension
 installed is not enough. Only extensions installed from a GitHub URL are named. Core extensions,
 extensions placed in the extensions folder by hand, and extensions installed from another git host are
-never named. The line is omitted when the session used none. An extension installed from a private
-repository is named too, so if its name should not appear in the pull requests you open, turn the line
-off.
+never named. The line lists every extension the session used, with no limit, once each and in
+alphabetical order ignoring case. It is omitted when the session used none. An extension installed
+from a private repository is named too, so if its name should not appear in the pull requests you
+open, turn the line off.
 
 Like the model line, it is added only when the description has no `Extensions:` line yet, so a line
 the agent wrote itself is never changed, and running the footer twice adds nothing. Turn it off with

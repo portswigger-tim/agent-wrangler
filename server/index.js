@@ -40,6 +40,7 @@ import { createMcpRequestHandler, extractCaller } from './mcp/server.js';
 import { createPrModelHandler } from './pr-model-handler.js';
 import { ExtensionUsageStore, skillOwnerIn } from './extension-usage.js';
 import { parseGithubSlug } from './repo-slug.js';
+import { extensionNames } from './pr-footer.js';
 import { createMessageThrottle } from './mcp/message-throttle.js';
 import { bindHost } from './runtime.js';
 import { isAllowedOrigin, isAllowedHost } from './origin-check.js';
@@ -189,9 +190,8 @@ sessionManager._noteLaunch = ({ sessionId, entry, ext: fields }) => {
 // The `owner/repo` the PR footer names each extension this session used by.
 // GitHub origins only: the line exists to be found with `gh search prs`, and a
 // non-GitHub origin (a local path, say) is not something to publish in a PR.
-const footerExtensions = (sessionId) => [...new Set(extUsage.extensionsFor(sessionId)
-  .map((id) => parseGithubSlug(ext.list.find((e) => e.id === id)?.provenance?.originUrl))
-  .filter(Boolean))].sort();
+const footerExtensions = (sessionId) => extensionNames(extUsage.extensionsFor(sessionId)
+  .map((id) => parseGithubSlug(ext.list.find((e) => e.id === id)?.provenance?.originUrl)));
 // Reads the session's transcript once more before a footer is written, so a
 // skill used moments before `gh pr create` is counted even if no graph tick
 // has run since. The same incremental analysis the tick does.
