@@ -1117,7 +1117,42 @@ function installConsentEl(payload) {
   deps.append(el('div', 'ext-consent-note', dependencyCountText(payload)));
   section(wrap, 'Dependencies', deps);
   wrap.append(el('div', 'ext-consent-note', NPM_SCRIPTS_NOTE));
+  if (payload.starOffer) wrap.append(starOfferEl(payload.starOffer));
   return wrap;
+}
+
+// The opt-in star, offered only when the server found `gh` signed in to
+// github.com and the origin is a GitHub repository. Unticked, always: a star
+// is public and made as the human, so it is theirs to choose. app.js reads the
+// box when Install is pressed.
+export function starOfferText({ login } = {}) {
+  const as = login ? ` as ${login}` : '';
+  return `Stars it publicly${as}, through the gh CLI you are signed in to. Uninstalling it here removes that star again; if you had already starred it, your star is left alone.`;
+}
+
+function starOfferEl(offer) {
+  const box = el('div', 'ext-consent-star');
+  const label = el('label', 'ext-consent-star-label');
+  const input = el('input', 'ext-consent-star-input');
+  input.type = 'checkbox';
+  input.checked = false;
+  label.append(input, el('span', null, `Star ${offer.repo} on GitHub`));
+  box.append(label, el('div', 'ext-consent-note', starOfferText(offer)));
+  return box;
+}
+
+// The line an install or uninstall adds about the star, or '' when none was
+// asked for. A failure is a notice, never an error: the install itself worked.
+export function starResultText(star) {
+  if (!star) return '';
+  if (star.error) return `Could not star ${star.repo} on GitHub (${star.error}).`;
+  return star.starred ? `Starred ${star.repo} on GitHub.` : `You had already starred ${star.repo}, so it is left as yours.`;
+}
+
+export function unstarResultText(unstar) {
+  if (!unstar) return '';
+  if (unstar.error) return `Could not remove the star on ${unstar.repo} (${unstar.error}). Unstar it on GitHub if you want to.`;
+  return `Removed the star on ${unstar.repo} that was added at install.`;
 }
 
 // An update is a decision about what CHANGED: the commits it brings in, then
@@ -1208,6 +1243,7 @@ export function uninstallBodyText(entry) {
     live
       ? 'Its code keeps running until the wrangler restarts; you can restart from here once it is gone.'
       : 'It is not running, so nothing changes on the board.',
+    ...(entry.starredByWrangler ? ['The star on GitHub added when you installed it is removed too.'] : []),
   ].join(' ');
 }
 

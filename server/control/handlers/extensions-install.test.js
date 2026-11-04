@@ -746,3 +746,133 @@ test('ext-set-early-adopter replies a refusal on its reqId, and refuses builtin 
   assert.equal(c.calls.rebuild, 0);
   reset();
 });
+
+// Opt-in starring. `gh` is a stub that records every call and keeps the star
+// state, so nothing here can reach the real CLI or GitHub.
+const URL_GH = 'https://github.com/acme/notes-ext.git';
+const STAR_PATH = 'user/starred/acme/notes-ext';
+
+function fakeGh({ authed = true, starred = false, fail = {} } = {}) {
+  const state = { starred, calls: [] };
+  state.gh = async (args) => {
+    state.calls.push(args.join(' '));
+    if (args[0] === 'auth') return authed ? { code: 0, stdout: '', stderr: 'github.com\n  ✓ Logged in to github.com account octo (keyring)\n' } : { code: 1, stdout: '', stderr: 'You are not logged into any GitHub hosts.' };
+    const method = args.includes('--method') ? args[args.indexOf('--method') + 1] : 'GET';
+    if (fail[method]) return { code: 1, stdout: '', stderr: fail[method] };
+    if (method === 'GET') return { code: state.starred ? 0 : 1, stdout: state.starred ? 'HTTP/2.0 204 No Content\n' : 'HTTP/2.0 404 Not Found\n\n{}', stderr: '' };
+    state.starred = method === 'PUT';
+    return { code: 0, stdout: '', stderr: '' };
+  };
+  return state;
+}
+
+async function installGh(c, gh, { star, url = URL_GH } = {}) {
+  _setInstallRunnersForTests({ clone: fakeClone(), head: async () => 'c'.repeat(40), npm: async () => {}, commits: async () => ({ commits: [], truncated: false }), gh: gh.gh });
+  await extInstallHandler.handler({ type: 'ext-install', url }, c);
+  const disclosure = reply(c, 'ext-install-disclosure');
+  await extConsentHandler.handler({ type: 'ext-consent', tempId: disclosure.tempId, approve: true, star }, c);
+  return { disclosure, done: reply(c, 'ext-install-done') };
+}
+
+const apiCalls = (gh) => gh.calls.filter((call) => call.startsWith('api'));
+
+test('a fresh GitHub install offers the star unticked; a ticked one stars and records it, uninstall unstars', async () => {
+  reset();
+  const gh = fakeGh();
+  const c = ctx();
+  const { disclosure, done } = await installGh(c, gh, { star: true });
+  assert.deepEqual(disclosure.starOffer, { repo: 'acme/notes-ext', login: 'octo' });
+  assert.deepEqual(done.star, { repo: 'acme/notes-ext', starred: true, alreadyStarred: false });
+  assert.equal(gh.starred, true);
+  assert.equal(readProvenance().notes.starredByWrangler, true);
+  assert.deepEqual(apiCalls(gh), [
+    `api --hostname github.com --include ${STAR_PATH}`,
+    `api --hostname github.com --method PUT --silent ${STAR_PATH}`,
+  ]);
+  const u = ctx([{ id: 'notes', external: true }]);
+  await extUninstallHandler.handler({ type: 'ext-uninstall', id: 'notes' }, u);
+  assert.deepEqual(reply(u, 'ext-uninstall-done').unstar, { repo: 'acme/notes-ext', unstarred: true });
+  assert.equal(gh.starred, false);
+  assert.equal(apiCalls(gh).at(-1), `api --hostname github.com --method DELETE --silent ${STAR_PATH}`);
+  reset();
+});
+
+test('left unticked, nothing is starred and uninstall touches no star', async () => {
+  reset();
+  const gh = fakeGh();
+  const { done } = await installGh(ctx(), gh, { star: false });
+  assert.equal(done.star, undefined);
+  assert.deepEqual(apiCalls(gh), []);
+  assert.equal(readProvenance().notes.starredByWrangler, false);
+  const u = ctx([{ id: 'notes', external: true }]);
+  await extUninstallHandler.handler({ type: 'ext-uninstall', id: 'notes' }, u);
+  assert.equal(reply(u, 'ext-uninstall-done').unstar, undefined);
+  assert.deepEqual(apiCalls(gh), []);
+  reset();
+});
+
+test('a repository the human had already starred is left as theirs: not recorded, never unstarred', async () => {
+  reset();
+  const gh = fakeGh({ starred: true });
+  const { done } = await installGh(ctx(), gh, { star: true });
+  assert.deepEqual(done.star, { repo: 'acme/notes-ext', starred: false, alreadyStarred: true });
+  assert.equal(readProvenance().notes.starredByWrangler, false);
+  assert.equal(apiCalls(gh).some((call) => call.includes('PUT')), false);
+  await extUninstallHandler.handler({ type: 'ext-uninstall', id: 'notes' }, ctx([{ id: 'notes', external: true }]));
+  assert.equal(gh.starred, true, 'their own star stays');
+  assert.equal(apiCalls(gh).some((call) => call.includes('DELETE')), false);
+  reset();
+});
+
+test('no offer when gh is signed out, the origin is not GitHub, or the extension is already installed', async () => {
+  reset();
+  const signedOut = fakeGh({ authed: false });
+  const c1 = ctx();
+  const out = await installGh(c1, signedOut, { star: true });
+  assert.equal(out.disclosure.starOffer, undefined);
+  assert.equal(out.done.star, undefined, 'a frame asking for a star that was never offered is ignored');
+  assert.deepEqual(apiCalls(signedOut), []);
+  reset();
+  const elsewhere = fakeGh();
+  const off = await installGh(ctx(), elsewhere, { star: true, url: URL_NOTES });
+  assert.equal(off.disclosure.starOffer, undefined);
+  assert.deepEqual(elsewhere.calls, [], 'not even gh auth status for a non-GitHub origin');
+  reset();
+  // An update keeps what was chosen at install, with no new offer and no gh call.
+  const gh = fakeGh();
+  await installGh(ctx(), gh, { star: true });
+  const before = gh.calls.length;
+  const c2 = ctx([{ id: 'notes', external: true }]);
+  const update = await installGh(c2, gh, { star: true });
+  assert.equal(update.disclosure.update, true);
+  assert.equal(update.disclosure.starOffer, undefined);
+  assert.equal(gh.calls.length, before);
+  assert.equal(readProvenance().notes.starredByWrangler, true, 'the flag survives the update');
+  reset();
+});
+
+test('a star or unstar failure is reported, never fails the install or uninstall', async () => {
+  reset();
+  const putFails = fakeGh({ fail: { PUT: 'gh: Resource not accessible by integration (HTTP 403)' } });
+  const c = ctx();
+  const { done } = await installGh(c, putFails, { star: true });
+  assert.equal(done.installed, true);
+  assert.deepEqual(done.star, { repo: 'acme/notes-ext', error: 'gh: Resource not accessible by integration (HTTP 403)' });
+  assert.equal(readProvenance().notes.starredByWrangler, false);
+  reset();
+  const getFails = fakeGh({ fail: { GET: 'error connecting to api.github.com' } });
+  const second = await installGh(ctx(), getFails, { star: true });
+  assert.equal(second.done.installed, true);
+  assert.match(second.done.star.error, /error connecting/);
+  assert.equal(apiCalls(getFails).some((call) => call.includes('PUT')), false);
+  reset();
+  const deleteFails = fakeGh({ fail: { DELETE: 'HTTP 401: Bad credentials' } });
+  await installGh(ctx(), deleteFails, { star: true });
+  const u = ctx([{ id: 'notes', external: true }]);
+  await extUninstallHandler.handler({ type: 'ext-uninstall', id: 'notes' }, u);
+  const gone = reply(u, 'ext-uninstall-done');
+  assert.deepEqual(gone.unstar, { repo: 'acme/notes-ext', error: 'HTTP 401: Bad credentials' });
+  assert.equal(fs.existsSync(path.join(externalDir(), 'notes')), false, 'the uninstall still completed');
+  assert.equal(readProvenance().notes, undefined);
+  reset();
+});

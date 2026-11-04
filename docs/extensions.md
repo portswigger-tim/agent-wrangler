@@ -55,9 +55,28 @@ An agent can draft the same issue with the `report_extension_issue` tool (see
 
 An extension installed from a GitHub URL also shows its stars and open issues (GitHub's count, which
 includes open pull requests), with a link to the issues and **Star on GitHub**, which opens the
-repository so you can star it there. Agent Wrangler never stars anything for you. The numbers come
-from GitHub's public API without a token, are cached for 30 minutes, and reuse what the
-**Browse GitHub** list already fetched. Core and hand-placed extensions show no stats.
+repository so you can star it there. Agent Wrangler never stars without your opt-in, and only
+unstars what it starred. The numbers come from GitHub's public API without a token, are cached for
+30 minutes, and reuse what the **Browse GitHub** list already fetched. Core and hand-placed
+extensions show no stats.
+
+### Star an extension when you install it
+
+When you install an extension from a GitHub URL and the `gh` CLI is signed in to github.com, the
+consent dialog has a **Star OWNER/REPO on GitHub** checkbox. It is unticked: a star is public and
+made as your GitHub account, so nothing is starred unless you tick it. Ticked, Agent Wrangler stars
+the repository through `gh` once the install has succeeded. If you had already starred it, your star
+is left as yours.
+
+Uninstalling the extension from **Settings → Extensions** removes a star Agent Wrangler added, and
+the uninstall dialog says so. It never removes a star you made yourself. Updating or reinstalling
+keeps the star, and you are not asked again. The box is offered only when you install an extension
+you don't already have.
+
+A star or unstar that fails (`gh` signed out, a token without the scope, no network) never stops the
+install or uninstall: the result toast says what happened, and you can star or unstar on GitHub
+yourself. Because stars come and go with installs, an extension's star count is a rough count of
+the people who opted in and still have it installed, plus anyone who starred it on GitHub.
 
 ### Auto-update an extension
 

@@ -14,6 +14,7 @@ import {
   removeRecord,
   setAutoUpdate,
   setEarlyAdopter,
+  setStarredByWrangler,
   trackedBranch,
   ensureDirs,
 } from './provenance.js';
@@ -40,6 +41,7 @@ const record = (over = {}) => ({
   autoUpdate: false,
   earlyAdopterBranch: null,
   earlyAdopter: false,
+  starredByWrangler: false,
   ...over,
 });
 
@@ -115,7 +117,7 @@ test('missing or malformed fields normalise instead of throwing', () => {
   assert.deepEqual(Object.keys(all), ['demo']);
   assert.deepEqual(all.demo, {
     id: 'demo', originUrl: null, sha: null, installedAt: null, requires: [], dependencies: [], autoUpdate: false,
-    earlyAdopterBranch: null, earlyAdopter: false,
+    earlyAdopterBranch: null, earlyAdopter: false, starredByWrangler: false,
   });
   clean();
 });
@@ -140,7 +142,7 @@ test('a corrupt file degrades to {} rather than throwing', () => {
 
 test('setAutoUpdate flips only the opt-in, and a record without it reads as off', () => {
   clean();
-  const { autoUpdate, earlyAdopterBranch, earlyAdopter, ...legacy } = record();
+  const { autoUpdate, earlyAdopterBranch, earlyAdopter, starredByWrangler, ...legacy } = record();
   fs.writeFileSync(FILE, JSON.stringify({ demo: legacy }));
   assert.equal(recordFor('demo').autoUpdate, false);
   assert.deepEqual(setAutoUpdate('demo', true), record({ autoUpdate: true }));
@@ -178,5 +180,17 @@ test('setEarlyAdopter refuses a record with no origin or no declared branch; a b
   fs.writeFileSync(FILE, JSON.stringify({ demo: record({ earlyAdopterBranch: '--upload-pack=x', earlyAdopter: true }) }));
   assert.equal(recordFor('demo').earlyAdopterBranch, null);
   assert.equal(trackedBranch(recordFor('demo')), null);
+  clean();
+});
+
+test('setStarredByWrangler records the flag, a missing one reads as off, and an unknown id is a no-op', () => {
+  clean();
+  const { starredByWrangler, ...legacy } = record();
+  fs.writeFileSync(FILE, JSON.stringify({ demo: legacy }));
+  assert.equal(recordFor('demo').starredByWrangler, false);
+  assert.deepEqual(setStarredByWrangler('demo', true), record({ starredByWrangler: true }));
+  assert.equal(recordFor('demo').starredByWrangler, true);
+  assert.equal(setStarredByWrangler('other', true), null);
+  assert.equal(recordFor('other'), null);
   clean();
 });

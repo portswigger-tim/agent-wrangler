@@ -41,7 +41,7 @@ import { MODEL_FRONT } from './model-front-api.js';
 import { createClientExtensionLoader } from './extensions.js';
 import { updatePanelEl, restartPanelEl, shouldReloadForVersion, updateAvailable, rolledBackText, updateToastText, outdatedExtensions, extUpdateKeys, extUpdateIsNew, extUpdateToastText, extUpdatesEl } from './update-panel.js';
 import { statsRepoOf } from './extension-issue.js';
-import { extensionsPanelEl, extensionSettingRowsEl, commitFocusedField, focusedFieldState, restoreFocusedField, consentBodyEl, consentButtonLabels, progressText, uninstallBodyText, AUTO_UPDATE_WARNING, TRANSIENT_PROGRESS_PHASES, RESTART_NOTE as EXT_RESTART_NOTE, AUTO_RESTART_NOTE as EXT_AUTO_RESTART_NOTE, UNINSTALL_RESTART_NOTE as EXT_UNINSTALL_RESTART_NOTE } from './extensions-panel.js';
+import { extensionsPanelEl, extensionSettingRowsEl, starResultText, unstarResultText, commitFocusedField, focusedFieldState, restoreFocusedField, consentBodyEl, consentButtonLabels, progressText, uninstallBodyText, AUTO_UPDATE_WARNING, TRANSIENT_PROGRESS_PHASES, RESTART_NOTE as EXT_RESTART_NOTE, AUTO_RESTART_NOTE as EXT_AUTO_RESTART_NOTE, UNINSTALL_RESTART_NOTE as EXT_UNINSTALL_RESTART_NOTE } from './extensions-panel.js';
 import { HINT_CHARS, hintLabels } from './hints.js';
 import { currentModelValue } from './model-menu.js';
 import {
@@ -7074,7 +7074,9 @@ function openExtConsent(payload) {
     modal.removeEventListener('keydown', onKey);
     modal.removeEventListener('mousedown', onBackdrop);
     extRestartOnDone = restart;
-    send({ type: 'ext-consent', tempId: payload.tempId, approve });
+    // The opt-in star box, present only when the server offered it.
+    const star = Boolean(approve && body.querySelector('.ext-consent-star-input')?.checked);
+    send({ type: 'ext-consent', tempId: payload.tempId, approve, ...(star ? { star } : {}) });
   };
   const onOk = () => done(true, Boolean(labels.later));
   const onLater = () => done(true);
@@ -7522,16 +7524,19 @@ function connect() {
         // `automatic`: the update tick applied it for an extension that opted
         // in, and every tab is told, so the restart button is up wherever the
         // human looks next.
+        const starred = starResultText(msg.star);
+        const withStar = (text) => (starred ? `${text} ${starred}` : text);
         if (msg.automatic) toast(`Auto-updated ${msg.id}. ${canRestartServer ? EXT_AUTO_RESTART_NOTE : EXT_RESTART_NOTE}`);
-        else if (msg.restartRequired) toast(`Installed ${msg.id}. ${EXT_RESTART_NOTE}`);
-        else if (msg.active === false) toast(`Installed ${msg.id}. Turn it on to start it.`);
-        else toast(`Installed ${msg.id} and live. Running sessions pick up its tools when they next resume.`);
+        else if (msg.restartRequired) toast(withStar(`Installed ${msg.id}. ${EXT_RESTART_NOTE}`));
+        else if (msg.active === false) toast(withStar(`Installed ${msg.id}. Turn it on to start it.`));
+        else toast(withStar(`Installed ${msg.id} and live. Running sessions pick up its tools when they next resume.`));
       }
       remountExtensions();
     }
     else if (msg.type === 'ext-uninstall-done') {
       extPendingRemoval.add(msg.id);
-      toast(`Uninstalled ${msg.id}. ${EXT_UNINSTALL_RESTART_NOTE}`);
+      const unstarred = unstarResultText(msg.unstar);
+      toast(`Uninstalled ${msg.id}. ${EXT_UNINSTALL_RESTART_NOTE}${unstarred ? ` ${unstarred}` : ''}`);
       remountExtensions();
     }
     else if (msg.type === 'ext-repo-stats-result') {

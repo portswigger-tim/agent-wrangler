@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   extensionSettingRowsEl, extensionsPanelEl, consentBodyEl, consentButtonLabels, updateStatusText, progressText,
-  uninstallBodyText, TRANSIENT_PROGRESS_PHASES, TRUST_STATEMENT,
+  uninstallBodyText, TRANSIENT_PROGRESS_PHASES, TRUST_STATEMENT, starResultText, unstarResultText,
   commitFocusedField, focusedFieldState, restoreFocusedField, MAX_TEXTAREA_LENGTH, BROWSE_NOTICE, normalizeRepoUrl, updatedAgoText, AUTO_UPDATE_WARNING,
 } from './extensions-panel.js';
 import { MAX_TEXTAREA_LENGTH as SERVER_MAX_TEXTAREA_LENGTH } from '../server/extensions/setting-constraints.js';
@@ -1110,4 +1110,34 @@ test('Feedback: stats only for a GitHub-installed extension, with a Star link th
     }
     assertNoThirdPartyHtml(panel);
   });
+});
+
+test('the install consent offers the star unticked, only when the server offered it', () => {
+  withDom(() => {
+    const base = { id: 'notes', label: 'Notes', capabilities: [], dependencies: [], dependencyCount: 0 };
+    assert.equal(byClass(consentBodyEl(base), 'ext-consent-star').length, 0);
+    const body = consentBodyEl({ ...base, starOffer: { repo: 'acme/notes-ext', login: 'octo' } });
+    const input = byClass(body, 'ext-consent-star-input')[0];
+    assert.equal(input.type, 'checkbox');
+    assert.equal(input.checked, false, 'opt-in: never ticked for the human');
+    const all = texts(body);
+    assert.ok(all.includes('Star acme/notes-ext on GitHub'));
+    assert.ok(all.some((t) => /publicly as octo/.test(t) && /removes that star again/.test(t)));
+    // An update never offers it, even if a payload carried one.
+    const update = consentBodyEl({ ...base, update: true, reconsentNeeded: false, starOffer: { repo: 'acme/notes-ext' }, addedCapabilities: [], removedCapabilities: [] });
+    assert.equal(byClass(update, 'ext-consent-star').length, 0);
+    assertNoThirdPartyHtml(body);
+  });
+});
+
+test('star and unstar results read as notices, and the uninstall dialog names a star it will remove', () => {
+  assert.equal(starResultText(undefined), '');
+  assert.equal(starResultText({ repo: 'acme/x', starred: true }), 'Starred acme/x on GitHub.');
+  assert.match(starResultText({ repo: 'acme/x', starred: false, alreadyStarred: true }), /already starred acme\/x/);
+  assert.match(starResultText({ repo: 'acme/x', error: 'HTTP 403' }), /Could not star acme\/x on GitHub \(HTTP 403\)/);
+  assert.equal(unstarResultText(undefined), '');
+  assert.match(unstarResultText({ repo: 'acme/x', unstarred: true }), /Removed the star on acme\/x/);
+  assert.match(unstarResultText({ repo: 'acme/x', error: 'HTTP 401' }), /Unstar it on GitHub if you want to/);
+  assert.match(uninstallBodyText({ ...INSTALLED, starredByWrangler: true }), /star on GitHub added when you installed it is removed too/);
+  assert.doesNotMatch(uninstallBodyText(INSTALLED), /star/);
 });

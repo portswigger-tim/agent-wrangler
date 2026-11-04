@@ -4,10 +4,12 @@ import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import semver from 'semver';
 import { validateManifest } from '../../extensions/index.js';
-import { externalDir, tmpDir, ensureDirs, isValidExtensionId, readProvenance, recordFor, putRecord, removeRecord, setAutoUpdate, setEarlyAdopter, trackedBranch } from '../../extensions/provenance.js';
+import { externalDir, tmpDir, ensureDirs, isValidExtensionId, readProvenance, recordFor, putRecord, removeRecord, setAutoUpdate, setEarlyAdopter, setStarredByWrangler, trackedBranch } from '../../extensions/provenance.js';
 import { unconsentedCapabilities, admitExternal, importViolation, packageFacts } from '../../extensions/external.js';
 import { assertAllowedUrl, cloneTo, readHead, lockDependencies, npmCi, lsRemoteHead, commitsSince, readDeclaration, MissingLockfileError, MissingDeclarationError } from '../../extensions/install.js';
 import { HOST_API_VERSION, servesRange, isValidRange } from '../../host-api/version.js';
+import { realGh, ghLogin, starRepo, unstarRepo } from '../../extensions/github-star.js';
+import { githubRepoOf } from '../../../public/extension-issue.js';
 import { log } from '../../log.js';
 
 // Installing an external extension, in two frames with a human decision between
@@ -66,11 +68,15 @@ const pending = new Map();
 // with no process and no network. Deliberately a MODULE seam and never an option
 // on the incoming frame: a control frame is browser-supplied, so a `_clone` a
 // client could set would be arbitrary code execution offered as an API.
-const REAL_RUNNERS = { clone: cloneTo, head: readHead, npm: npmCi, lsRemote: lsRemoteHead, commits: commitsSince };
+const REAL_RUNNERS = { clone: cloneTo, head: readHead, npm: npmCi, lsRemote: lsRemoteHead, commits: commitsSince, gh: realGh };
 let runners = REAL_RUNNERS;
 
+// A test that stubs the runners gets a `gh` that is signed out unless it passes
+// one, so no install test can reach the real CLI or star anything.
+const SIGNED_OUT_GH = async () => ({ code: 1, stdout: '', stderr: 'You are not logged into any GitHub hosts.' });
+
 export function _setInstallRunnersForTests(next = null) {
-  runners = next ? { ...REAL_RUNNERS, ...next } : REAL_RUNNERS;
+  runners = next ? { ...REAL_RUNNERS, gh: SIGNED_OUT_GH, ...next } : REAL_RUNNERS;
 }
 
 export const _PENDING_CONSENT_TTL_MS = PENDING_CONSENT_TTL_MS;
@@ -296,6 +302,50 @@ async function loadStagedManifest(dir) {
   return manifest;
 }
 
+// "Star OWNER/REPO on GitHub" is offered, unticked, only on a FRESH install
+// (no record yet: an update or reinstall keeps whatever was chosen before)
+// from a github.com origin while `gh` is signed in to github.com. `login` is
+// the account the star would be made as, '' when `gh` did not say.
+async function starOfferFor(url, existing) {
+  if (existing) return null;
+  const repo = githubRepoOf(url);
+  if (!repo) return null;
+  const login = await ghLogin(runners.gh);
+  return login === null ? null : { ...repo, login };
+}
+
+// Starring and unstarring never fail an install or an uninstall: the outcome
+// rides on the done frame as `star`/`unstar`, and the board shows a failure as
+// a notice. `starredByWrangler` is recorded only when the wrangler added the
+// star — a repository the human had already starred is left as theirs.
+async function starAfterInstall(id, repo) {
+  const name = `${repo.owner}/${repo.repo}`;
+  try {
+    const { starred } = await starRepo(repo, runners.gh);
+    if (starred) setStarredByWrangler(id, true);
+    log(`[agent-wrangler] extension ${id}: ${starred ? 'starred' : 'already starred'} ${name} on GitHub`);
+    return { star: { repo: name, starred, alreadyStarred: !starred } };
+  } catch (err) {
+    const error = String(err?.message || err);
+    log(`[agent-wrangler] extension ${id}: could not star ${name} on GitHub (${error})`);
+    return { star: { repo: name, error } };
+  }
+}
+
+async function unstarAfterUninstall(id, repo) {
+  if (!repo) return {};
+  const name = `${repo.owner}/${repo.repo}`;
+  try {
+    await unstarRepo(repo, runners.gh);
+    log(`[agent-wrangler] extension ${id}: removed the star on ${name} it added at install`);
+    return { unstar: { repo: name, unstarred: true } };
+  } catch (err) {
+    const error = String(err?.message || err);
+    log(`[agent-wrangler] extension ${id}: could not unstar ${name} on GitHub (${error})`);
+    return { unstar: { repo: name, error } };
+  }
+}
+
 export const extInstallHandler = {
   type: 'ext-install',
   async handler(msg, ctx) {
@@ -349,6 +399,7 @@ export const extInstallHandler = {
       const existing = recordFor(declared.id);
       // Best effort: a missing list costs the human context, not the update.
       const history = existing ? await runners.commits(dir, existing.sha || '').catch(() => null) : null;
+      const star = await starOfferFor(url, existing);
       const reply = {
         type: 'ext-install-disclosure',
         tempId,
@@ -358,8 +409,9 @@ export const extInstallHandler = {
         dependencyCount: deps.all.length,
         ...(existing ? updateDiff(existing, declared, deps) : { update: false, reconsentNeeded: true }),
         ...(history ? { commits: history.commits, commitsTruncated: history.truncated } : {}),
+        ...(star ? { starOffer: { repo: `${star.owner}/${star.repo}`, login: star.login } } : {}),
       };
-      pending.set(tempId, { url, sha, declared, deps, dir, branch });
+      pending.set(tempId, { url, sha, declared, deps, dir, branch, star });
       busy.awaitingConsent = true;
       busy.since = Date.now();
       // The lock is HELD across the human's decision, deliberately: the staging
@@ -383,7 +435,10 @@ export const extConsentHandler = {
     const staged = pending.get(msg.tempId);
     if (!staged) throw new Error('That install is no longer pending — start it again.');
     pending.delete(msg.tempId);
-    const { url, sha, declared, deps, dir, branch } = staged;
+    const { url, sha, declared, deps, dir, branch, star } = staged;
+    // Only what this disclosure offered: a frame cannot ask for a star on an
+    // install that was never shown the checkbox.
+    const wantsStar = Boolean(msg.star && star);
     try {
       if (!msg.approve) {
         rmQuiet(dir);
@@ -435,21 +490,27 @@ export const extConsentHandler = {
         autoUpdate: recordFor(manifest.id)?.autoUpdate === true,
         earlyAdopterBranch: declared.earlyAdopterBranch,
         earlyAdopter: recordFor(manifest.id)?.earlyAdopter === true,
+        // Kept across a reinstall or update, so uninstall can still take back
+        // the star the wrangler added at the first install.
+        starredByWrangler: recordFor(manifest.id)?.starredByWrangler === true,
       });
       log(`[agent-wrangler] extension ${manifest.id} installed from ${url}${branch ? ` (early-adopter branch ${branch} if present)` : ''} at ${sha.slice(0, 8)}`);
       if (registered) {
+        const starred = wantsStar ? await starAfterInstall(manifest.id, star) : {};
         progress(ctx, 'done', { id: manifest.id, restartRequired: true });
-        ctx.reply({ type: 'ext-install-done', id: manifest.id, installed: true, sha, restartRequired: true });
+        ctx.reply({ type: 'ext-install-done', id: manifest.id, installed: true, sha, restartRequired: true, ...starred });
         await ctx.rebuild();
         return;
       }
       const entry = await goLive(ctx, manifest.id, dest);
+      // After goLive, so a star is never left on an install that rolled back.
+      const starred = wantsStar ? await starAfterInstall(manifest.id, star) : {};
       progress(ctx, 'done', { id: manifest.id });
       // `active: false` is the honest end state when config says this extension
       // is off — `defaultEnabled` absent or false, or a stale `extensions.<id>`
       // left behind by an earlier uninstall. It is registered and one toggle
       // away, and saying "installed and live" there would be a lie.
-      ctx.reply({ type: 'ext-install-done', id: manifest.id, installed: true, sha, active: Boolean(entry.enabled) });
+      ctx.reply({ type: 'ext-install-done', id: manifest.id, installed: true, sha, active: Boolean(entry.enabled), ...starred });
       await ctx.rebuild();
     } catch (err) {
       // On ANY failure at any point the staging dir goes — it is never left
@@ -469,6 +530,7 @@ export const extUninstallHandler = {
     if (!known) throw new Error(`Unknown extension: ${id}`);
     if (!known.external) throw new Error(`${id} ships with the wrangler and cannot be uninstalled — turn it off instead.`);
     const dest = safeExtPath(id);
+    const record = recordFor(id);
     // Deactivated and deregistered BEFORE the files go: its row, tools,
     // handlers, stores, sweeps and client asset are gone on the next tick. What
     // no uninstall can undo is the module import itself — Node keeps it forever
@@ -485,7 +547,8 @@ export const extUninstallHandler = {
     // there is nothing here that can enumerate it. An explicit purge is deferred;
     // see the spec's Deferred section, and uninstallBodyText, which says so.
     log(`[agent-wrangler] extension ${id} uninstalled (its own saved data, wherever it put it, is left)`);
-    ctx.reply({ type: 'ext-uninstall-done', id, restartRequired: true });
+    const unstarred = record?.starredByWrangler ? await unstarAfterUninstall(id, githubRepoOf(record.originUrl)) : {};
+    ctx.reply({ type: 'ext-uninstall-done', id, restartRequired: true, ...unstarred });
     await ctx.rebuild();
   },
 };

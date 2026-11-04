@@ -11,7 +11,7 @@ import { isValidBranchName } from '../worktree.js';
 // hand-edited file in the path of an atomic whole-file rewrite on every install.
 //
 // A record is `{ id, originUrl, sha, installedAt, requires, dependencies,
-// autoUpdate, earlyAdopterBranch, earlyAdopter }`, and `requires`/`dependencies` are the whole point of persisting
+// autoUpdate, earlyAdopterBranch, earlyAdopter, starredByWrangler }`, and `requires`/`dependencies` are the whole point of persisting
 // anything: `requires` is the
 // CONSENTED capability set (a later version's `requires` is diffed against it to
 // decide whether the human must consent again), and `dependencies` is the
@@ -132,6 +132,17 @@ export function setEarlyAdopter(id, on) {
   return all[id];
 }
 
+// Records that the wrangler added (or, false, removed) the human's star on
+// this extension's repository. A no-op for an id with no record.
+export function setStarredByWrangler(id, on) {
+  const all = readProvenance();
+  const rec = isValidExtensionId(id) ? all[id] : null;
+  if (!rec) return null;
+  all[id] = normalise(id, { ...rec, starredByWrangler: on === true });
+  writeJsonAtomic(provenanceFile(), all, { trailingNewline: true });
+  return all[id];
+}
+
 // The branch an install, update check or update of this record follows instead
 // of the remote's default: its early-adopter branch while opted in, else null.
 // Whether the remote still has that branch is install.js's question.
@@ -158,6 +169,10 @@ function normalise(id, rec) {
     autoUpdate: rec.autoUpdate === true,
     earlyAdopterBranch: isValidBranchName(rec.earlyAdopterBranch) ? rec.earlyAdopterBranch : null,
     earlyAdopter: rec.earlyAdopter === true,
+    // The wrangler starred this extension's GitHub repository because the
+    // human ticked "Star on GitHub" at install (github-star.js). Only then may
+    // uninstall unstar it; a star the human made themselves is never recorded.
+    starredByWrangler: rec.starredByWrangler === true,
   };
 }
 

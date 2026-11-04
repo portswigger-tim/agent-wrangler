@@ -519,6 +519,9 @@ export function extensionsForGraph(list, enabledFor = extensionEnabled, valuesFo
     // The auto-update opt-in, for the detail pane's switch. False for a
     // builtin or hand-placed entry, which has no record to carry it.
     autoUpdate: Boolean(provenance?.autoUpdate),
+    // The wrangler starred its repository at install (opt-in), so the
+    // uninstall dialog can say that star goes too.
+    starredByWrangler: Boolean(provenance?.starredByWrangler),
     // Backs the client `api.earlyAdopter`; null when the manifest declares no
     // branch. The host draws nothing for it.
     earlyAdopter: earlyAdopterFacts(earlyAdopterBranch, provenance),
