@@ -1,5 +1,6 @@
 import { COPY_ICON, CHECK_ICON, PROMOTE_ICON, RESTART_ICON, GITHUB_ICON, STAR_ICON, ATTACH_ICON, SEARCH_ICON } from './icons.js';
 import { changesText } from './update-panel.js';
+import { timeAgo } from './util.js';
 
 // The Extensions settings tab and the install/update consent modal. Pure DOM
 // builders with no app state, like toast.js and system-banner.js: settings.js
@@ -207,12 +208,41 @@ function sourceEl(entry) {
   return list;
 }
 
+// How this extension has been used on this machine, from the local usage
+// ledger (server/extension-usage.js): `undefined` while the answer is on its
+// way, null when nothing is recorded. Only a git-installed extension has one.
+const USAGE_HELP = 'Counted on this machine only. Nothing is sent anywhere; PRs a session opens can name the extension in an "Extensions:" line (Settings › Automation).';
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const topText = (items) => items.map(({ name, count }) => `${name} (${count})`).join(', ');
+
+export function extensionUsageEl(usage) {
+  const box = el('div', 'ext-usage');
+  if (usage === undefined) {
+    box.append(el('div', 'setting-help', 'Loading…'));
+    return box;
+  }
+  if (!usage || (!usage.sessions && !usage.lastUsedAt)) {
+    box.append(el('div', 'setting-help', `Not used yet. ${USAGE_HELP}`));
+    return box;
+  }
+  const last = usage.lastUsedAt ? timeAgo(Date.parse(usage.lastUsedAt)) : null;
+  box.append(el('div', 'ext-usage-line', [`Used in ${plural(usage.sessions || 0, 'session')}`, last && `last used ${last}`].filter(Boolean).join(' · ')));
+  const list = el('div', 'ext-kv');
+  const rows = [['Top tools', usage.tools], ['Top skills', usage.skills], ['Runtimes', usage.runtimes], ['Board actions', usage.handlers]];
+  for (const [key, items] of rows) {
+    if (Array.isArray(items) && items.length) kvRow(list, key, el('span', 'ext-mono', topText(items)));
+  }
+  if (list.childNodes.length) box.append(list);
+  box.append(el('div', 'setting-help', USAGE_HELP));
+  return box;
+}
+
 // The right pane for one extension. The header row is a `.setting-row` with
 // `data-id="ext:<id>"` around a `.setting-toggle`, which is exactly what
 // settings.js's delegated click handler already drives (and where it puts its
 // flip note), so the enable switch has no second flip path.
 export function extensionDetailEl(entry, {
-  status, pendingRemoval, settings, onUninstall, onAutoUpdate,
+  status, pendingRemoval, settings, usage, onUninstall, onAutoUpdate,
 } = {}) {
   const pane = el('div', 'ext-detail-body');
   const head = el('div', 'setting-row ext-detail-head');
@@ -257,6 +287,9 @@ export function extensionDetailEl(entry, {
   // Only an extension with a recorded origin has anything to update from: a
   // builtin ships with the wrangler and a hand-placed one has no record.
   if (entry.external && entry.origin && !pendingRemoval) section(pane, 'Updates', autoUpdateRowEl(entry, onAutoUpdate));
+  // Usage is recorded for git-installed extensions only, so a builtin or a
+  // hand-placed one has no section rather than a permanent "not used yet".
+  if (entry.external && entry.origin && !pendingRemoval) section(pane, 'Usage', extensionUsageEl(usage));
   section(pane, 'Source', sourceEl(entry));
   if (settings && !pendingRemoval) section(pane, 'Settings', settings);
   return pane;
@@ -860,7 +893,7 @@ function defaultSettingsEl(entry, onSettingChange) {
 export function extensionsPanelEl({
   entries = [], statuses = {}, checking = false, progress = '', busy = false,
   pendingRemoval = [], pendingInstall = '', canRestart = false, restarting = false,
-  selectedId = '', filter = '', adding = false, browse = null, addMode = 'browse', browseQuery = '',
+  selectedId = '', filter = '', adding = false, browse = null, addMode = 'browse', browseQuery = '', usages = {},
   onSelect, onFilter, onAdd, onAddMode, onBrowseQuery, onInstall, onBrowse, onUninstall, onUpdate, onUpdateAll,
   onCheckUpdates, onRestart, onSettingChange, onAutoUpdate, settingsEl,
 } = {}) {
@@ -967,6 +1000,7 @@ export function extensionsPanelEl({
       status: statusOf(selected),
       pendingRemoval: removing.has(selected.id),
       settings,
+      usage: usages[selected.id],
       onUninstall,
       onAutoUpdate,
     }));

@@ -173,6 +173,7 @@ let childFullViewByDefault = false; // server config flag, carried on every grap
 let autoFixPrChecksDefault = true; // server config flag, carried on every graph push
 let mailWakesDormant = false;
 let prModelFooter = true;
+let prExtensionsFooter = true;
 let archiveReviewEnabled = false; // server config flag, carried on every graph push
 let chatViewDefault = false; // server config flag, carried on every graph push
 let defaultSessionCwd = ''; // server config value, carried on every graph push
@@ -848,6 +849,7 @@ function applyGraph(graph) {
   archiveReviewEnabled = graph.archiveReviewEnabled === true;
   mailWakesDormant = graph.mailWakesDormant === true;
   prModelFooter = graph.prModelFooter !== false;
+  prExtensionsFooter = graph.prExtensionsFooter !== false;
   chatViewDefault = graph.chatViewDefault === true;
   defaultSessionCwd = typeof graph.defaultSessionCwd === 'string' ? graph.defaultSessionCwd : '';
   defaultRuntime = typeof graph.defaultRuntime === 'string' && graph.defaultRuntime ? graph.defaultRuntime : 'local';
@@ -6874,6 +6876,11 @@ let extRestartAfterUpdates = false;
 // Refresh, then kept for the life of the page so reopening it costs nothing.
 let extBrowse = null;
 const searchExtBrowse = () => { extBrowse = { loading: true, repos: extBrowse?.repos || [] }; send({ type: 'ext-browse' }); };
+// Each extension's usage summary from the local ledger (the `ext-usage`
+// request), fetched when it is selected rather than carried on every graph.
+// A missing key reads as "loading", null as "never used".
+const extUsages = {};
+const requestExtUsage = (id) => { if (id) send({ type: 'ext-usage', id }); };
 // The detail pane's settings.panel host, torn down before every remount.
 let extSettingsPanelHost = null;
 
@@ -6972,7 +6979,8 @@ function mountExtensionsPanel(host) {
     browse: extBrowse,
     addMode: extAddMode,
     browseQuery: extBrowseQuery,
-    onSelect: (id) => { extSelectedId = id; extAdding = false; remountExtensions(); },
+    usages: extUsages,
+    onSelect: (id) => { extSelectedId = id; extAdding = false; requestExtUsage(id); remountExtensions(); },
     onFilter: (text) => { extFilter = text; },
     onBrowseQuery: (text) => { extBrowseQuery = text; },
     onAddMode: (mode) => {
@@ -7072,6 +7080,7 @@ initSettings({
       if (id === 'archiveReviewEnabled') return archiveReviewEnabled;
       if (id === 'mailWakesDormant') return mailWakesDormant;
       if (id === 'prModelFooter') return prModelFooter;
+      if (id === 'prExtensionsFooter') return prExtensionsFooter;
       if (id === 'chatViewDefault') return chatViewDefault;
       if (id === 'defaultSessionCwd') return defaultSessionCwd;
       if (id === 'defaultRuntime') return defaultRuntime;
@@ -7111,6 +7120,9 @@ initSettings({
       } else if (id === 'prModelFooter') {
         prModelFooter = Boolean(value);
         send({ type: 'set-pr-model-footer', enabled: prModelFooter });
+      } else if (id === 'prExtensionsFooter') {
+        prExtensionsFooter = Boolean(value);
+        send({ type: 'set-pr-extensions-footer', enabled: prExtensionsFooter });
       } else if (id === 'chatViewDefault') {
         chatViewDefault = Boolean(value);
         send({ type: 'set-chat-view-default', enabled: chatViewDefault });
@@ -7500,6 +7512,10 @@ function connect() {
     else if (msg.type === 'ext-uninstall-done') {
       extPendingRemoval.add(msg.id);
       toast(`Uninstalled ${msg.id}. ${EXT_UNINSTALL_RESTART_NOTE}`);
+      remountExtensions();
+    }
+    else if (msg.type === 'ext-usage') {
+      if (msg.id) extUsages[msg.id] = msg.usage ?? null;
       remountExtensions();
     }
     else if (msg.type === 'ext-browse-results') {

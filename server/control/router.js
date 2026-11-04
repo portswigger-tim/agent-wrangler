@@ -49,6 +49,9 @@ export async function routeControlMessage(raw, ctx, { handlers = null } = {}) {
     // unchanged for both: an extension handler throwing must still reply
     // {type:'error'} rather than tear down the socket.
     if (entry.extId) {
+      // Counted in the usage ledger without a session: a board frame is the
+      // human acting, not a session using the extension.
+      try { ctx.noteExtUse?.(null, entry.extId, 'handlers', entry.type); } catch { /* best effort */ }
       const reply = (payload) => ctx.reply({ ...payload, type: `ext:${entry.extId}` });
       await runWithOrigin(ctx.reply, () => entry.handler(msg, ctx.hostApiFor?.(entry.extId), reply));
     } else {

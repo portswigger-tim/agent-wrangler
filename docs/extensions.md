@@ -31,8 +31,25 @@ capabilities), which restarts once the update has installed; after **Update all*
 after the last update. **Update without restarting** applies the update and leaves **Restart now** in
 the panel for later. Elsewhere the dialog offers just **Update**.
 Select an extension to see its **Enabled** switch, **Uninstall…** (installed
-only), its **Auto-update** switch (installed from a git URL only), its **Source** (type, repository and
-commit) and its **Settings**.
+only), its **Auto-update** switch (installed from a git URL only), its **Usage** (installed from a git
+URL only, see below), its **Source** (type, repository and commit) and its **Settings**.
+
+### Usage
+
+For an extension installed from a git URL, the detail pane's **Usage** section shows how often
+sessions on this machine used it, for example "Used in 14 sessions · last used 2h ago", followed by
+its most-used tools, skills, runtimes and board actions. A session counts as using an extension when
+it calls one of its MCP tools, launches on a runtime it adds, is dispatched with its dispatch fields,
+or invokes a skill it ships or provides. A board action is counted for the extension but not for any
+session.
+
+The counts are kept in `<AW_DATA_DIR>/extension-usage.json` and never leave the machine. Extensions
+cannot read them: there is no host API for it. Core extensions and extensions placed in the
+extensions folder by hand are never recorded, so they have no Usage section. Skill counts for Codex
+sessions are best effort (see [Extensions line](reviews-and-prs.md#extensions-line)).
+
+When a session opens a pull request, the extensions it used are named in the PR description's
+`Extensions:` line, which you can turn off in **Settings → Automation**.
 
 ### Auto-update an extension
 
@@ -235,6 +252,33 @@ name and a strip of its accent, green and red. The button handles no clicks itse
 
 For development, place it under `<AW_DATA_DIR>/extensions/<id>/` and restart. Hand-placed extensions
 have no provenance or panel updates; use an isolated `AW_DATA_DIR`.
+
+## For extension authors: seeing your usage
+
+Agent Wrangler sends no telemetry, to you or anyone else. What an extension's owner can see comes from
+GitHub:
+
+- **Pull requests that used it.** When a session that used your extension opens a pull request, its
+  description gets an `Extensions:` line naming your repository (unless the user turned it off). Search
+  for it across GitHub with:
+
+  ```sh
+  gh search prs '"Extensions:" acme/widgets-ext in:body'
+  ```
+
+  Only public pull requests, and private ones you can read, are found. The line names an extension by
+  the GitHub `owner/repo` it was installed from, so it is only added for extensions installed from a
+  GitHub URL.
+- **Installs.** Every install and update is a `git clone` or fetch of your repository, so clone traffic
+  is a rough install count. Only the repository owner, or someone with push access, can read it, and
+  GitHub keeps 14 days:
+
+  ```sh
+  gh api repos/acme/widgets-ext/traffic/clones
+  ```
+
+- **Stars.** The **+ Add extension** browser lists tagged repositories with their star counts, so stars
+  are what users see first.
 
 ## Authoring rules
 

@@ -314,7 +314,7 @@ export async function activityInRange(sessionId, startMs, endMs, projectsDir = P
 }
 
 function emptyState(transcript, since = 0) {
-  return { transcript, since, offset: 0, totals: {}, subAgentTotals: {}, advisorTotals: {}, subAdvisorTotals: {}, subAgents: [], legacyAgents: new Map(), subFiles: new Map(), leftover: '', lastActivity: 0, summary: null, aiTitle: null, currentModel: null, seenUsageIds: new Set(), apiError: false, apiErrorText: null };
+  return { transcript, since, offset: 0, totals: {}, subAgentTotals: {}, advisorTotals: {}, subAdvisorTotals: {}, subAgents: [], legacyAgents: new Map(), subFiles: new Map(), leftover: '', lastActivity: 0, summary: null, aiTitle: null, currentModel: null, seenUsageIds: new Set(), apiError: false, apiErrorText: null, skills: {} };
 }
 
 // Add one per-model totals bag into another (the shape addUsage builds), so the
@@ -461,6 +461,13 @@ export function scanLine(line, state) {
       // finds a subagents/ dir, so a modern dispatch isn't double-counted.
       // Skipping an inherited tool_use also drops its tool_result for free — the
       // result only lands if its tool_use_id is already in the map.
+      // Skill invocations by name, for the extension usage ledger
+      // (server/extension-usage.js). Absolute counts for this transcript; the
+      // ledger counts only their growth. Inherited (fork-replayed) calls are
+      // the parent's, not this session's.
+      if (block?.type === 'tool_use' && !inherited && block.name === 'Skill' && typeof block.input?.skill === 'string' && block.input.skill) {
+        state.skills[block.input.skill] = (state.skills[block.input.skill] || 0) + 1;
+      }
       if (block?.type === 'tool_use' && !inherited && (block.name === 'Agent' || block.name === 'Task')) {
         const input = block.input || {};
         const id = block.id || `${state.legacyAgents.size}`;
@@ -891,5 +898,6 @@ function summarise(state) {
     currentModel: state.currentModel || null,
     apiError: Boolean(state.apiError),
     apiErrorText: state.apiErrorText || null,
+    skills: { ...state.skills },
   };
 }

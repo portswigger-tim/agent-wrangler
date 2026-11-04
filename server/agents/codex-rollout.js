@@ -5,6 +5,7 @@ import os from 'node:os';
 import { codexCostUsd, codexCostUsdByType, LONG_CONTEXT_TOKENS } from '../pricing.js';
 import { priceCatalogVersion } from '../price-catalog.js';
 import { codexCatalogVersion, liveCodexContextWindow } from './codex-catalog.js';
+import { skillReadsIn } from '../extension-usage.js';
 
 const CODEX_SESSIONS = path.join(os.homedir(), '.codex', 'sessions');
 const MODELS_CACHE_PATH = path.join(os.homedir(), '.codex', 'models_cache.json');
@@ -418,6 +419,13 @@ function scanLine(line, state) {
   // real rollout) whose `usage` is this ONE call's actual size, not a running
   // total — see codexContextWindow/analyzeRollout below, the one consumer.
   if (kind === 'token_usage_record' && p.usage) state.lastCallUsage = p.usage;
+  // A skill a Codex session loaded, by the SKILL.md path its command read (the
+  // catalog points it at one; Codex has no Skill tool call to see). Best effort,
+  // for the extension usage ledger (server/extension-usage.js).
+  if (entry.type === 'response_item' && state.skills && (p.type === 'function_call' || p.type === 'custom_tool_call' || p.type === 'local_shell_call')) {
+    const text = [p.arguments, p.input, p.action?.command].map((v) => (typeof v === 'string' ? v : v == null ? '' : JSON.stringify(v))).join(' ');
+    for (const name of skillReadsIn(text)) state.skills[name] = (state.skills[name] || 0) + 1;
+  }
   if (kind === 'task_started' && typeof entry.timestamp === 'string') {
     const timestamp = Date.parse(entry.timestamp) || null;
     if (state.startedAt == null) state.startedAt = timestamp;
@@ -534,7 +542,7 @@ export function codexContextWindow(modelSlug, cachePath = MODELS_CACHE_PATH) {
 }
 
 async function analyzeRollout(file, meta = null, modelsCachePath = MODELS_CACHE_PATH, priorUsage = null, priorModel = null) {
-  const state = { usage: null, priorUsage, needsResumeBaseline: Boolean(priorUsage), peak: blankUsage(), byModel: {}, model: priorModel, firstModel: priorModel, currentModel: null, pendingModel: null, summary: null, startedAt: meta?.startedAt || null, endedAt: null, lastTaskStartedAt: null, lastCallUsage: null };
+  const state = { usage: null, priorUsage, needsResumeBaseline: Boolean(priorUsage), peak: blankUsage(), byModel: {}, model: priorModel, firstModel: priorModel, currentModel: null, pendingModel: null, summary: null, startedAt: meta?.startedAt || null, endedAt: null, lastTaskStartedAt: null, lastCallUsage: null, skills: {} };
   let lastActivity = null;
   try {
     const st = await fsp.stat(file);
@@ -572,6 +580,7 @@ async function analyzeRollout(file, meta = null, modelsCachePath = MODELS_CACHE_
     startedAt: state.startedAt,
     endedAt: state.endedAt && state.endedAt >= state.lastTaskStartedAt ? state.endedAt : null,
     contextPercent,
+    skills: state.skills,
   };
 }
 
@@ -584,10 +593,12 @@ async function analyzeRolloutChain(files, meta, modelsCachePath) {
   let latest = null;
   let previousUsage = null;
   let previousModel = null;
+  const skills = {};
   for (const [index, file] of files.entries()) {
     const part = await analyzeRollout(file, index === files.length - 1 ? meta : null, modelsCachePath, previousUsage, previousModel);
     if (!part) continue;
     mergeTotals(totals, part.totals);
+    for (const [name, n] of Object.entries(part.skills || {})) skills[name] = (skills[name] || 0) + n;
     if (!first) first = part;
     latest = part;
     previousUsage = part.rawUsage || previousUsage;
@@ -602,6 +613,7 @@ async function analyzeRolloutChain(files, meta, modelsCachePath) {
     tokens: tokensFor(totals),
     summary: first.summary || latest.summary,
     startedAt: first.startedAt || latest.startedAt,
+    skills,
   };
 }
 
@@ -651,6 +663,9 @@ async function analyzeCodexUncached(sessionId, { sessionsDir = CODEX_SESSIONS, i
     // THIS session's own occupancy only — never merged across the sub-agent
     // family above (a sub-agent's context window is a separate conversation).
     contextPercent: own.contextPercent,
+    // THIS session's own skill reads, like contextPercent: a sub-agent is a
+    // conversation of its own.
+    skills: own.skills || {},
     hasTranscript: true,
   };
 }

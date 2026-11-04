@@ -316,7 +316,14 @@ export async function applyRuntimeCost(runtime, args, enr) {
 
 export const resolveRuntimeForGraph = (id) => findRuntime(id) || runtimeFor(undefined);
 
-export async function buildGraph(sessionManager, enrich, { runtimeResolver = resolveRuntimeForGraph, discover = discoverClaudeSessions, capture = capturePane, codexStatus = realCodexStatus, mailStore, mailDraftBlocked } = {}) {
+export async function buildGraph(sessionManager, enrich, { runtimeResolver = resolveRuntimeForGraph, discover = discoverClaudeSessions, capture = capturePane, codexStatus = realCodexStatus, mailStore, mailDraftBlocked, onAnalysis } = {}) {
+  // Every card's transcript analysis, handed on as it is read — the extension
+  // usage ledger takes its skill counts from here rather than reading every
+  // transcript a second time. Never allowed to break the build.
+  const noteAnalysis = (cardId, liveSid, enr) => {
+    if (onAnalysis && enr) { try { onAnalysis(cardId, liveSid, enr); } catch { /* ledger is best effort */ } }
+    return enr;
+  };
   const graphAnalysis = (agent, id, opts) => {
     const adapter = adapterFor(agent);
     return adapter.graphAnalysis ? adapter.graphAnalysis(id, opts, enrich) : adapter.analyze(id, opts);
@@ -489,7 +496,7 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
 
     const mapEntry = sessionManager?.entryFor?.(s.sessionId);
     const agentId = mapEntry?.agent ?? 'claude';
-    const enrichment = await graphAnalysis(agentId, s.sessionId, { since: usageSince(mapEntry) });
+    const enrichment = noteAnalysis(s.sessionId, s.sessionId, await graphAnalysis(agentId, s.sessionId, { since: usageSince(mapEntry) }));
     const name = sessionLabel({
       agent: agentId,
       names: [mapEntry?.name, s.name && s.name !== s.jobId ? s.name : null, worker?.dispatch?.seed?.name],
@@ -670,9 +677,9 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
     // abandoned one back). No-ops when unchanged; see noteLiveSessionId.
     if (live?.liveSid) await sessionManager?.noteLiveSessionId?.(realSid, live.liveSid);
     const costSid = live?.liveSid || appEntry?.liveSessionId;
-    const enr = await applyRuntimeCost(runtime, { entry: appEntry, liveSid: costSid },
+    const enr = noteAnalysis(realSid, costSid || realSid, await applyRuntimeCost(runtime, { entry: appEntry, liveSid: costSid },
       (runtime.analyze ? await runtime.analyze({ entry: appEntry, liveSid: costSid }) : null)
-        || await adapter.analyze(costSid || realSid, { since: usageSince(appEntry) }));
+        || await adapter.analyze(costSid || realSid, { since: usageSince(appEntry) })));
     // A recognized live status wins (Claude's mapped status, or Codex's). Else
     // surface a reported-but-unrecognized status as 'unknown', and only scrape when
     // nothing was reported (Codex has no status file → live.rawStatus is absent).
@@ -805,8 +812,8 @@ export async function buildGraph(sessionManager, enrich, { runtimeResolver = res
     // their cost/age. Legacy entries have no liveSessionId → fall back to the card id
     // (which for them is the live id). Mirrors the Codex branch.
     const runtime = runtimeResolver(entry.runtime);
-    const enrichment = await applyRuntimeCost(runtime, { entry, liveSid: entry.liveSessionId || sid }, (runtime.analyze ? await runtime.analyze({ entry, liveSid: entry.liveSessionId || sid }) : null)
-      || await graphAnalysis(agentId, entry.liveSessionId || sid, { since: usageSince(entry) }));
+    const enrichment = noteAnalysis(sid, entry.liveSessionId || sid, await applyRuntimeCost(runtime, { entry, liveSid: entry.liveSessionId || sid }, (runtime.analyze ? await runtime.analyze({ entry, liveSid: entry.liveSessionId || sid }) : null)
+      || await graphAnalysis(agentId, entry.liveSessionId || sid, { since: usageSince(entry) })));
     const label = sessionLabel({
       agent: agentId,
       names: [entry.name, entry.lastLabel],

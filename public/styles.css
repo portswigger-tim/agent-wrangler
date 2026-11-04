@@ -3426,6 +3426,9 @@ main.diff-fullscreen .diff-filelist-handle { display: block; }
 .ext-kv-repo { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; min-width: 0; }
 .ext-mono { font-family: var(--font-mono); word-break: break-all; }
 .ext-kv-open { color: var(--blue-fg); white-space: nowrap; }
+.ext-usage { display: grid; gap: 8px; }
+.ext-usage-line { font-size: 13px; }
+.ext-usage .ext-mono { overflow-wrap: anywhere; }
 .ext-install-form { display: flex; gap: 8px; align-items: center; }
 .ext-install-form .ext-install-url { flex: 1; min-width: 0; }
 .ext-mode-row { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }

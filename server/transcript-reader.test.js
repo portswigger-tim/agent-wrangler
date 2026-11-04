@@ -980,3 +980,16 @@ test('usageSince bounds a fork at its createdAt and leaves every other entry unb
   // number rather than silently zeroing the card's whole cost.
   assert.equal(usageSince({ forkedFrom: 'PARENT1' }), 0);
 });
+
+// The extension usage ledger reads skill counts off the same scan: one per Skill
+// tool_use, by the name the agent passed, and none for a fork's replayed history.
+test('analyzeLines counts Skill tool calls by name, skipping a fork\'s inherited ones', () => {
+  const skill = (name, at) => JSON.stringify({
+    type: 'assistant', timestamp: new Date(at).toISOString(),
+    message: { role: 'assistant', content: [{ type: 'tool_use', id: `t${at}`, name: 'Skill', input: { skill: name } }] },
+  });
+  const other = JSON.stringify({ type: 'assistant', timestamp: new Date(NOW + 5).toISOString(), message: { role: 'assistant', content: [{ type: 'tool_use', id: 'b', name: 'Bash', input: { command: 'ls' } }] } });
+  const lines = [skill('widgets:widgets', NOW - 1000), skill('widgets:widgets', NOW + 1), skill('agent-skills:links', NOW + 2), skill('widgets:widgets', NOW + 3), other];
+  assert.deepEqual(analyzeLines(lines).skills, { 'widgets:widgets': 3, 'agent-skills:links': 1 });
+  assert.deepEqual(analyzeLines(lines, { since: NOW }).skills, { 'widgets:widgets': 2, 'agent-skills:links': 1 });
+});

@@ -31,6 +31,7 @@ test('each registered setting appears in exactly one tab', () => {
     'archiveReviewEnabled',
     'mailWakesDormant',
     'prModelFooter',
+    'prExtensionsFooter',
     'flipNavHotkeys',
     'autoUpdate',
     'refreshSessionsAfterUpdate',

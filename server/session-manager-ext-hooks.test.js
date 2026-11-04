@@ -119,6 +119,25 @@ test('dispatch() hands onBeforeDispatch the dialog\'s ext bag, null when there i
   assert.deepEqual(seen, [{ 'spend-limit': { usd: 50 } }, null]);
 });
 
+// The usage ledger's seam: every settled launch, with the dispatch's ext bag.
+test('dispatch() and fork() tell _noteLaunch, and a throwing one never aborts the launch', async () => {
+  const sm = manager();
+  const seen = [];
+  sm._noteLaunch = (p) => { seen.push({ phase: p.phase, ext: p.ext, entry: p.entry === sm.entryFor(p.sessionId) }); };
+  await sm.dispatch({ cwd: os.tmpdir(), intent: 'a', agent: 'claude', ext: { widgets: { size: 3 } } });
+  await sm.fork({ sourceId: 'SRC', parentId: 'PARENT', parentEntry: { agent: 'claude', cwd: os.tmpdir() }, cwd: os.tmpdir() });
+  assert.deepEqual(seen, [{ phase: 'dispatch', ext: { widgets: { size: 3 } }, entry: true }, { phase: 'fork', ext: undefined, entry: true }]);
+  const orig = console.error;
+  console.error = () => {};
+  try {
+    sm._noteLaunch = () => { throw new Error('ledger exploded'); };
+    const { sessionId } = await sm.dispatch({ cwd: os.tmpdir(), intent: 'b', agent: 'claude' });
+    assert.ok(sm.entryFor(sessionId));
+  } finally {
+    console.error = orig;
+  }
+});
+
 test('a throwing onBeforeDispatch never aborts the dispatch', async () => {
   // captureErrors is sync-only (it restores in a finally), and this path has to
   // be awaited across the hook — so the swap is done by hand here.

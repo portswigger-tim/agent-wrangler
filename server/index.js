@@ -9,7 +9,7 @@ import { WebSocketServer } from 'ws';
 import openModule from 'open';
 
 import { buildGraph, createWatcher, sessionLabel } from './state-reader.js';
-import { analyze, resolveResumeDir } from './transcript-reader.js';
+import { analyze, resolveResumeDir, usageSince } from './transcript-reader.js';
 import { SessionManager, SESSIONS_DIR } from './session-manager.js';
 import { BUILTIN_RUNTIME_IDS, registerRuntime, unregisterRuntimesFor } from './runtimes/index.js';
 import { worktreeStatus } from './worktree.js';
@@ -33,11 +33,13 @@ import { setTmuxBin, sendText, sendKeys } from './tmux-scraper.js';
 import { createPaneDeferral } from './pane-deferral.js';
 import { fetchPrStatus, mergePr, fetchUnresolvedThreadCount } from './pr-status.js';
 import { normalisePr, linkMatches } from './mcp/links.js';
-import { shouldOpenBrowser, prStatusPollSeconds, autoAttachPrEnabled, subagentsExpandedByDefault, trustCodexLaunchCwd, trustClaudeLaunchCwd, childFullViewByDefault, autoFixPrChecksDefault, archiveReviewEnabled, mailWakesDormant, prModelFooterEnabled, chatViewDefault, defaultSessionCwd, defaultRuntime, readConfig, extensionSettings, applyRetiredFlagMigrations, autoUpdateMode, refreshSessionsAfterUpdate } from './config-store.js';
+import { shouldOpenBrowser, prStatusPollSeconds, autoAttachPrEnabled, subagentsExpandedByDefault, trustCodexLaunchCwd, trustClaudeLaunchCwd, childFullViewByDefault, autoFixPrChecksDefault, archiveReviewEnabled, mailWakesDormant, prModelFooterEnabled, prExtensionsFooterEnabled, chatViewDefault, defaultSessionCwd, defaultRuntime, readConfig, extensionSettings, applyRetiredFlagMigrations, autoUpdateMode, refreshSessionsAfterUpdate } from './config-store.js';
 import { listStyles } from './styles.js';
-import { availableAgents, modelsWithDefault, validateDefaultModel, providerMetadata, registeredAgents } from './agents/index.js';
+import { availableAgents, modelsWithDefault, validateDefaultModel, providerMetadata, registeredAgents, adapterFor } from './agents/index.js';
 import { createMcpRequestHandler, extractCaller } from './mcp/server.js';
 import { createPrModelHandler } from './pr-model-handler.js';
+import { ExtensionUsageStore, skillOwnerIn } from './extension-usage.js';
+import { parseGithubSlug } from './repo-slug.js';
 import { createMessageThrottle } from './mcp/message-throttle.js';
 import { bindHost } from './runtime.js';
 import { isAllowedOrigin, isAllowedHost } from './origin-check.js';
@@ -159,6 +161,47 @@ function quarantineFor(id, err) {
 }
 const sessionManager = new SessionManager();
 const taskStore = new TaskStore();
+// The local extension usage ledger (server/extension-usage.js). Git-installed
+// extensions only — an entry is tracked while it has an origin to name it by —
+// and core-owned: it is fed from the seams below and read by the Settings pane
+// and the PR footer, and no host API hands it to an extension.
+const trackedExtension = (id) => {
+  const e = ext.list.find((x) => x.id === id);
+  return Boolean(e?.external && e.provenance?.originUrl);
+};
+const extUsage = new ExtensionUsageStore({
+  isTracked: trackedExtension,
+  skillOwner: (name) => skillOwnerIn(ext.list, name),
+});
+// The ledger saves on a short debounce, so the last second is written on the
+// way out. On 'exit' rather than shutdownLog.onShutdown: a self-inflicted exit
+// (restart, update) runs no onShutdown cleanup, and a signal ends in
+// process.exit too. Writes nothing unless something changed.
+process.on('exit', () => { try { extUsage.flush(); } catch { /* exiting anyway */ } });
+const noteExtUse = (sessionId, extId, kind, name) => extUsage.note(sessionId, extId, kind, name);
+// A launch on an extension's runtime, and a dispatch carrying `ext.<id>` fields.
+sessionManager._noteLaunch = ({ sessionId, entry, ext: fields }) => {
+  if (entry?.runtimeExt && entry.runtime) noteExtUse(sessionId, entry.runtimeExt, 'runtimes', entry.runtime);
+  for (const [extId, slice] of Object.entries(fields || {})) {
+    if (slice && typeof slice === 'object') for (const key of Object.keys(slice)) noteExtUse(sessionId, extId, 'fields', key);
+  }
+};
+// The `owner/repo` the PR footer names each extension this session used by.
+// GitHub origins only: the line exists to be found with `gh search prs`, and a
+// non-GitHub origin (a local path, say) is not something to publish in a PR.
+const footerExtensions = (sessionId) => [...new Set(extUsage.extensionsFor(sessionId)
+  .map((id) => parseGithubSlug(ext.list.find((e) => e.id === id)?.provenance?.originUrl))
+  .filter(Boolean))].sort();
+// Reads the session's transcript once more before a footer is written, so a
+// skill used moments before `gh pr create` is counted even if no graph tick
+// has run since. The same incremental analysis the tick does.
+async function refreshSkillUsage(sessionId) {
+  const entry = sessionManager.entryFor(sessionId);
+  if (!entry) return;
+  const live = entry.liveSessionId || sessionId;
+  const a = await adapterFor(entry.agent ?? 'claude').analyze(live, { since: usageSince(entry) });
+  if (a?.skills) extUsage.noteSkillTotals(sessionId, live, a.skills);
+}
 // The core singletons an extension's capability builder binds on its behalf (the
 // leaf rule means nothing under server/extensions/** can import them — see
 // server/extensions/index.js). Handed to host-api/, never reached for, which is
@@ -886,6 +929,9 @@ const prModelHandler = createPrModelHandler({
   graph: () => lastGraph,
   entryFor: (id) => sessionManager.entryFor(id),
   enabled: () => prModelFooterEnabled(),
+  extensionsEnabled: () => prExtensionsFooterEnabled(),
+  extensionsFor: footerExtensions,
+  refreshUsage: refreshSkillUsage,
   logError,
 });
 
@@ -975,6 +1021,8 @@ const mcpRequestHandler = createMcpRequestHandler({
   // extId -> that extension's façade. mcp/server.js selects by the loader's
   // `extId` tag: a tagged tool gets { host, caller }, a core one { deps, caller }.
   hostApiFor,
+  // An extension tool call, counted in the usage ledger (mcp/server.js).
+  noteExtUse,
   claimLink: createLinkNormaliser(ext, hostApiFor),
   onPrLinksChanged: (scope, ownerId) => { pollPrStatuses({ scope, ownerId }).catch(() => {}); },
   // create_terminal deps
@@ -1072,7 +1120,12 @@ async function rebuildOnce() {
     task: taskStore.taskFor(sid),
     label: lastGraph?.sessions?.find((s) => s.sessionId === sid)?.label,
   }));
-  const graph = await buildGraph(sessionManager, (sid, opts) => analyze(sid, undefined, opts), { mailStore, mailDraftBlocked: (sid, now) => mailDeferrals.draftBlocked(sid, now) });
+  const graph = await buildGraph(sessionManager, (sid, opts) => analyze(sid, undefined, opts), {
+    mailStore,
+    mailDraftBlocked: (sid, now) => mailDeferrals.draftBlocked(sid, now),
+    // Each card's skill counts, as its transcript is read, into the usage ledger.
+    onAnalysis: (sid, liveSid, enr) => { if (enr.skills) extUsage.noteSkillTotals(sid, liveSid, enr.skills); },
+  });
   graph.tasks = taskStore.snapshot();
   graph.schedules = scheduleStore.snapshot(); // drives the Schedules panel off the live rebuild
   graph.subagentsExpandedByDefault = subagentsExpandedByDefault();
@@ -1083,6 +1136,7 @@ async function rebuildOnce() {
   graph.archiveReviewEnabled = archiveReviewEnabled();
   graph.mailWakesDormant = mailWakesDormant();
   graph.prModelFooter = prModelFooterEnabled();
+  graph.prExtensionsFooter = prExtensionsFooterEnabled();
   graph.chatViewDefault = chatViewDefault();
   graph.defaultSessionCwd = defaultSessionCwd();
   graph.defaultRuntime = defaultRuntime();
@@ -1217,6 +1271,10 @@ controlWss.on('connection', (ws) => {
     // reads ctx.ext.list. An extension's handler is invoked with its façade.
     ext: extBag,
     hostApiFor,
+    // The usage ledger: an extension's board handler is counted (router.js),
+    // and the Settings pane reads it (ext-usage).
+    noteExtUse,
+    extUsage,
     rebuild,
     runSchedule: runScheduleNow,
     graph: () => lastGraph,
@@ -1281,6 +1339,7 @@ async function main() {
   // installed at module load, so a stop arriving during this slow startup is still
   // recorded — and one handler means one path down.
   shutdownLog.onShutdown(() => instanceLock.release());
+
   // An interrupted install leaves only a staging directory behind, so this is
   // the whole of its recovery — and the reason the install lock can be purely
   // in-memory. After the lock, so a duplicate instance never sweeps the running

@@ -56,6 +56,18 @@ test('an extension handler is invoked with its facade, not ctx', async () => {
   assert.deepEqual(c.sent, []);
 });
 
+test('an extension handler is counted in the usage ledger without a session', async () => {
+  const noted = [];
+  const c = ctx({ hostApiFor: () => ({ id: 'fake' }), noteExtUse: (...args) => noted.push(args) });
+  await routeControlMessage(JSON.stringify({ type: 'fake-do', sessionId: 'CARD' }), c, {
+    handlers: [{ type: 'fake-do', extId: 'fake', handler: () => {} }, { type: 'core-do', handler: () => {} }],
+  });
+  await routeControlMessage(JSON.stringify({ type: 'core-do' }), c, {
+    handlers: [{ type: 'core-do', handler: () => {} }],
+  });
+  assert.deepEqual(noted, [[null, 'fake', 'handlers', 'fake-do']]);
+});
+
 test("an extension handler's throw still lands in the error envelope", async () => {
   const c = ctx({ hostApiFor: () => ({ id: 'fake' }) });
   await routeControlMessage(JSON.stringify({ type: 'fake-do' }), c, {

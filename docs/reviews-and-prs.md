@@ -136,6 +136,36 @@ card, and works with automatic attaching off. It runs after the `gh pr create` c
 it never delays or fails it, and it uses the session's own `gh` login, including inside a
 devcontainer.
 
+### Extensions line
+
+The same step adds an `Extensions:` line naming the installed extensions the session used, by their
+GitHub repository, on the line after `Model:`:
+
+```text
+Model: claude-opus-5-5
+Extensions: acme/widgets-ext, acme/gadgets-ext
+```
+
+"Used" means the session called one of the extension's MCP tools, ran on a runtime it adds, was
+dispatched with its dispatch fields, or invoked a skill it ships or provides. Having an extension
+installed is not enough. Only extensions installed from a GitHub URL are named. Core extensions,
+extensions placed in the extensions folder by hand, and extensions installed from another git host are
+never named. The line is omitted when the session used none. An extension installed from a private
+repository is named too, so if its name should not appear in the pull requests you open, turn the line
+off.
+
+Like the model line, it is added only when the description has no `Extensions:` line yet, so a line
+the agent wrote itself is never changed, and running the footer twice adds nothing. Turn it off with
+**Tag new PRs with the extensions used** in **Settings → Automation**, next to the model switch. It
+is on by default and independent of the model switch. Nothing is sent anywhere else: the usage behind
+it is kept on this machine (see [Extensions](extensions.md#for-extension-authors-seeing-your-usage)).
+
+Claude skill use is read from the session's `Skill` tool calls. Codex has no skill tool, so a Codex
+session counts a skill when it reads that skill's `SKILL.md`, which is how Codex loads one. This is
+best effort: a session that reads the file for another reason also counts.
+
+### Codex
+
 Codex runs it as a hook the wrangler passes at launch, resume and fork. Codex asks you to review a
 new hook before running it; the wrangler marks this one trusted in the same launch flags, so no
 prompt appears and nothing is written to `~/.codex/config.toml`. The hook runs outside Codex's

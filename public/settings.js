@@ -99,6 +99,14 @@ export const SETTINGS = [
     default: true,
   },
   {
+    id: 'prExtensionsFooter',
+    type: 'toggle',
+    scope: 'server',
+    label: 'Tag new PRs with the extensions used',
+    help: 'When a session opens a PR with gh pr create, add a line to its description naming the installed extensions the session used, by their GitHub repository, e.g. "Extensions: acme/widgets-ext". This lets an extension\'s owner find the PRs it helped with, using gh search prs \'"Extensions:" acme/widgets-ext in:body\'. Only extensions installed from a GitHub URL are named; built-in ones never are. A description that already has an Extensions: line is left alone. Nothing is sent anywhere else.',
+    default: true,
+  },
+  {
     id: 'childFullViewByDefault',
     type: 'toggle',
     scope: 'server',
@@ -177,7 +185,7 @@ export const SETTINGS_TABS = [
   {
     id: 'automation',
     label: 'Automation',
-    settingIds: ['autoFixPrChecksDefault', 'prModelFooter', 'trustCodexLaunchCwd', 'trustClaudeLaunchCwd', 'archiveReviewEnabled', 'mailWakesDormant'],
+    settingIds: ['autoFixPrChecksDefault', 'prModelFooter', 'prExtensionsFooter', 'trustCodexLaunchCwd', 'trustClaudeLaunchCwd', 'archiveReviewEnabled', 'mailWakesDormant'],
   },
   { id: 'extensions', label: 'Extensions', settingIds: [] },
   { id: 'shortcuts', label: 'Shortcuts', settingIds: ['flipNavHotkeys'] },

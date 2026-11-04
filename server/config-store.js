@@ -69,6 +69,14 @@ export function prModelFooterEnabled(cfg = readConfig()) {
   return cfg.prModelFooter !== false;
 }
 
+// Whether that footer also gets an `Extensions: <owner/repo>, ...` line naming
+// the git-installed extensions the session used (server/extension-usage.js), so
+// an extension's owner can find the PRs it helped with. Its own switch, beside
+// the model one. Default on; config.json `prExtensionsFooter: false` turns it off.
+export function prExtensionsFooterEnabled(cfg = readConfig()) {
+  return cfg.prExtensionsFooter !== false;
+}
+
 // Whether a session's sub-agents zone (board card + panel) starts expanded or
 // collapsed for cards the user hasn't explicitly toggled either way. Default off
 // (collapsed) to preserve today's behaviour; toggled from the board's settings

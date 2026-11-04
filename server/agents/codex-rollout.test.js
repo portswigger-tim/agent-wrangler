@@ -1014,3 +1014,18 @@ test('findRollout: a missing sessions dir is null, never a throw', async () => {
   const root = path.join(os.tmpdir(), 'cxr-does-not-exist-', String(Date.now()));
   assert.equal(await findRollout('77777777-7777-7777-7777-777777777777', root), null);
 });
+
+// Codex has no Skill tool: it reads the SKILL.md its catalog points at, so the
+// usage ledger counts those reads, by the skill directory's name.
+test('analyzeCodex counts the SKILL.md files a session read through its shell', async () => {
+  const { root, uuid } = fixtureSessions();
+  const file = path.join(root, '2026', '06', '10', `rollout-2026-06-10T09-00-00-${uuid}.jsonl`);
+  const call = (cmd) => JSON.stringify({ type: 'response_item', payload: { type: 'function_call', name: 'exec_command', arguments: JSON.stringify({ cmd }) } });
+  fs.appendFileSync(file, [
+    call("sed -n '1,200p' /data/extensions/widgets/skills/widgets/SKILL.md"),
+    call('cat /data/extensions/widgets/skills/widgets/SKILL.md'),
+    call('ls /data/extensions/widgets/skills'),
+  ].join('\n') + '\n');
+  const r = await analyzeCodex(uuid, { sessionsDir: root });
+  assert.deepEqual(r.skills, { widgets: 2 });
+});

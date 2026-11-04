@@ -1056,3 +1056,40 @@ test('an update auto-update left for the human keeps its button and says why', (
     assert.equal(byClass(extensionsPanelEl({ entries: [EXT1], statuses: { ext1: status } }), 'ext-btn-square').length, 1);
   });
 });
+
+const sectionTitles = (node) => byClass(node, 'ext-section-title').map((n) => n._text);
+
+test('a git-installed extension shows its usage: sessions, last used and the top tools and skills', () => {
+  withDom(() => {
+    const usage = {
+      sessions: 14,
+      lastUsedAt: new Date(Date.now() - 2 * 3600_000).toISOString(),
+      tools: [{ name: 'widget_make', count: 12 }, { name: 'widget_list', count: 3 }],
+      skills: [{ name: 'widgets', count: 4 }],
+      runtimes: [], handlers: [], fields: [],
+    };
+    const detail = detailOf(showing(EXT1, { usages: { ext1: usage } }));
+    assert.ok(sectionTitles(detail).includes('Usage'));
+    const all = texts(detail);
+    assert.ok(all.includes('Used in 14 sessions · last used 2h ago'));
+    assert.ok(all.includes('widget_make (12), widget_list (3)'));
+    assert.ok(all.includes('widgets (4)'));
+    assert.equal(all.includes('Runtimes'), false, 'an empty kind draws no row');
+    assertNoThirdPartyHtml(detail);
+  });
+});
+
+test('usage says loading before the answer, and "not used yet" when none is recorded', () => {
+  withDom(() => {
+    assert.ok(texts(detailOf(showing(EXT1))).includes('Loading…'));
+    assert.ok(texts(detailOf(showing(EXT1, { usages: { ext1: null } }))).some((t) => t.startsWith('Not used yet.')));
+  });
+});
+
+test('a builtin or hand-placed extension has no Usage section', () => {
+  withDom(() => {
+    assert.equal(sectionTitles(detailOf(showing(BUILTIN_A))).includes('Usage'), false);
+    const handPlaced = { ...EXT1, origin: '' };
+    assert.equal(sectionTitles(detailOf(showing(handPlaced))).includes('Usage'), false);
+  });
+});

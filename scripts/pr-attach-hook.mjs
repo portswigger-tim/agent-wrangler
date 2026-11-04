@@ -6,7 +6,7 @@
 //   - POSTs it to the wrangler so the PR attaches to THIS session's card
 //     (identity from $AW_SESSION_ID — the card id, inherited from the launch env);
 //   - starts scripts/pr-model-footer.mjs detached, which tags the PR body with
-//     the session's model. Detached so the gh round trips never delay the tool
+//     the session's model and the installed extensions it used. Detached so the gh round trips never delay the tool
 //     result; independent of the attach, which the server may have switched off.
 // All errors are swallowed and it always exits 0 with no stdout, so it can never
 // disrupt the tool result or the session. The parsing lives in server/pr-hook.js

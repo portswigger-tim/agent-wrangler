@@ -479,6 +479,11 @@ export class SessionManager {
     // launch only. Returns a normalised policy or undefined; the default answers
     // nothing, so every existing launch keeps the core sandbox/approval flags.
     this._extCodexPolicy = () => undefined;
+    // Seam (same mould) for the extension usage ledger: told of every launch
+    // that settled an entry (dispatch, resume, fork), so a launch on an
+    // extension's runtime, or one carrying its dispatch fields, is counted.
+    // server/index.js binds it; the default records nothing.
+    this._noteLaunch = () => {};
     this._load();
   }
 
@@ -490,6 +495,11 @@ export class SessionManager {
     await this._mirrorWorktreeTrust(dir);
     const loginDir = launchEnvOf(launchContext).CLAUDE_CONFIG_DIR;
     if (loginDir) await this._ensureLoginClaudeTrust(loginDir, { cwd: dir, sessionsDir: SESSIONS_DIR });
+  }
+
+  // Usage bookkeeping must never fail a launch that has already happened.
+  _noteLaunchSafely(payload) {
+    try { this._noteLaunch(payload); } catch (err) { logError('[ext-usage]', err); }
   }
 
   async _fireExtHooks(name, payload) {
@@ -1262,6 +1272,7 @@ export class SessionManager {
     // Here, not in resume(): that wrapper coalesces concurrent callers onto one
     // in-flight promise, so a hook there would fire twice for one relaunch (the
     // same reason the log line below lives here).
+    this._noteLaunchSafely({ sessionId, entry: this.map.get(sessionId), phase: 'resume' });
     await this._fireExtHooks('onResume', { sessionId, entry: this.map.get(sessionId), reason });
     await this.refreshAlive();
     // Logged here rather than in resume(): that wrapper hands a second concurrent
@@ -1341,6 +1352,7 @@ export class SessionManager {
     entry.launchedCodeVersion = this.codeVersion || undefined;
     this.map.set(sessionId, entry);
     this._save();
+    this._noteLaunchSafely({ sessionId, entry, phase: 'fork' });
     await this._fireExtHooks('onFork', { sessionId, parentId, entry });
     await this.refreshAlive();
     return { sessionId, tmux };
@@ -2016,6 +2028,7 @@ export class SessionManager {
     const entry = { ...existing, short, tmux, cwd, agent, runtime: runtime === 'local' ? undefined : runtime, runtimeExt: rt.extId || undefined, intent, model: model || null, effort: effort || null, permissionMode, ...(normalizedAutoCompactTokens === undefined ? {} : { autoCompactTokens: normalizedAutoCompactTokens }), createdAt: launchedAt, liveSessionId: liveSessionId || undefined, worktree: worktreeEntry, addDirs: grantedDirs.length ? grantedDirs : undefined, socket: this.socket, paneId: paneId || undefined, workflow: workflowOpt ?? existing?.workflow, autoMergeOnPass: autoMergeOnPass ? true : (existing?.autoMergeOnPass || undefined), spawnedBy: spawnedBy || undefined, parentSession: nestedParent, childFullView, offBoard: offBoard || existing?.offBoard || undefined, remoteControl: remoteControl || undefined, mailCapable: !(rt.buildLaunch || rt.deliver), launchedCodeVersion: this.codeVersion || undefined };
     this.map.set(sessionId, entry);
     this._save();
+    this._noteLaunchSafely({ sessionId, entry, phase: 'dispatch', ext: ext || null });
     await this._fireExtHooks('onDispatch', { sessionId, entry });
     await this.refreshAlive();
     return { sessionId, tmux, cwd };

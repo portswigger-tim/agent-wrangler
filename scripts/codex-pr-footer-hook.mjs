@@ -2,7 +2,8 @@
 // PostToolUse hook (matcher: Bash) injected into wrangler-launched Codex
 // sessions (server/codex-hook-config.js). If the agent just ran `gh pr create`
 // and a PR url is in the output, it starts scripts/pr-model-footer.mjs detached,
-// which tags the PR body with the session's model. It never attaches the PR to
+// which tags the PR body with the session's model and the installed extensions
+// it used. It never attaches the PR to
 // a card. Codex's payload has the same shape as Claude's (tool_input.command,
 // tool_response), so server/pr-hook.js parses it. All errors are swallowed and
 // it always exits 0 with no stdout.

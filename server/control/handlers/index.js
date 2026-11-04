@@ -20,6 +20,7 @@ import { trustClaudeLaunchCwdHandler } from './trust-claude-launch-cwd.js';
 import { archiveReviewEnabledHandler } from './archive-review-enabled.js';
 import { mailWakesDormantHandler } from './mail-wakes-dormant.js';
 import { prModelFooterHandler } from './pr-model-footer.js';
+import { prExtensionsFooterHandler } from './pr-extensions-footer.js';
 import { childFullViewHandler } from './child-full-view.js';
 import { childFullViewDefaultHandler } from './child-full-view-default.js';
 import { chatViewDefaultHandler } from './chat-view-default.js';
@@ -29,6 +30,7 @@ import { extensionEnabledHandler } from './extension-enabled.js';
 import { extInstallHandler, extConsentHandler, extUninstallHandler, extCheckUpdatesHandler, extSetAutoUpdateHandler, extSetEarlyAdopterHandler } from './extensions-install.js';
 import { extSettingSetHandler } from './ext-setting-set.js';
 import { extBrowseHandler } from './ext-browse.js';
+import { extUsageHandler } from './ext-usage.js';
 import { restartHandler } from './restart.js';
 import { restartTmuxHandler } from './restart-tmux.js';
 import { updateCheckHandler, updateApplyHandler, autoUpdateModeHandler, refreshSessionsAfterUpdateHandler } from './self-update.js';
@@ -94,6 +96,7 @@ export const CONTROL_HANDLERS = [
   archiveReviewEnabledHandler,
   mailWakesDormantHandler,
   prModelFooterHandler,
+  prExtensionsFooterHandler,
   childFullViewHandler,
   childFullViewDefaultHandler,
   chatViewDefaultHandler,
@@ -107,6 +110,7 @@ export const CONTROL_HANDLERS = [
   extCheckUpdatesHandler,
   extSetAutoUpdateHandler,
   extSetEarlyAdopterHandler,
+  extUsageHandler,
   extBrowseHandler,
   restartHandler,
   restartTmuxHandler,

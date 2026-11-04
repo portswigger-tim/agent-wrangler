@@ -205,6 +205,21 @@ test('buildMcpServer invokes a tagged tool with its facade and an untagged one w
   assert.equal(seen[1].host, undefined);
 });
 
+test('an extension tool call is counted in the usage ledger with its caller; a core one is not', async () => {
+  const noted = [];
+  const deps = { ...fakeDeps(), hostApiFor: () => ({ id: 'fake' }), noteExtUse: (...args) => noted.push(args) };
+  const tools = [
+    { name: 'ext_tool', extId: 'fake', description: 'x', inputSchema: {}, handler: () => ({ content: [] }) },
+    { name: 'core_tool', description: 'x', inputSchema: {}, handler: () => ({ content: [] }) },
+  ];
+  const { client, server } = await connect(deps, 'CARD1', { tools });
+  await client.callTool({ name: 'ext_tool', arguments: {} });
+  await client.callTool({ name: 'core_tool', arguments: {} });
+  await client.close();
+  await server.close();
+  assert.deepEqual(noted, [['CARD1', 'fake', 'tools', 'ext_tool']]);
+});
+
 test('SDK boundary forwards Remote Control for explicit/default Claude including a Codex caller and rejects invalid options', async () => {
   const seen = { dispatch: [], assign: [], rebuild: 0 };
   const deps = {

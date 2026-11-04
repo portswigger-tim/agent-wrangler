@@ -47,9 +47,13 @@ export function buildMcpServer(deps, caller, { tools = activeTools() } = {}) {
       // with that extension's own `host` façade and never `deps` — the whole
       // point of the façade is that an extension cannot reach a singleton it did
       // not declare. A core tool is untagged and keeps `deps` unchanged.
-      (args) => (tool.extId
-        ? tool.handler({ host: deps?.hostApiFor?.(tool.extId), caller }, args)
-        : tool.handler({ deps, caller }, args)),
+      // An extension's tool call is also counted in the local usage ledger
+      // (server/extension-usage.js), which ignores all but git-installed ones.
+      (args) => {
+        if (!tool.extId) return tool.handler({ deps, caller }, args);
+        try { deps?.noteExtUse?.(caller, tool.extId, 'tools', tool.name); } catch { /* best effort */ }
+        return tool.handler({ host: deps?.hostApiFor?.(tool.extId), caller }, args);
+      },
     );
   }
   return server;
