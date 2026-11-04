@@ -3426,6 +3426,11 @@ main.diff-fullscreen .diff-filelist-handle { display: block; }
 .ext-kv-repo { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; min-width: 0; }
 .ext-mono { font-family: var(--font-mono); word-break: break-all; }
 .ext-kv-open { color: var(--blue-fg); white-space: nowrap; }
+.ext-feedback { display: flex; flex-direction: column; gap: 8px; }
+.ext-feedback-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; }
+.ext-feedback-row .setting-help { margin-top: 0; flex: 1; min-width: 200px; }
+.ext-report-issue { text-decoration: none; color: inherit; white-space: nowrap; }
+.ext-repo-stats { font-size: 12px; margin-top: 0; }
 .ext-install-form { display: flex; gap: 8px; align-items: center; }
 .ext-install-form .ext-install-url { flex: 1; min-width: 0; }
 .ext-mode-row { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }

@@ -1056,3 +1056,58 @@ test('an update auto-update left for the human keeps its button and says why', (
     assert.equal(byClass(extensionsPanelEl({ entries: [EXT1], statuses: { ext1: status } }), 'ext-btn-square').length, 1);
   });
 });
+
+const GH = { ...INSTALLED, id: 'widgets', label: 'Widgets', enabled: true, origin: 'https://github.com/acme/widgets-ext.git', version: '2.0.1' };
+const ISSUE_ENV = { version: '1.2.3', codeVersion: '', hostApi: '1.57.0', os: 'Linux 6.1 (x64)' };
+const feedbackOf = (node) => byClass(node, 'ext-feedback')[0];
+const reportLink = (node) => byClass(node, 'ext-report-issue')[0];
+
+test('Feedback: Report an issue is a new-tab link to the pre-filled GitHub form', () => {
+  withDom(() => {
+    const reported = [];
+    const panel = showing(GH, { issueEnv: ISSUE_ENV, onReportIssue: (e, d) => reported.push([e.id, d.prefill]) });
+    assert.ok(texts(detailOf(panel)).includes('Feedback'));
+    const link = reportLink(panel);
+    assert.equal(link._text, 'Report an issue ↗');
+    assert.equal(link.target, '_blank');
+    assert.equal(link.rel, 'noreferrer noopener');
+    const url = new URL(link.href);
+    assert.equal(`${url.origin}${url.pathname}`, 'https://github.com/acme/widgets-ext/issues/new');
+    assert.match(url.searchParams.get('body'), /Extension: `widgets` 2\.0\.1/);
+    assert.match(url.searchParams.get('body'), /OS: Linux 6\.1 \(x64\)/);
+    link.fire('click');
+    assert.deepEqual(reported, [['widgets', true]]);
+  });
+});
+
+test('Feedback: core reports to Agent Wrangler; a bugs URL wins; no target and no stats draws nothing', () => {
+  withDom(() => {
+    assert.match(reportLink(showing(BUILTIN_A)).href, /^https:\/\/github\.com\/PortSwigger\/agent-wrangler\/issues\/new\?/);
+    const tracked = reportLink(showing({ ...INSTALLED, bugsUrl: 'https://tracker.example.com/notes' }));
+    assert.equal(tracked.href, 'https://tracker.example.com/notes');
+    assert.equal(feedbackOf(showing(INSTALLED)), undefined, 'a non-GitHub origin with no bugs URL');
+    assert.equal(feedbackOf(showing({ ...INSTALLED, origin: '' })), undefined, 'hand-placed, no bugs URL');
+    assert.equal(feedbackOf(showing(GH, { pendingRemoval: ['widgets'] })), undefined);
+  });
+});
+
+test('Feedback: stats only for a GitHub-installed extension, with a Star link that only opens GitHub', () => {
+  withDom(() => {
+    assert.ok(texts(showing(GH)).includes('Loading GitHub stats…'));
+    const panel = showing(GH, { repoStats: { widgets: { stars: 1200, openIssues: 1, htmlUrl: 'https://github.com/acme/widgets-ext' } } });
+    const stats = byClass(panel, 'ext-repo-stats')[0];
+    const all = texts(stats);
+    assert.ok(all.includes('1.2k stars'));
+    const links = byClass(stats, 'ext-kv-open');
+    assert.deepEqual(links.map((a) => [a._text, a.href]), [
+      ['1 open issue', 'https://github.com/acme/widgets-ext/issues'],
+      ['Star on GitHub ↗', 'https://github.com/acme/widgets-ext'],
+    ]);
+    assert.ok(texts(showing(GH, { repoStats: { widgets: { error: 'rate limited' } } })).includes('GitHub stats unavailable: rate limited'));
+    // Core, hand-placed (even with a GitHub bugs URL) and non-GitHub installs: no stats.
+    for (const entry of [BUILTIN_A, { ...INSTALLED, origin: '', bugsUrl: 'https://github.com/acme/notes-ext/issues' }, { ...INSTALLED, bugsUrl: 'https://github.com/acme/notes-ext/issues' }]) {
+      assert.equal(byClass(showing(entry), 'ext-repo-stats').length, 0, entry.id);
+    }
+    assertNoThirdPartyHtml(panel);
+  });
+});

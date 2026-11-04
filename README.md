@@ -331,6 +331,10 @@ complete implementation constraints. Client extensions can build model pickers w
 core’s frozen benchmark data and pure quality/cost/time maths through
 `api.modelFront` (host API 1.56.0), using their own UI and presets.
 
+Each extension's **Report an issue** opens a pre-filled issue on its tracker for you to review and
+submit, and an extension installed from GitHub shows its stars and open issues. An agent that hits a
+broken extension can draft the same issue with `report_extension_issue`.
+
 An extension runs inside the wrangler with full access to the machine: its capability list is
 disclosure, not a sandbox. Install one only if you trust whoever wrote it.
 

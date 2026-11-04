@@ -105,6 +105,12 @@ same provider and lifecycle limits.
 | `cancel_schedule` | Delete a schedule by id (from `schedule_session`) — retract a pending one-off or stop a cron. One-offs delete themselves after firing. |
 | `create_terminal` | Open a plain shell in the caller's directory and optionally prefill, but never execute, one command. |
 
+## Extension feedback
+
+| Tool | Purpose |
+| --- | --- |
+| `report_extension_issue` | Draft an issue about an extension that misbehaved: `extensionId`, `title`, `description` and optional `steps`. Returns the pre-filled new-issue URL that the extension's **Report an issue** button opens, with the extension version, installed commit and branch, Agent Wrangler version, host API, enabled or quarantine state and OS added to the body. It posts nothing. The agent gives the URL to the human, who reviews and submits it. `prefilled: false` (a tracker other than GitHub) or `truncated: true` means the human should also paste the returned `title` and `body`. Errors when the extension names no tracker. |
+
 ## Shared checklist
 
 | Tool | Purpose |
@@ -142,6 +148,7 @@ Board TODOs are separate from session checklists. Their descriptions can be pass
   original user request.
 - `set_links` replaces a complete list; use the `links` skill or read the current list first.
 - `create_terminal` only prefills a command. The human decides whether to run it.
+- `report_extension_issue` only drafts. The human decides whether to submit the issue; agents never file it with `gh issue create` or the API.
 
 ## Tools from built-in extensions
 

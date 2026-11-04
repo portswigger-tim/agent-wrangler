@@ -70,7 +70,7 @@ test('exported install paths are absolute and point at the in-repo agent-skills 
 
 test('the real agent-skills dir ships its core skills with descriptions', () => {
   const names = skillEntries().map((e) => e.name);
-  assert.deepEqual(names, ['advisor', 'links', 'mail', 'session-activity', 'session-hierarchy', 'spawn-session']);
+  assert.deepEqual(names, ['advisor', 'links', 'mail', 'report-extension-issue', 'session-activity', 'session-hierarchy', 'spawn-session']);
   for (const e of skillEntries()) assert.ok(e.description.length > 0, `${e.name} has a description`);
 });
 

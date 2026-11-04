@@ -1,5 +1,6 @@
 import { COPY_ICON, CHECK_ICON, PROMOTE_ICON, RESTART_ICON, GITHUB_ICON, STAR_ICON, ATTACH_ICON, SEARCH_ICON } from './icons.js';
 import { changesText } from './update-panel.js';
+import { extensionIssue, statsRepoOf } from './extension-issue.js';
 
 // The Extensions settings tab and the install/update consent modal. Pure DOM
 // builders with no app state, like toast.js and system-banner.js: settings.js
@@ -212,7 +213,7 @@ function sourceEl(entry) {
 // settings.js's delegated click handler already drives (and where it puts its
 // flip note), so the enable switch has no second flip path.
 export function extensionDetailEl(entry, {
-  status, pendingRemoval, settings, onUninstall, onAutoUpdate,
+  status, pendingRemoval, settings, onUninstall, onAutoUpdate, issueEnv, repoStats, onReportIssue,
 } = {}) {
   const pane = el('div', 'ext-detail-body');
   const head = el('div', 'setting-row ext-detail-head');
@@ -258,8 +259,77 @@ export function extensionDetailEl(entry, {
   // builtin ships with the wrangler and a hand-placed one has no record.
   if (entry.external && entry.origin && !pendingRemoval) section(pane, 'Updates', autoUpdateRowEl(entry, onAutoUpdate));
   section(pane, 'Source', sourceEl(entry));
+  const feedback = !pendingRemoval && feedbackEl(entry, { issueEnv, repoStats, onReportIssue });
+  if (feedback) section(pane, 'Feedback', feedback);
   if (settings && !pendingRemoval) section(pane, 'Settings', settings);
   return pane;
+}
+
+export const REPORT_ISSUE_HELP = 'Opens a new issue with this extension\'s details filled in, for you to review and submit. Nothing is posted until you submit it.';
+export const REPORT_ISSUE_COPY_HELP = 'Opens this extension\'s issue tracker and copies a draft with its details to paste.';
+
+function externalLink(className, text, href) {
+  const a = el('a', className, text);
+  a.href = href;
+  a.target = '_blank';
+  a.rel = 'noreferrer noopener';
+  return a;
+}
+
+// "Report an issue", plus stars and open issues for an extension installed
+// from GitHub. The button is a link, not a script-opened window, so a popup
+// blocker never eats it; the URL is built by extension-issue.js, the same code
+// as the report_extension_issue MCP tool. Absent when the extension names no
+// tracker and has no stats to show.
+//
+// `repoStats` is the reply to `ext-repo-stats` for this extension: undefined
+// or `{ loading }` while it is out, `{ error }`, or `{ stars, openIssues,
+// htmlUrl }`. Nothing here stars a repository: "Star on GitHub" opens the
+// repository's page, where the human can.
+function feedbackEl(entry, { issueEnv, repoStats, onReportIssue } = {}) {
+  const draft = extensionIssue(entry, issueEnv || {});
+  const statsRepo = statsRepoOf(entry);
+  if (!draft && !statsRepo) return null;
+  const box = el('div', 'ext-feedback');
+  if (draft) {
+    const row = el('div', 'ext-feedback-row');
+    const report = externalLink('ext-btn ext-btn-sm ext-report-issue', 'Report an issue ↗', draft.url);
+    report.addEventListener('click', () => onReportIssue?.(entry, draft));
+    row.append(report);
+    row.append(el('span', 'setting-help', draft.prefill ? REPORT_ISSUE_HELP : REPORT_ISSUE_COPY_HELP));
+    box.append(row);
+  }
+  if (statsRepo) box.append(repoStatsEl(statsRepo, repoStats));
+  return box;
+}
+
+function repoStatsEl(repo, stats) {
+  const meta = el('div', 'ext-gh-meta ext-repo-stats');
+  if (!stats || stats.loading) {
+    meta.append(el('span', null, 'Loading GitHub stats…'));
+    return meta;
+  }
+  if (stats.error) {
+    meta.append(el('span', null, `GitHub stats unavailable: ${stats.error}`));
+    return meta;
+  }
+  const n = (count, word) => `${compactCount(count)} ${word}${count === 1 ? '' : 's'}`;
+  const stars = el('span', 'ext-gh-stars');
+  stars.innerHTML = STAR_ICON;
+  stars.append(el('span', null, n(stats.stars, 'star')));
+  stars.title = `${stats.stars} star${stats.stars === 1 ? '' : 's'} on GitHub`;
+  meta.append(stars);
+  const issues = stats.htmlUrl
+    ? externalLink('ext-kv-open', `${n(stats.openIssues, 'open issue')}`, `${stats.htmlUrl}/issues`)
+    : el('span', null, n(stats.openIssues, 'open issue'));
+  issues.title = 'GitHub\'s count, which includes open pull requests.';
+  meta.append(issues);
+  if (stats.htmlUrl) {
+    const star = externalLink('ext-kv-open', 'Star on GitHub ↗', stats.htmlUrl);
+    star.title = `Opens ${repo.owner}/${repo.repo} on GitHub, where you can star it.`;
+    meta.append(star);
+  }
+  return meta;
 }
 
 // The per-extension auto-update switch. No `data-id`, so settings.js's
@@ -863,6 +933,7 @@ export function extensionsPanelEl({
   selectedId = '', filter = '', adding = false, browse = null, addMode = 'browse', browseQuery = '',
   onSelect, onFilter, onAdd, onAddMode, onBrowseQuery, onInstall, onBrowse, onUninstall, onUpdate, onUpdateAll,
   onCheckUpdates, onRestart, onSettingChange, onAutoUpdate, settingsEl,
+  issueEnv = {}, repoStats = {}, onReportIssue,
 } = {}) {
   const wrap = el('div', 'ext-split');
   const removing = new Set(pendingRemoval);
@@ -969,6 +1040,9 @@ export function extensionsPanelEl({
       settings,
       onUninstall,
       onAutoUpdate,
+      issueEnv,
+      repoStats: repoStats[selected.id],
+      onReportIssue,
     }));
   }
   wrap.append(detail);

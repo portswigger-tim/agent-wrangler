@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 import semver from 'semver';
 import { validateManifest } from '../../extensions/index.js';
 import { externalDir, tmpDir, ensureDirs, isValidExtensionId, readProvenance, recordFor, putRecord, removeRecord, setAutoUpdate, setEarlyAdopter, trackedBranch } from '../../extensions/provenance.js';
-import { unconsentedCapabilities, admitExternal, importViolation } from '../../extensions/external.js';
+import { unconsentedCapabilities, admitExternal, importViolation, packageFacts } from '../../extensions/external.js';
 import { assertAllowedUrl, cloneTo, readHead, lockDependencies, npmCi, lsRemoteHead, commitsSince, readDeclaration, MissingLockfileError, MissingDeclarationError } from '../../extensions/install.js';
 import { HOST_API_VERSION, servesRange, isValidRange } from '../../host-api/version.js';
 import { log } from '../../log.js';
@@ -258,7 +258,7 @@ async function goLive(ctx, id, dest) {
     // otherwise get the module already in this process's ESM cache, which is
     // the version that was just deleted from disk.
     const mod = await import(`${pathToFileURL(path.join(dest, 'index.js')).href}?t=${Date.now()}`);
-    const admitted = admitExternal(mod?.default, { id, dir: dest, external: true, provenance: recordFor(id) });
+    const admitted = admitExternal(mod?.default, { id, dir: dest, external: true, provenance: recordFor(id), ...packageFacts(dest) });
     if (!admitted.ok) throw new Error(admitted.quarantine);
     const entry = ctx.ext.register(admitted.entry);
     registered = true;

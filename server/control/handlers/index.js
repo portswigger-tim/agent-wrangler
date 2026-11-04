@@ -29,6 +29,7 @@ import { extensionEnabledHandler } from './extension-enabled.js';
 import { extInstallHandler, extConsentHandler, extUninstallHandler, extCheckUpdatesHandler, extSetAutoUpdateHandler, extSetEarlyAdopterHandler } from './extensions-install.js';
 import { extSettingSetHandler } from './ext-setting-set.js';
 import { extBrowseHandler } from './ext-browse.js';
+import { extRepoStatsHandler } from './ext-repo-stats.js';
 import { restartHandler } from './restart.js';
 import { restartTmuxHandler } from './restart-tmux.js';
 import { updateCheckHandler, updateApplyHandler, autoUpdateModeHandler, refreshSessionsAfterUpdateHandler } from './self-update.js';
@@ -108,6 +109,7 @@ export const CONTROL_HANDLERS = [
   extSetAutoUpdateHandler,
   extSetEarlyAdopterHandler,
   extBrowseHandler,
+  extRepoStatsHandler,
   restartHandler,
   restartTmuxHandler,
   updateCheckHandler,

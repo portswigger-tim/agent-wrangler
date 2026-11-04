@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { discoverExternal, unconsentedCapabilities, admitExternal, FORBIDDEN_IMPORTS } from './external.js';
-import { loadExtensions } from './index.js';
+import { loadExtensions, extensionsForGraph } from './index.js';
 
 function tempRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'aw-ext-discover-'));
@@ -181,4 +181,30 @@ test('admitExternal applies the id-match and consent checks the install path sha
   assert.equal(ok.entry.label, 'Toy');
   assert.equal(ok.entry.dir, '/tmp/toy', 'the discovered path wins over the manifest\'s own');
   assert.equal(ok.entry.external, true);
+});
+
+test('package.json version and https bugs URL ride the entry, quarantined or not, into the graph', async () => {
+  const root = tempRoot();
+  const good = writeExt(root, 'notes');
+  fs.writeFileSync(path.join(good, 'package.json'), JSON.stringify({ version: '1.4.0', bugs: { url: 'https://github.com/acme/notes-ext/issues' } }));
+  const broken = writeExt(root, 'broken', { idInManifest: 'other' });
+  fs.writeFileSync(path.join(broken, 'package.json'), JSON.stringify({ version: '0.1.0', bugs: 'https://tracker.example.com/broken' }));
+  const plain = writeExt(root, 'plain');
+  fs.writeFileSync(path.join(plain, 'package.json'), JSON.stringify({ bugs: 'http://tracker.example.com/plain' }));
+  writeExt(root, 'bare');
+  const found = await discoverExternal({ dir: root, provenance: {} });
+  const byId = Object.fromEntries(found.map((e) => [e.id, e]));
+  assert.equal(byId.notes.version, '1.4.0');
+  assert.equal(byId.notes.bugsUrl, 'https://github.com/acme/notes-ext/issues');
+  assert.ok(byId.broken.quarantine);
+  assert.equal(byId.broken.bugsUrl, 'https://tracker.example.com/broken');
+  assert.equal(byId.plain.bugsUrl, '', 'a non-https bugs URL is ignored, like homepage');
+  assert.deepEqual([byId.bare.version, byId.bare.bugsUrl], ['', '']);
+
+  const graph = extensionsForGraph(loadExtensions({ cfg: {}, builtin: found }).list, () => true, () => ({}));
+  const rows = Object.fromEntries(graph.map((e) => [e.id, e]));
+  assert.equal(rows.notes.version, '1.4.0');
+  assert.equal(rows.notes.bugsUrl, 'https://github.com/acme/notes-ext/issues');
+  assert.equal(rows.broken.bugsUrl, 'https://tracker.example.com/broken');
+  assert.equal(rows.bare.bugsUrl, '');
 });

@@ -470,6 +470,7 @@ export function extensionsForGraph(list, enabledFor = extensionEnabled, valuesFo
   return list.map(({
     id, label, help, defaultEnabled, enabled: bootEnabled, handlerTypes, hideDispatchField, keybindings,
     quarantine, external, description, author, homepage, provenance, requires, settings, runtimes, earlyAdopterBranch,
+    version, bugsUrl, range,
   }) => ({
     id, label, help, defaultEnabled, bootEnabled: Boolean(bootEnabled) && !quarantine,
     enabled: quarantine ? false : enabledFor(id, defaultEnabled),
@@ -481,6 +482,11 @@ export function extensionsForGraph(list, enabledFor = extensionEnabled, valuesFo
     description: description || '',
     author: author || '',
     homepage: homepage || '',
+    // "Report an issue" (public/extension-issue.js): the package.json version
+    // and https:// `bugs` URL, and the declared `engines.wranglerApi` range.
+    version: version || '',
+    bugsUrl: bugsUrl || '',
+    range: range || '',
     requires: [...(requires || [])],
     // The runtimes it contributes, for the dispatch dialog's Runtime select.
     // Filled only while the extension is staged (empty for a disabled or
@@ -641,6 +647,10 @@ function quarantinedEntry(ext, quarantine) {
     description: '',
     author: '',
     homepage: '',
+    // Kept for a quarantined row too: a broken extension is exactly the one
+    // whose "Report an issue" matters.
+    version: typeof ext?.version === 'string' ? ext.version : '',
+    bugsUrl: typeof ext?.bugsUrl === 'string' ? ext.bugsUrl : '',
     defaultEnabled: false,
     enabled: false,
     requires: [],
@@ -693,6 +703,9 @@ function stageExtension(ext, { cfg, out, reg }) {
     description: typeof ext.description === 'string' ? ext.description : '',
     author: typeof ext.author === 'string' ? ext.author : '',
     homepage: typeof ext.homepage === 'string' ? ext.homepage : '',
+    // From package.json (external.js packageFacts), so empty for a builtin.
+    version: typeof ext.version === 'string' ? ext.version : '',
+    bugsUrl: typeof ext.bugsUrl === 'string' ? ext.bugsUrl : '',
     defaultEnabled: Boolean(ext.defaultEnabled),
     enabled,
     requires: [...(ext.requires || [])],

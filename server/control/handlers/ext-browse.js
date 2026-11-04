@@ -1,3 +1,5 @@
+import { noteRepo } from '../../extensions/github-stats.js';
+
 // Public GitHub repositories tagged with the extension topic, for the "+ Add
 // extension" pane to list. A listing only: picking one sends its clone URL down
 // the ordinary `ext-install` path, so the clone, the disclosure and the consent
@@ -56,7 +58,11 @@ export const extBrowseHandler = {
         throw new Error(limited ? 'GitHub\'s search rate limit was hit — try again in a minute.' : `GitHub answered ${res.status}.`);
       }
       const body = await res.json();
-      const repos = (Array.isArray(body?.items) ? body.items : []).map(toRepo).filter(Boolean);
+      const items = Array.isArray(body?.items) ? body.items : [];
+      // Each result's stars and open issues seed the detail pane's cache, so an
+      // installed extension the catalog lists needs no request of its own.
+      for (const item of items) noteRepo(item);
+      const repos = items.map(toRepo).filter(Boolean);
       ctx.reply({ type: 'ext-browse-results', topic: EXTENSION_TOPIC, repos });
     } catch (err) {
       ctx.reply({ type: 'ext-browse-results', topic: EXTENSION_TOPIC, repos: [], error: String(err?.message || err) });

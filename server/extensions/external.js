@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { externalDir, readProvenance, tmpDir } from './provenance.js';
+import { bugsUrlOf } from '../../public/extension-issue.js';
 
 // Discovery of INSTALLED ("external") extensions: one immediate subdirectory of
 // <DATA_DIR>/extensions/ per extension, each with an index.js default-exporting
@@ -15,7 +16,8 @@ import { externalDir, readProvenance, tmpDir } from './provenance.js';
 // contributes nothing — see its failure-posture comment. A directory that can
 // only be half-understood must not take the board down with it.
 //
-// Stays a LEAF: node:fs / node:path / node:url and the provenance leaf only.
+// Stays a LEAF: node:fs / node:path / node:url, the provenance leaf and the
+// pure public/extension-issue.js only.
 
 // A static import of these breaks BOOT FOR THE WHOLE SERVER, not just one
 // extension: server/extensions/** is imported by mcp/client-config.js and
@@ -131,13 +133,31 @@ export function unconsentedCapabilities(requires, record) {
 // that skipped one of these checks would land an extension boot would then
 // quarantine, which reads as an install that silently did nothing.
 //
-// `base` is `{id, dir, external, provenance}` — the id being the DIRECTORY name,
+// `base` is `{id, dir, external, provenance}` plus packageFacts — the id being the DIRECTORY name,
 // which is the authority the manifest is held to. Returns the entry to stage, or
 // the quarantine reason discovery would have carried; the caller decides which
 // of those it can live with (discovery quarantines, an install refuses).
 //
 // `importViolation` is deliberately NOT part of this: it runs BEFORE the import,
 // and both callers have to run it there rather than after the fact.
+// What an installed extension's package.json says about itself beyond the
+// `wranglerExtension` block: its `version`, and its `bugs` tracker as an
+// https:// URL (see public/extension-issue.js). Read for "Report an issue",
+// never for anything that decides whether it loads, so a missing or unreadable
+// file is just empty strings — a hand-placed extension may have no package.json.
+export function packageFacts(dir) {
+  let pkg = null;
+  try {
+    pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+  } catch {
+    // No facts to report.
+  }
+  return {
+    version: typeof pkg?.version === 'string' ? pkg.version.slice(0, 64) : '',
+    bugsUrl: bugsUrlOf(pkg?.bugs),
+  };
+}
+
 export function admitExternal(manifest, base) {
   if (!manifest || typeof manifest !== 'object') return { ok: false, quarantine: 'index.js has no default-exported manifest object' };
   // EXTERNAL ONLY: the id and the directory name must agree, or the on-disk
@@ -190,7 +210,7 @@ export async function discoverExternal({ dir = externalDir(), provenance = readP
     // cannot be read still has to produce a row, and the directory is the only
     // name available then. `provenance: null` is what marks an entry as
     // not-updatable (there is no originUrl to re-clone).
-    const base = { id: name, dir: extDir, external: true, provenance: provenance?.[name] ?? null };
+    const base = { id: name, dir: extDir, external: true, provenance: provenance?.[name] ?? null, ...packageFacts(extDir) };
     const violation = importViolation(extDir);
     if (violation) { out.push({ ...base, quarantine: violation }); continue; }
     let manifest;
