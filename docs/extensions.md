@@ -34,13 +34,16 @@ Select an extension to see its **Enabled** switch, **Uninstall…** (installed
 only), its **Auto-update** switch (installed from a git URL only), its **Source** (type, repository and
 commit), its **Feedback** and its **Settings**.
 
-### Report an issue and GitHub stats
+### Report an issue, request a feature, and GitHub stats
 
 **Report an issue** in an extension's **Feedback** section opens a new issue on its tracker in a new
 tab, with the extension id, version, installed commit and branch (the early-adopter branch when you
 follow it), the Agent Wrangler version, the host API version and the extension's `wranglerApi` range,
-whether it is enabled or quarantined, and the OS already in the body. Nothing is posted: you add what
-went wrong, review it, and submit it yourself. Long reports are shortened to fit GitHub's URL limit.
+whether it is enabled or quarantined, and the OS already in the body. **Request a feature** beside
+it opens the same tracker with a feature-request template (what you'd like, why, and how it might
+look) and just the extension and Agent Wrangler versions. On GitHub the two are labelled `bug` and
+`enhancement` when you are allowed to label issues there. Nothing is posted: you fill in the rest,
+review it, and submit it yourself. Long reports are shortened to fit GitHub's URL limit.
 
 The issue goes to the first of these that exists:
 
@@ -48,10 +51,12 @@ The issue goes to the first of these that exists:
 2. Agent Wrangler's own repository, for a core extension.
 3. The GitHub repository it was installed from.
 
-An extension with none of these has no button. A `bugs` URL on GitHub opens that repository's
+An extension with none of these has neither link. A `bugs` URL on GitHub opens that repository's
 new-issue form pre-filled; any other tracker opens as it is, and the draft is copied for you to paste.
 An agent can draft the same issue with the `report_extension_issue` tool (see
-[Agent tools](agent-tools.md#extension-feedback)).
+[Agent tools](agent-tools.md#extension-feedback)). When you wish out loud that an extension did
+something differently, an agent offers once to draft a feature request and drafts it only if you
+say yes.
 
 An extension installed from a GitHub URL also shows its stars and open issues (GitHub's count, which
 includes open pull requests), with a link to the issues and **Star on GitHub**, which opens the
@@ -169,8 +174,8 @@ export default {
 ```
 
 `bugs` is the standard npm field, a URL string or `{ "url": … }`, and is optional. It sets where
-**Report an issue** files issues; leave it out to use the GitHub repository the extension was
-installed from. Only an `https://` URL counts. The `version` field is shown in issue reports.
+**Report an issue** and **Request a feature** file issues; leave it out to use the GitHub repository
+the extension was installed from. Only an `https://` URL counts. The `version` field is shown in issue reports.
 
 `earlyAdopter` is optional (1.39.0). Its `branch` must be a branch name `git check-ref-format
 --branch` accepts and not start with `-`, and the two copies must match.
@@ -281,7 +286,7 @@ have no provenance or panel updates; use an isolated `AW_DATA_DIR`.
 - Put browser assets under `public/`. Third-party strings render as text; homepages must use `https://`.
 - Set `bugs` in `package.json` to an `https://` URL when issues belong somewhere other than the
   GitHub repository people install from, or when it is not on GitHub. Without one, an extension not
-  installed from GitHub gets no **Report an issue** button.
+  installed from GitHub gets no **Report an issue** or **Request a feature** link.
 - Handle cleanup explicitly: uninstall removes the extension and provenance, not files it wrote elsewhere.
 
 ### Session launch capabilities

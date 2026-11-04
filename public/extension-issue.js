@@ -97,14 +97,17 @@ function branchText(entry) {
 }
 
 // The facts block. `env` is the wrangler's side: `{ version, codeVersion,
-// hostApi, os }`, any of them possibly empty.
-export function environmentLines(entry, env = {}) {
+// hostApi, os }`, any of them possibly empty. A feature request gets the
+// `short` block — which extension and which wrangler — since the commit, state
+// and OS are there to reproduce a bug.
+export function environmentLines(entry, env = {}, { short = false } = {}) {
   const lines = [];
   const kind = entry.external ? (entry.origin ? 'installed from git' : 'placed by hand') : 'core';
   lines.push(`- Extension: ${code(entry.id)}${entry.version ? ` ${entry.version}` : ''} (${kind})`);
-  if (entry.sha) lines.push(`- Installed commit: ${code(entry.sha)} on ${branchText(entry)}`);
+  if (entry.sha && !short) lines.push(`- Installed commit: ${code(entry.sha)} on ${branchText(entry)}`);
   const build = env.codeVersion && env.codeVersion !== env.version ? ` (${code(env.codeVersion)})` : '';
   lines.push(`- Agent Wrangler: ${env.version || 'unknown'}${build}`);
+  if (short) return lines;
   const range = entry.range ? `, extension declares ${code(entry.range)}` : '';
   lines.push(`- wranglerApi: ${env.hostApi || 'unknown'}${range}`);
   lines.push(`- State: ${stateText(entry)}`);
@@ -112,22 +115,46 @@ export function environmentLines(entry, env = {}) {
   return lines;
 }
 
-const DESCRIPTION_HINT = '<!-- What went wrong, and what you expected instead. -->';
-const STEPS_HINT = '<!-- 1. … -->';
+// A bug report or a feature request. Each kind is its body's sections, in
+// order — `[heading, field, hint]`, where a section with no hint is optional
+// and left out when its field is empty — and the label GitHub applies when the
+// reporter is allowed to label (and ignores otherwise).
+export const ISSUE_KINDS = {
+  bug: {
+    label: 'bug',
+    sections: [
+      ['What happened', 'description', '<!-- What went wrong, and what you expected instead. -->'],
+      ['Steps to reproduce', 'steps', '<!-- 1. … -->'],
+    ],
+  },
+  feature: {
+    label: 'enhancement',
+    sections: [
+      ['What I\'d like', 'description', '<!-- The change you would like, as you would use it. -->'],
+      ['Why / what I was doing', 'why', '<!-- What you were trying to do when you wanted it. -->'],
+      ['How it might look', 'how', null],
+    ],
+  },
+};
 
-export function issueBody(entry, env, { description = '', steps = '' } = {}) {
+const kindOf = (kind) => (Object.hasOwn(ISSUE_KINDS, kind) ? kind : 'bug');
+const FIELDS = ['description', 'steps', 'why', 'how'];
+
+// `text` is `{ kind, description, steps, why, how }`; only the kind's own
+// fields are used.
+export function issueBody(entry, env, text = {}) {
+  const kind = kindOf(text.kind);
+  const out = [];
+  for (const [heading, field, hint] of ISSUE_KINDS[kind].sections) {
+    const value = String(text[field] || '').trim();
+    if (!value && !hint) continue;
+    out.push(`### ${heading}`, '', value || hint, '');
+  }
   return [
-    '### What happened',
-    '',
-    description.trim() || DESCRIPTION_HINT,
-    '',
-    '### Steps to reproduce',
-    '',
-    steps.trim() || STEPS_HINT,
-    '',
+    ...out,
     '### Environment',
     '',
-    ...environmentLines(entry, env),
+    ...environmentLines(entry, env, { short: kind === 'feature' }),
     '',
     '<!-- Drafted by Agent Wrangler. Nothing has been posted: review it, remove anything you would rather not share, then submit. -->',
   ].join('\n');
@@ -141,24 +168,33 @@ export function issueTitle(entry, title = '') {
   return clip(t.startsWith(prefix) ? t : `${prefix}${t}`, MAX_TITLE_LENGTH);
 }
 
-const withQuery = (url, title, body) => `${url}${url.includes('?') ? '&' : '?'}title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
+// `labels` is added only when the tracker's URL does not already choose them
+// (a `bugs` URL may carry its own `?labels=`).
+function withQuery(url, title, body, label) {
+  const labels = label && !/[?&]labels=/.test(url) ? `&labels=${encodeURIComponent(label)}` : '';
+  return `${url}${url.includes('?') ? '&' : '?'}title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}${labels}`;
+}
 
-// The drafted issue: `{ url, prefill, truncated, title, body }`, or null when
-// the extension has nowhere to report to. `title` and `body` are the full text,
-// for a human to paste when `prefill` is false or the URL had to be shortened.
+// The drafted issue: `{ url, prefill, truncated, kind, title, body }`, or null
+// when the extension has nowhere to report to. `title` and `body` are the full
+// text, for a human to paste when `prefill` is false or the URL had to be
+// shortened. `kind` is 'bug' (the default) or 'feature'.
 //
-// Over the length limit, the description and steps are cut — never the
-// environment, which is what makes a report actionable — to the longest that
-// fits, found by bisection since each character can encode to up to nine.
-export function extensionIssue(entry, env = {}, { title = '', description = '', steps = '' } = {}) {
+// Over the length limit, the free-text fields are cut — never the environment,
+// which is what makes a report actionable — to the longest that fits, found by
+// bisection since each character can encode to up to nine.
+export function extensionIssue(entry, env = {}, { kind: askedKind = 'bug', title = '', ...fields } = {}) {
   const target = issueTarget(entry);
   if (!target) return null;
+  const kind = kindOf(askedKind);
+  const text = Object.fromEntries(FIELDS.map((f) => [f, String(fields[f] || '').trim()]));
   const fullTitle = issueTitle(entry, title);
-  const fullBody = issueBody(entry, env, { description, steps });
-  const draft = { url: target.url, prefill: target.prefill, truncated: false, title: fullTitle, body: fullBody };
+  const fullBody = issueBody(entry, env, { kind, ...text });
+  const draft = { url: target.url, prefill: target.prefill, truncated: false, kind, title: fullTitle, body: fullBody };
   if (!target.prefill) return draft;
-  const urlFor = (n) => withQuery(target.url, fullTitle, issueBody(entry, env, { description: clip(description.trim(), n), steps: clip(steps.trim(), n) }));
-  const longest = Math.max(description.trim().length, steps.trim().length);
+  const cut = (n) => Object.fromEntries(FIELDS.map((f) => [f, clip(text[f], n)]));
+  const urlFor = (n) => withQuery(target.url, fullTitle, issueBody(entry, env, { kind, ...cut(n) }), ISSUE_KINDS[kind].label);
+  const longest = Math.max(...FIELDS.map((f) => text[f].length));
   if (urlFor(longest).length <= MAX_ISSUE_URL_LENGTH) return { ...draft, url: urlFor(longest) };
   let lo = 0;
   let hi = longest;
