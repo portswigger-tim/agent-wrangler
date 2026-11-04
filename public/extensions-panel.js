@@ -1132,7 +1132,9 @@ export function starOfferText({ login } = {}) {
 
 function starOfferEl(offer) {
   const box = el('div', 'ext-consent-star');
-  const label = el('label', 'ext-consent-star-label');
+  // `check-row` is the modal's own checkbox row (styles.css), which undoes the
+  // `.modal-card label` field-heading style.
+  const label = el('label', 'check-row ext-consent-star-label');
   const input = el('input', 'ext-consent-star-input');
   input.type = 'checkbox';
   input.checked = false;

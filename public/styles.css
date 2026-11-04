@@ -3432,7 +3432,7 @@ main.diff-fullscreen .diff-filelist-handle { display: block; }
 .ext-report-issue { text-decoration: none; color: inherit; white-space: nowrap; }
 .ext-repo-stats { font-size: 12px; margin-top: 0; color: var(--fg-muted); }
 .ext-consent-star { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border-muted); }
-.ext-consent-star-label { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; cursor: pointer; }
+.modal-card label.check-row.ext-consent-star-label { font-weight: 600; gap: 8px; }
 .ext-install-form { display: flex; gap: 8px; align-items: center; }
 .ext-install-form .ext-install-url { flex: 1; min-width: 0; }
 .ext-mode-row { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
