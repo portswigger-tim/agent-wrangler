@@ -204,7 +204,7 @@ Worktree and devcontainer cleanup is withheld while another session uses the dir
 
 - Theme, terminal side, terminal font size, and chat font size.
 - Child-card and Chat defaults, and the default folder for new sessions.
-- PR auto-fix, the `Model:` and `Extensions:` lines on new pull requests (see
+- PR auto-fix, the `Model:` and `Extensions:` lines and the extension usage table on new pull requests (see
   [Reviews and pull requests](reviews-and-prs.md#model-footer-on-new-pull-requests)), Codex and Claude folder trust, and optional extraction of archive learnings into task memory.
   Codex folder trust uses the resolved directory path, so a symlink and its target share one trust
   entry. If the directory cannot be resolved or trust cannot be saved, the launch reports an error.

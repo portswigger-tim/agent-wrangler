@@ -161,6 +161,27 @@ the agent wrote itself is never changed, and running the footer twice adds nothi
 is on by default and independent of the model switch. Nothing is sent anywhere else: the usage behind
 it is kept on this machine (see [Extensions](extensions.md#for-extension-authors-seeing-your-usage)).
 
+### Extension usage table
+
+Below the `Extensions:` line, the same step adds a collapsed **Extension usage in this PR** table:
+
+| Extension | Commit | Tools (calls) | Skills | Runtime |
+| --- | --- | --- | --- | --- |
+| acme/widgets-ext | `0123456` | `widget_make` (12), `widget_list` (3) | `widgets` | — |
+
+It has one row per extension the `Extensions:` line names, in the same order. **Commit** is the
+installed version, and **Runtime** says whether the session ran on a runtime the extension adds. The
+counts cover the session since its previous pull request, or since it started for its first one; use
+after the pull request was opened is not added later. Each row lists the 10 most-called tools, with "+N
+more" for the rest. Only names and counts are recorded, never what was passed to a tool. A JSON copy
+sits in an HTML comment for tools to read (see
+[Usage table format](extensions.md#usage-table-format)).
+
+It is added once: a description that already has one, or anything with
+`<summary>Extension usage`, is left alone. Turn it off with **Include per-extension tool and skill
+counts**, under the extensions switch in **Settings → Automation**. It is on by default, and off
+whenever the `Extensions:` line is.
+
 Claude skill use is read from the session's `Skill` tool calls. Codex has no skill tool, so a Codex
 session counts a skill when it reads that skill's `SKILL.md`, which is how Codex loads one. This is
 best effort: a session that reads the file for another reason also counts.

@@ -929,6 +929,11 @@ body.light #sn-when, body.light #m-sch-at, body.light #m-sch-time { color-scheme
   background: var(--fg-muted); transition: transform 0.12s ease, background 0.12s ease;
 }
 .setting-toggle.on .setting-knob { transform: translateX(16px); background: var(--accent-fg); }
+/* A sub-setting (settings.js `parent`): indented under its parent toggle, and
+   dimmed with its switch disabled while that parent is off. */
+.setting-row-sub { padding-left: 22px; }
+.setting-row-sub .setting-toggle:disabled { opacity: 0.55; cursor: default; border-color: var(--border); }
+.setting-row-sub:has(.setting-toggle:disabled) .setting-copy { opacity: 0.6; }
 
 /* Appearance section: each item (Theme, Terminal font size) gets the same
    label/help styling as a Behavior row, then its own row of pills/segments. */

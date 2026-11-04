@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { SETTINGS_TABS, SETTINGS, isOpenSettingsKey, tabIndexAfterKey, setExtensionDefs, setRuntimeOptions, extensionFlipNote, getSetting, EXT_SETTING_PREFIX } from './settings.js';
+import { SETTINGS_TABS, SETTINGS, settingRowHtml, settingLocked, initSettings, isOpenSettingsKey, tabIndexAfterKey, setExtensionDefs, setRuntimeOptions, extensionFlipNote, getSetting, EXT_SETTING_PREFIX } from './settings.js';
 
 test('settings are grouped into six ordered tabs', () => {
   assert.deepEqual(SETTINGS_TABS.map(({ id, label }) => ({ id, label })), [
@@ -32,6 +32,7 @@ test('each registered setting appears in exactly one tab', () => {
     'mailWakesDormant',
     'prModelFooter',
     'prExtensionsFooter',
+    'prExtensionsUsage',
     'flipNavHotkeys',
     'autoUpdate',
     'refreshSessionsAfterUpdate',
@@ -143,4 +144,33 @@ test('setRuntimeOptions replaces the Default runtime row\'s options', () => {
   setRuntimeOptions([]);
   setRuntimeOptions(null);
   assert.deepEqual(def.options, list);
+});
+
+test('the per-extension counts toggle sits under the Extensions-line toggle and locks while it is off', () => {
+  const automation = SETTINGS_TABS.find((t) => t.id === 'automation').settingIds;
+  assert.equal(automation.indexOf('prExtensionsUsage'), automation.indexOf('prExtensionsFooter') + 1);
+  const def = SETTINGS.find((s) => s.id === 'prExtensionsUsage');
+  assert.equal(def.parent, 'prExtensionsFooter');
+  assert.equal(def.default, true);
+  assert.equal(def.label, 'Include per-extension tool and skill counts');
+
+  const server = { prExtensionsFooter: true, prExtensionsUsage: true };
+  // No DOM here: initSettings only needs to find no modal to stop after
+  // taking the bridge.
+  const hadDocument = 'document' in globalThis;
+  globalThis.document ??= { getElementById: () => null };
+  try {
+    initSettings({ server: { get: (id) => server[id], set: (id, v) => { server[id] = v; } } });
+  } finally {
+    if (!hadDocument) delete globalThis.document;
+  }
+  assert.equal(settingLocked('prExtensionsUsage'), false);
+  assert.match(settingRowHtml(def), /class="setting-row setting-row-sub"/);
+  assert.doesNotMatch(settingRowHtml(def), /disabled/);
+  server.prExtensionsFooter = false;
+  assert.equal(settingLocked('prExtensionsUsage'), true);
+  assert.match(settingRowHtml(def), /role="switch" disabled/);
+  // Locked, it still shows its own stored value.
+  assert.match(settingRowHtml(def), /setting-toggle on/);
+  assert.equal(settingLocked('prExtensionsFooter'), false);
 });

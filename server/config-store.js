@@ -77,6 +77,13 @@ export function prExtensionsFooterEnabled(cfg = readConfig()) {
   return cfg.prExtensionsFooter !== false;
 }
 
+// Whether that footer also gets the per-extension usage table (tool calls,
+// skills, runtime) for the PR's window. A sub-switch of the Extensions line:
+// stored on its own, default on, and only ever applied while the line is on.
+export function prExtensionsUsageEnabled(cfg = readConfig()) {
+  return cfg.prExtensionsFooter !== false && cfg.prExtensionsUsage !== false;
+}
+
 // Whether a session's sub-agents zone (board card + panel) starts expanded or
 // collapsed for cards the user hasn't explicitly toggled either way. Default off
 // (collapsed) to preserve today's behaviour; toggled from the board's settings

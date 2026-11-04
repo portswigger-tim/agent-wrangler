@@ -174,6 +174,7 @@ let autoFixPrChecksDefault = true; // server config flag, carried on every graph
 let mailWakesDormant = false;
 let prModelFooter = true;
 let prExtensionsFooter = true;
+let prExtensionsUsage = true;
 let archiveReviewEnabled = false; // server config flag, carried on every graph push
 let chatViewDefault = false; // server config flag, carried on every graph push
 let defaultSessionCwd = ''; // server config value, carried on every graph push
@@ -850,6 +851,7 @@ function applyGraph(graph) {
   mailWakesDormant = graph.mailWakesDormant === true;
   prModelFooter = graph.prModelFooter !== false;
   prExtensionsFooter = graph.prExtensionsFooter !== false;
+  prExtensionsUsage = graph.prExtensionsUsage !== false;
   chatViewDefault = graph.chatViewDefault === true;
   defaultSessionCwd = typeof graph.defaultSessionCwd === 'string' ? graph.defaultSessionCwd : '';
   defaultRuntime = typeof graph.defaultRuntime === 'string' && graph.defaultRuntime ? graph.defaultRuntime : 'local';
@@ -7081,6 +7083,7 @@ initSettings({
       if (id === 'mailWakesDormant') return mailWakesDormant;
       if (id === 'prModelFooter') return prModelFooter;
       if (id === 'prExtensionsFooter') return prExtensionsFooter;
+      if (id === 'prExtensionsUsage') return prExtensionsUsage;
       if (id === 'chatViewDefault') return chatViewDefault;
       if (id === 'defaultSessionCwd') return defaultSessionCwd;
       if (id === 'defaultRuntime') return defaultRuntime;
@@ -7123,6 +7126,9 @@ initSettings({
       } else if (id === 'prExtensionsFooter') {
         prExtensionsFooter = Boolean(value);
         send({ type: 'set-pr-extensions-footer', enabled: prExtensionsFooter });
+      } else if (id === 'prExtensionsUsage') {
+        prExtensionsUsage = Boolean(value);
+        send({ type: 'set-pr-extensions-usage', enabled: prExtensionsUsage });
       } else if (id === 'chatViewDefault') {
         chatViewDefault = Boolean(value);
         send({ type: 'set-chat-view-default', enabled: chatViewDefault });

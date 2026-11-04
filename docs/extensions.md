@@ -49,7 +49,8 @@ extensions folder by hand are never recorded, so they have no Usage section. Ski
 sessions are best effort (see [Extensions line](reviews-and-prs.md#extensions-line)).
 
 When a session opens a pull request, the extensions it used are named in the PR description's
-`Extensions:` line, which you can turn off in **Settings → Automation**.
+`Extensions:` line, with a collapsed table of what it did with each. Both can be turned off in
+**Settings → Automation** (see [Extensions line](reviews-and-prs.md#extensions-line)).
 
 ### Auto-update an extension
 
@@ -269,6 +270,8 @@ GitHub:
   Only public pull requests, and private ones you can read, are found. The line names an extension by
   the GitHub `owner/repo` it was installed from, so it is only added for extensions installed from a
   GitHub URL.
+- **What each pull request used.** Below the line, the description has a collapsed **Extension usage
+  in this PR** table, unless the user turned it off. See [Usage table format](#usage-table-format).
 - **Installs.** Every install and update is a `git clone` or fetch of your repository, so clone traffic
   is a rough install count. Only the repository owner, or someone with push access, can read it, and
   GitHub keeps 14 days:
@@ -279,6 +282,42 @@ GitHub:
 
 - **Stars.** The **+ Add extension** browser lists tagged repositories with their star counts, so stars
   are what users see first.
+
+### Usage table format
+
+The usage table is for people. The same facts are in an HTML comment beside it, for tools:
+
+```text
+<!-- agent-wrangler:usage v1 {"window":"session-start","extensions":{"acme/widgets-ext":{"commit":"0123456","tools":{"widget_make":12,"widget_list":3},"skills":["widgets"],"runtime":false}}} -->
+```
+
+The comment is one line: `agent-wrangler:usage`, the format version `v1`, then compact JSON:
+
+| Field | Meaning |
+| --- | --- |
+| `window` | `session-start` if this is the session's first pull request, or `previous-pr` if the counts start where the session's previous pull request's footer was written. Use after the pull request was opened is never added. |
+| `extensions` | One entry per extension the `Extensions:` line names, keyed by `owner/repo`, in the same order. |
+| `commit` | The first 7 characters of the installed commit when the pull request was opened, or `null` if unknown. |
+| `tools` | Calls to each of the extension's MCP tools in the window, most called first. The table shows the top 10 and "+N more"; the comment has them all. |
+| `skills` | The extension's skills the session used in the window, sorted. |
+| `runtime` | `true` if the session runs on a runtime the extension adds, or launched on one in the window. |
+
+Only names and counts are recorded, never tool arguments, prompts or paths. A hyphen pair inside a
+string is written as `-\u002d` so it cannot end the comment early; any JSON parser reads it back as `--`.
+A later format changes the version, so check it before parsing.
+
+To total your tool calls across the pull requests that used your extension (pull requests without a
+table are skipped):
+
+```sh
+gh search prs '"Extensions:" acme/widgets-ext in:body' --json url --jq '.[].url' |
+while read -r url; do
+  gh pr view "$url" --json body --jq .body |
+    sed -n 's/^<!-- agent-wrangler:usage v1 \(.*\) -->$/\1/p'
+done |
+  jq -s 'map(.extensions["acme/widgets-ext"].tools // {} | to_entries[]) | group_by(.key)
+         | map({tool: .[0].key, calls: (map(.value) | add)}) | sort_by(-.calls)'
+```
 
 ## Authoring rules
 

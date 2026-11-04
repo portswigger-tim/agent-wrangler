@@ -23,9 +23,14 @@ import { writeJsonAtomic, readJsonOrLoud } from './atomic-json.js';
 //
 // Shape on disk:
 //   { extensions: { [extId]: { sessions, tools, skills, runtimes, handlers, fields, lastUsedAt } },
-//     sessions:   { [sessionId]: { extIds: [...], seen: { [transcript]: { [skill]: n } }, at } } }
+//     sessions:   { [sessionId]: { extIds: [...], seen: { [transcript]: { [skill]: n } },
+//                                  counts: { [extId]: { [kind]: { [name]: n } } }, cut, at } } }
 // `seen` holds the ABSOLUTE skill counts last read from each transcript, so a
 // rescan after a restart (which starts from byte 0) adds nothing twice.
+// `counts` is the same tally as `extensions` but for this session alone, and
+// `cut` is where the session's last PR footer took its window from
+// (windowFor): `{ pr, window, from, to }`, `from`/`to` being `counts`
+// snapshots.
 
 const usageFile = () => path.join(DATA_DIR, 'extension-usage.json');
 
@@ -63,9 +68,35 @@ export function skillReadsIn(text) {
   return [...new Set([...text.matchAll(SKILL_READ_RE)].map((m) => m[1]))];
 }
 
+// The kinds a PR footer's usage window reports.
+const WINDOW_KINDS = ['tools', 'skills', 'runtimes'];
+
 const blankExt = () => ({ sessions: 0, tools: {}, skills: {}, runtimes: {}, handlers: {}, fields: {}, lastUsedAt: null });
 const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
 const counts = (v) => Object.fromEntries(Object.entries(isObj(v) ? v : {}).filter(([, n]) => Number.isFinite(n) && n > 0));
+// `{ [extId]: { [kind]: counts } }`, restricted to the window kinds.
+const tally = (v) => Object.fromEntries(Object.entries(isObj(v) ? v : {})
+  .filter(([, e]) => isObj(e))
+  .map(([id, e]) => [id, Object.fromEntries(WINDOW_KINDS.map((k) => [k, counts(e[k])]))]));
+// What `to` has on top of `from`, per extension and kind, dropping empties.
+function grownSince(to, from) {
+  const out = {};
+  for (const [id, e] of Object.entries(to)) {
+    for (const k of WINDOW_KINDS) {
+      for (const [name, n] of Object.entries(e[k] || {})) {
+        const d = n - (from[id]?.[k]?.[name] || 0);
+        if (d > 0) (((out[id] ||= {})[k] ||= {})[name] = d);
+      }
+    }
+  }
+  return out;
+}
+const readCut = (c) => (isObj(c) ? {
+  pr: typeof c.pr === 'string' ? c.pr : null,
+  window: c.window === 'previous-pr' ? 'previous-pr' : 'session-start',
+  from: tally(c.from),
+  to: tally(c.to),
+} : null);
 
 export class ExtensionUsageStore {
   // `isTracked(extId)` gates every write (git-installed only, see above);
@@ -99,13 +130,15 @@ export class ExtensionUsageStore {
       this.sessions[sid] = {
         extIds: Array.isArray(s.extIds) ? s.extIds.filter((x) => typeof x === 'string') : [],
         seen: Object.fromEntries(Object.entries(isObj(s.seen) ? s.seen : {}).map(([k, v]) => [k, counts(v)])),
+        counts: tally(s.counts),
+        cut: readCut(s.cut),
         at: Number.isFinite(s.at) ? s.at : 0,
       };
     }
   }
 
   _session(sessionId) {
-    const s = (this.sessions[sessionId] ||= { extIds: [], seen: {}, at: 0 });
+    const s = (this.sessions[sessionId] ||= { extIds: [], seen: {}, counts: {}, cut: null, at: 0 });
     s.at = this.now();
     return s;
   }
@@ -123,6 +156,10 @@ export class ExtensionUsageStore {
       if (!s.extIds.includes(extId)) {
         s.extIds.push(extId);
         e.sessions += 1;
+      }
+      if (WINDOW_KINDS.includes(kind)) {
+        const mine = ((s.counts[extId] ||= {})[kind] ||= {});
+        mine[name] = (mine[name] || 0) + n;
       }
     }
     this._scheduleSave();
@@ -158,6 +195,25 @@ export class ExtensionUsageStore {
   // hand, losing its origin) since the use is no longer one to name.
   extensionsFor(sessionId) {
     return [...(this.sessions[sessionId]?.extIds || [])].filter((id) => this.isTracked(id)).sort();
+  }
+
+  // The session's usage per tracked extension since its previous PR footer (or
+  // since it started, before its first), for the footer of PR `pr`, and moves
+  // the cut to now: `{ window: 'session-start' | 'previous-pr', counts: {
+  // [extId]: { tools?, skills?, runtimes? } } }`. Asking again for the same PR
+  // (a rerun hook) answers the same window instead of an empty one. Usage after
+  // this call belongs to the next PR.
+  windowFor(sessionId, pr = null) {
+    const s = sessionId && this.sessions[sessionId];
+    if (!s) return { window: 'session-start', counts: {} };
+    let cut = s.cut;
+    if (!cut || !pr || cut.pr !== pr) {
+      cut = { pr: pr || null, window: s.cut ? 'previous-pr' : 'session-start', from: s.cut?.to || {}, to: tally(s.counts) };
+      s.cut = cut;
+      this._scheduleSave();
+    }
+    const grown = grownSince(cut.to, cut.from);
+    return { window: cut.window, counts: Object.fromEntries(Object.entries(grown).filter(([id]) => this.isTracked(id))) };
   }
 
   // What the detail pane shows for one extension, or null when it has never

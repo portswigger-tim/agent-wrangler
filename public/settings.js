@@ -20,6 +20,10 @@
 //     (Enter or blur); getSetting returns the string.
 // New types extend renderRow()/readStored()/writeStored() + getSetting().
 //
+// parent: '<toggle id>' makes a toggle a sub-setting of another: indented under
+// it and disabled while that toggle is off. It keeps its own stored value, so
+// turning the parent back on brings back whatever it was.
+//
 // scope: 'server' marks a setting persisted in the server's config.json (shared
 // by every browser) instead of localStorage. Its read/write goes through the
 // bridge app.js hands to initSettings — read off the latest graph, write via the
@@ -107,6 +111,15 @@ export const SETTINGS = [
     default: true,
   },
   {
+    id: 'prExtensionsUsage',
+    type: 'toggle',
+    scope: 'server',
+    parent: 'prExtensionsFooter',
+    label: 'Include per-extension tool and skill counts',
+    help: 'Below the Extensions: line, add a collapsed table with each extension\'s installed commit, how many times the session called each of its tools, the skills it used and whether it ran on the extension\'s runtime, counted since the session\'s previous PR. Names and counts only, never what was passed to a tool.',
+    default: true,
+  },
+  {
     id: 'childFullViewByDefault',
     type: 'toggle',
     scope: 'server',
@@ -185,7 +198,7 @@ export const SETTINGS_TABS = [
   {
     id: 'automation',
     label: 'Automation',
-    settingIds: ['autoFixPrChecksDefault', 'prModelFooter', 'prExtensionsFooter', 'trustCodexLaunchCwd', 'trustClaudeLaunchCwd', 'archiveReviewEnabled', 'mailWakesDormant'],
+    settingIds: ['autoFixPrChecksDefault', 'prModelFooter', 'prExtensionsFooter', 'prExtensionsUsage', 'trustCodexLaunchCwd', 'trustClaudeLaunchCwd', 'archiveReviewEnabled', 'mailWakesDormant'],
   },
   { id: 'extensions', label: 'Extensions', settingIds: [] },
   { id: 'shortcuts', label: 'Shortcuts', settingIds: ['flipNavHotkeys'] },
@@ -343,17 +356,24 @@ export function setSetting(id, value) {
   changeBridge(id, value);
 }
 
-function rowHtml(def) {
+// A sub-setting whose parent toggle is off: shown, but not switchable.
+export function settingLocked(id) {
+  const parent = byId.get(byId.get(id)?.parent);
+  return Boolean(parent) && !readStored(parent);
+}
+
+export function settingRowHtml(def) {
   const on = readStored(def);
   // type dispatch: only 'toggle' today, but the switch keeps the door open for
   // select/number rows without touching the open/close/escape wiring below.
   if (def.type === 'toggle') {
-    return `<div class="setting-row" data-id="${esc(def.id)}">
+    const locked = settingLocked(def.id);
+    return `<div class="setting-row${def.parent ? ' setting-row-sub' : ''}" data-id="${esc(def.id)}">
         <div class="setting-copy">
           <div class="setting-label">${esc(def.label)}</div>
           ${def.help ? `<div class="setting-help">${esc(def.help)}</div>` : ''}
         </div>
-        <button type="button" class="setting-toggle${on ? ' on' : ''}" role="switch"
+        <button type="button" class="setting-toggle${on ? ' on' : ''}" role="switch"${locked ? ' disabled' : ''}
           aria-checked="${on ? 'true' : 'false'}" aria-label="${esc(def.label)}">
           <span class="setting-knob"></span>
         </button>
@@ -401,7 +421,7 @@ function appearanceItemHtml(label, help, body) {
 }
 
 function tabPanelHtml(tab, selected) {
-  const rows = tab.settingIds.map((id) => rowHtml(byId.get(id))).join('');
+  const rows = tab.settingIds.map((id) => settingRowHtml(byId.get(id))).join('');
   let inner = `<div class="settings-list">${rows}</div>`;
   if (tab.id === 'appearance') {
     inner = [
@@ -666,6 +686,11 @@ export function initSettings({ server, appearance, onChange, extensions, updates
     setSetting(def.id, next);
     toggle.classList.toggle('on', next);
     toggle.setAttribute('aria-checked', next ? 'true' : 'false');
+    // Its sub-settings follow it: switchable only while it is on.
+    for (const sub of SETTINGS.filter((s) => s.parent === def.id)) {
+      const subToggle = body.querySelector(`.setting-row[data-id="${sub.id}"] .setting-toggle`);
+      if (subToggle) subToggle.disabled = !next;
+    }
     // Extension rows only: what just happened and what is still pending. Shown
     // on the row rather than as a toast, and only after a real flip, so an
     // unread row carries no standing warning about a state nobody chose.

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
-import { migrateRetiredFlags, shouldOpenBrowser, prStatusPollSeconds, subagentsExpandedByDefault, trustCodexLaunchCwd, trustClaudeLaunchCwd, childFullViewByDefault, autoFixPrChecksDefault, archiveReviewEnabled, mailWakesDormant, prModelFooterEnabled, prExtensionsFooterEnabled, chatViewDefault, defaultSessionCwd, defaultRuntime, extensionEnabled, extensionSetting, extensionSettings, setExtensionSetting, writeConfig, readConfig } from './config-store.js';
+import { migrateRetiredFlags, shouldOpenBrowser, prStatusPollSeconds, subagentsExpandedByDefault, trustCodexLaunchCwd, trustClaudeLaunchCwd, childFullViewByDefault, autoFixPrChecksDefault, archiveReviewEnabled, mailWakesDormant, prModelFooterEnabled, prExtensionsFooterEnabled, prExtensionsUsageEnabled, chatViewDefault, defaultSessionCwd, defaultRuntime, extensionEnabled, extensionSetting, extensionSettings, setExtensionSetting, writeConfig, readConfig } from './config-store.js';
 import { DATA_DIR } from './data-dir.js';
 import { writeJsonAtomic } from './atomic-json.js';
 
@@ -102,6 +102,13 @@ test('prModelFooterEnabled defaults to on; only an explicit false disables', () 
   assert.equal(prModelFooterEnabled({ prModelFooter: true }), true);
   assert.equal(prModelFooterEnabled({ prModelFooter: false }), false);
   assert.equal(prModelFooterEnabled({ autoAttachPr: false }), true, 'independent of autoAttachPr');
+});
+
+test('prExtensionsUsageEnabled defaults to on and is off whenever the Extensions line is', () => {
+  assert.equal(prExtensionsUsageEnabled({}), true);
+  assert.equal(prExtensionsUsageEnabled({ prExtensionsUsage: false }), false);
+  assert.equal(prExtensionsUsageEnabled({ prExtensionsFooter: false }), false);
+  assert.equal(prExtensionsUsageEnabled({ prExtensionsFooter: false, prExtensionsUsage: true }), false);
 });
 
 test('prExtensionsFooterEnabled defaults to on, independent of the model footer', () => {

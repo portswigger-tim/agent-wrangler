@@ -46,18 +46,20 @@ test('400 without a caller', async () => {
   assert.equal((await call(handler())).status, 400);
 });
 
-const extHandler = ({ on = true, refreshUsage } = {}) => createPrModelHandler({
+const extHandler = ({ on = true, refreshUsage, usageOn = false, usageFor } = {}) => createPrModelHandler({
   graph: () => graph,
   entryFor: (id) => entries[id] || null,
   enabled: () => false,
   extensionsEnabled: () => on,
   extensionsFor: (id) => (id === 'LIVE' ? ['acme/widgets-ext'] : []),
   refreshUsage,
+  usageEnabled: () => usageOn,
+  usageFor,
 });
 const body = async (h, session) => JSON.parse((await call(h, { 'x-aw-session': session })).body);
 
 test('answers the extensions the session used, under their own setting', async () => {
-  assert.deepEqual(await body(extHandler(), 'LIVE'), { model: null, extensions: ['acme/widgets-ext'] });
+  assert.deepEqual(await body(extHandler(), 'LIVE'), { model: null, extensions: ['acme/widgets-ext'], usage: null });
   assert.deepEqual((await body(extHandler({ on: false }), 'LIVE')).extensions, []);
   assert.deepEqual((await body(extHandler(), 'NOPE')).extensions, []);
 });
@@ -68,4 +70,18 @@ test('brings skill counts up to date before reading them, and survives a failed 
   assert.deepEqual(seen, ['LIVE']);
   const res = await body(extHandler({ refreshUsage: async () => { throw new Error('boom'); } }), 'LIVE');
   assert.deepEqual(res.extensions, ['acme/widgets-ext']);
+});
+
+test('answers the usage table for the PR in X-AW-PR, only under both settings and only with extensions', async () => {
+  const asked = [];
+  const usageFor = (id, pr) => { asked.push([id, pr]); return { window: 'session-start', extensions: {} }; };
+  const pr = 'https://github.com/acme/app/pull/1';
+  const res = await call(extHandler({ usageOn: true, usageFor }), { 'x-aw-session': 'LIVE', 'x-aw-pr': pr });
+  assert.deepEqual(JSON.parse(res.body).usage, { window: 'session-start', extensions: {} });
+  assert.deepEqual(asked, [['LIVE', pr]]);
+  // Sub-switch off, Extensions line off, or nothing used: no window is taken.
+  assert.equal((await body(extHandler({ usageOn: false, usageFor }), 'LIVE')).usage, null);
+  assert.equal((await body(extHandler({ on: false, usageOn: true, usageFor }), 'LIVE')).usage, null);
+  assert.equal((await body(extHandler({ usageOn: true, usageFor }), 'FRESH')).usage, null);
+  assert.equal(asked.length, 1);
 });

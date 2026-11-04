@@ -33,7 +33,7 @@ import { setTmuxBin, sendText, sendKeys } from './tmux-scraper.js';
 import { createPaneDeferral } from './pane-deferral.js';
 import { fetchPrStatus, mergePr, fetchUnresolvedThreadCount } from './pr-status.js';
 import { normalisePr, linkMatches } from './mcp/links.js';
-import { shouldOpenBrowser, prStatusPollSeconds, autoAttachPrEnabled, subagentsExpandedByDefault, trustCodexLaunchCwd, trustClaudeLaunchCwd, childFullViewByDefault, autoFixPrChecksDefault, archiveReviewEnabled, mailWakesDormant, prModelFooterEnabled, prExtensionsFooterEnabled, chatViewDefault, defaultSessionCwd, defaultRuntime, readConfig, extensionSettings, applyRetiredFlagMigrations, autoUpdateMode, refreshSessionsAfterUpdate } from './config-store.js';
+import { shouldOpenBrowser, prStatusPollSeconds, autoAttachPrEnabled, subagentsExpandedByDefault, trustCodexLaunchCwd, trustClaudeLaunchCwd, childFullViewByDefault, autoFixPrChecksDefault, archiveReviewEnabled, mailWakesDormant, prModelFooterEnabled, prExtensionsFooterEnabled, prExtensionsUsageEnabled, chatViewDefault, defaultSessionCwd, defaultRuntime, readConfig, extensionSettings, applyRetiredFlagMigrations, autoUpdateMode, refreshSessionsAfterUpdate } from './config-store.js';
 import { listStyles } from './styles.js';
 import { availableAgents, modelsWithDefault, validateDefaultModel, providerMetadata, registeredAgents, adapterFor } from './agents/index.js';
 import { createMcpRequestHandler, extractCaller } from './mcp/server.js';
@@ -192,6 +192,29 @@ sessionManager._noteLaunch = ({ sessionId, entry, ext: fields }) => {
 // non-GitHub origin (a local path, say) is not something to publish in a PR.
 const footerExtensions = (sessionId) => extensionNames(extUsage.extensionsFor(sessionId)
   .map((id) => parseGithubSlug(ext.list.find((e) => e.id === id)?.provenance?.originUrl)));
+// The footer's usage table for PR `pr`: per extension the Extensions line
+// names, its installed commit and what the session did with it since its last
+// PR (extUsage.windowFor). Names and counts only, never arguments. Runtime is
+// whether the session runs on one the extension adds, or launched on one in
+// the window.
+function footerUsage(sessionId, pr) {
+  const w = extUsage.windowFor(sessionId, pr);
+  const runsOn = sessionManager.entryFor(sessionId)?.runtimeExt || null;
+  const extensions = {};
+  for (const id of extUsage.extensionsFor(sessionId)) {
+    const prov = ext.list.find((e) => e.id === id)?.provenance;
+    const slug = parseGithubSlug(prov?.originUrl);
+    if (!slug || extensions[slug]) continue;
+    const c = w.counts[id] || {};
+    extensions[slug] = {
+      commit: typeof prov.sha === 'string' && prov.sha ? prov.sha.slice(0, 7) : null,
+      tools: c.tools || {},
+      skills: Object.keys(c.skills || {}),
+      runtime: runsOn === id || Object.keys(c.runtimes || {}).length > 0,
+    };
+  }
+  return { window: w.window, extensions };
+}
 // Reads the session's transcript once more before a footer is written, so a
 // skill used moments before `gh pr create` is counted even if no graph tick
 // has run since. The same incremental analysis the tick does.
@@ -932,6 +955,8 @@ const prModelHandler = createPrModelHandler({
   extensionsEnabled: () => prExtensionsFooterEnabled(),
   extensionsFor: footerExtensions,
   refreshUsage: refreshSkillUsage,
+  usageEnabled: () => prExtensionsUsageEnabled(),
+  usageFor: footerUsage,
   logError,
 });
 
@@ -1137,6 +1162,8 @@ async function rebuildOnce() {
   graph.mailWakesDormant = mailWakesDormant();
   graph.prModelFooter = prModelFooterEnabled();
   graph.prExtensionsFooter = prExtensionsFooterEnabled();
+  // The sub-switch as stored, so it keeps its place while the parent is off.
+  graph.prExtensionsUsage = readConfig().prExtensionsUsage !== false;
   graph.chatViewDefault = chatViewDefault();
   graph.defaultSessionCwd = defaultSessionCwd();
   graph.defaultRuntime = defaultRuntime();

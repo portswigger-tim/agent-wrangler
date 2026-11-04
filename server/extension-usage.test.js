@@ -118,3 +118,36 @@ test('skillReadsIn finds SKILL.md reads in a command line', () => {
   assert.deepEqual(skillReadsIn('ls skills/'), []);
   assert.deepEqual(skillReadsIn(null), []);
 });
+
+test('windowFor: two PRs from one session each count only their own usage', () => {
+  const s = store();
+  s.note('a', 'widgets', 'tools', 'widget_make', 3);
+  s.noteSkillTotals('a', 'live-a', { 'widgets:widgets': 1 });
+  s.note('a', 'widgets', 'runtimes', 'widget-box');
+  s.note('b', 'widgets', 'tools', 'widget_make', 9); // another session never leaks in
+  const first = s.windowFor('a', 'https://github.com/acme/app/pull/1');
+  assert.deepEqual(first, { window: 'session-start', counts: { widgets: { tools: { widget_make: 3 }, skills: { widgets: 1 }, runtimes: { 'widget-box': 1 } } } });
+  // The hook running twice for the same PR gets the same answer, not an empty one.
+  assert.deepEqual(s.windowFor('a', 'https://github.com/acme/app/pull/1'), first);
+
+  s.note('a', 'widgets', 'tools', 'widget_make', 2);
+  s.note('a', 'widgets', 'tools', 'widget_list');
+  const second = s.windowFor('a', 'https://github.com/acme/app/pull/2');
+  assert.deepEqual(second, { window: 'previous-pr', counts: { widgets: { tools: { widget_make: 2, widget_list: 1 } } } });
+  // Nothing since: the next PR's window is empty but still says where it started.
+  assert.deepEqual(s.windowFor('a', 'https://github.com/acme/app/pull/3'), { window: 'previous-pr', counts: {} });
+  assert.deepEqual(s.windowFor('unknown', 'x'), { window: 'session-start', counts: {} });
+});
+
+test('windowFor: the cut survives a reload, and an untracked extension never appears', () => {
+  const file = tmpFile();
+  const a = store({ file });
+  a.note('a', 'widgets', 'tools', 'widget_make');
+  a.note('a', 'checklist', 'tools', 'add_checklist_item');
+  a.windowFor('a', 'pr-1');
+  a.note('a', 'widgets', 'tools', 'widget_make');
+  a.flush();
+  const b = store({ file });
+  assert.deepEqual(b.windowFor('a', 'pr-1').window, 'session-start');
+  assert.deepEqual(b.windowFor('a', 'pr-2'), { window: 'previous-pr', counts: { widgets: { tools: { widget_make: 1 } } } });
+});
