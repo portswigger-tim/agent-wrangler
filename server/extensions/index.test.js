@@ -113,7 +113,7 @@ test('enabled filtering: a disabled extension is listed but contributes nothing 
   const out = loadExtensions({ cfg: { extensions: { fake: false } }, builtin: [manifest({ client: 'public/index.js', sweeps: [{ id: 's', everyMs: 1000, run() {} }] })] });
   assert.deepEqual(out.list, [{
     id: 'fake', label: 'Fake extension', help: 'Does fake things.', defaultEnabled: true, enabled: false,
-    description: '', author: '', homepage: '', version: '', bugsUrl: '',
+    description: '', author: '', homepage: '', version: '', issuesRepo: '',
     requires: [], range: null, storeNames: ['fake'], settings: [], skills: ['mail'], handlerTypes: [],
     hideDispatchField: [], keybindings: [], runtimes: [], external: false, dir: path.join(HERE, 'fake'), provenance: null, earlyAdopterBranch: null, quarantine: null,
   }], 'a disabled extension still reports its facade inputs, but claims no handler types');
@@ -745,7 +745,7 @@ test('a bad BUILTIN quarantines too, and the good one beside it loads', () => {
 test('an already-quarantined entry (discovery could not read it) becomes a row and nothing else', () => {
   const out = loadExtensions({ cfg: {}, builtin: [{ id: 'dud', external: true, quarantine: 'no index.js' }] });
   assert.deepEqual(out.list, [{
-    id: 'dud', label: 'dud', help: '', description: '', author: '', homepage: '', version: '', bugsUrl: '',
+    id: 'dud', label: 'dud', help: '', description: '', author: '', homepage: '', version: '', issuesRepo: '',
     defaultEnabled: false, enabled: false, requires: [], range: null, storeNames: [], settings: [], skills: [],
     handlerTypes: [], hideDispatchField: [], keybindings: [], runtimes: [], external: true, dir: null, provenance: null, earlyAdopterBranch: null, quarantine: 'no index.js',
   }]);

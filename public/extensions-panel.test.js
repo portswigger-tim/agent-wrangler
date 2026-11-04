@@ -1062,70 +1062,72 @@ const ISSUE_ENV = { version: '1.2.3', codeVersion: '', hostApi: '1.57.0', os: 'L
 const feedbackOf = (node) => byClass(node, 'ext-feedback')[0];
 const reportLink = (node) => byClass(node, 'ext-report-issue')[0];
 
-test('Feedback: Report an issue is a new-tab link to the pre-filled GitHub form', () => {
+const GH_INFO = { stats: { stars: 1200, openIssues: 1, htmlUrl: 'https://github.com/acme/widgets-ext' }, issues: { repo: 'acme/widgets-ext', available: true } };
+
+test('Feedback: Report an issue and Request a feature are new-tab links to the pre-filled GitHub form', () => {
   withDom(() => {
-    const reported = [];
-    const panel = showing(GH, { issueEnv: ISSUE_ENV, onReportIssue: (e, d) => reported.push([e.id, d.prefill]) });
+    const panel = showing(GH, { issueEnv: ISSUE_ENV, repoInfo: { widgets: GH_INFO } });
     assert.ok(texts(detailOf(panel)).includes('Feedback'));
+    const row = byClass(panel, 'ext-feedback-row')[0];
+    assert.deepEqual(byClass(row, 'ext-issue-link').map((a) => a._text), ['Report an issue ↗', 'Request a feature ↗']);
+    assert.ok(texts(row).some((t) => /^Opens a new issue on acme\/widgets-ext /.test(t)));
     const link = reportLink(panel);
-    assert.equal(link._text, 'Report an issue ↗');
     assert.equal(link.target, '_blank');
     assert.equal(link.rel, 'noreferrer noopener');
     const url = new URL(link.href);
     assert.equal(`${url.origin}${url.pathname}`, 'https://github.com/acme/widgets-ext/issues/new');
+    assert.equal(url.searchParams.get('title'), '[widgets] ');
+    assert.equal(url.searchParams.get('labels'), 'bug');
     assert.match(url.searchParams.get('body'), /Extension: `widgets` 2\.0\.1/);
     assert.match(url.searchParams.get('body'), /OS: Linux 6\.1 \(x64\)/);
-    link.fire('click');
-    assert.deepEqual(reported, [['widgets', true]]);
+    const feature = new URL(byClass(panel, 'ext-request-feature')[0].href);
+    assert.equal(feature.searchParams.get('labels'), 'enhancement');
+    assert.match(feature.searchParams.get('body'), /### What I'd like/);
   });
 });
 
-test('Feedback: core reports to Agent Wrangler; a bugs URL wins; no target and no stats draws nothing', () => {
+test('Feedback: issuesRepo first, core to Agent Wrangler, nothing without an issue repo or stats', () => {
   withDom(() => {
-    assert.match(reportLink(showing(BUILTIN_A)).href, /^https:\/\/github\.com\/PortSwigger\/agent-wrangler\/issues\/new\?/);
-    const tracked = reportLink(showing({ ...INSTALLED, bugsUrl: 'https://tracker.example.com/notes' }));
-    assert.equal(tracked.href, 'https://tracker.example.com/notes');
-    assert.equal(feedbackOf(showing(INSTALLED)), undefined, 'a non-GitHub origin with no bugs URL');
-    assert.equal(feedbackOf(showing({ ...INSTALLED, origin: '' })), undefined, 'hand-placed, no bugs URL');
+    assert.match(reportLink(showing(BUILTIN_A)).href, /^https:\/\/github\.com\/PortSwigger\/agent-wrangler\/issues\/new\?title=%5Ba%5D/);
+    const shared = showing({ ...GH, issuesRepo: 'acme/all-issues' });
+    assert.match(reportLink(shared).href, /^https:\/\/github\.com\/acme\/all-issues\/issues\/new\?/);
+    assert.ok(texts(shared).some((t) => /on acme\/all-issues /.test(t)));
+    assert.match(reportLink(showing({ ...INSTALLED, origin: '', issuesRepo: 'acme/notes-ext' })).href, /acme\/notes-ext\/issues\/new/);
+    assert.equal(feedbackOf(showing(INSTALLED)), undefined, 'a non-GitHub origin with no issuesRepo');
+    assert.equal(feedbackOf(showing({ ...INSTALLED, origin: '' })), undefined, 'hand-placed, no issuesRepo');
     assert.equal(feedbackOf(showing(GH, { pendingRemoval: ['widgets'] })), undefined);
+  });
+});
+
+test('Feedback: links hidden only when GitHub says issues are unavailable, offered while unknown', () => {
+  withDom(() => {
+    const off = { ...GH_INFO, issues: { repo: 'acme/widgets-ext', available: false } };
+    const hidden = showing(GH, { repoInfo: { widgets: off } });
+    assert.equal(byClass(hidden, 'ext-issue-link').length, 0);
+    assert.equal(byClass(hidden, 'ext-repo-stats').length, 1, 'the stats line stays');
+    assert.equal(feedbackOf(showing(BUILTIN_A, { repoInfo: { a: { issues: { available: false } } } })), undefined, 'core with issues off: nothing left');
+    for (const info of [undefined, { loading: true }, { ...GH_INFO, issues: { available: null } }, { stats: null, statsError: 'offline', issues: null }]) {
+      assert.equal(byClass(showing(GH, { repoInfo: { widgets: info } }), 'ext-issue-link').length, 2, JSON.stringify(info));
+    }
   });
 });
 
 test('Feedback: stats only for a GitHub-installed extension, with a Star link that only opens GitHub', () => {
   withDom(() => {
     assert.ok(texts(showing(GH)).includes('Loading GitHub stats…'));
-    const panel = showing(GH, { repoStats: { widgets: { stars: 1200, openIssues: 1, htmlUrl: 'https://github.com/acme/widgets-ext' } } });
+    const panel = showing(GH, { repoInfo: { widgets: GH_INFO } });
     const stats = byClass(panel, 'ext-repo-stats')[0];
-    const all = texts(stats);
-    assert.ok(all.includes('1.2k stars'));
+    assert.ok(texts(stats).includes('1.2k stars'));
     const links = byClass(stats, 'ext-kv-open');
     assert.deepEqual(links.map((a) => [a._text, a.href]), [
       ['1 open issue', 'https://github.com/acme/widgets-ext/issues'],
       ['Star on GitHub ↗', 'https://github.com/acme/widgets-ext'],
     ]);
-    assert.ok(texts(showing(GH, { repoStats: { widgets: { error: 'rate limited' } } })).includes('GitHub stats unavailable: rate limited'));
-    // Core, hand-placed (even with a GitHub bugs URL) and non-GitHub installs: no stats.
-    for (const entry of [BUILTIN_A, { ...INSTALLED, origin: '', bugsUrl: 'https://github.com/acme/notes-ext/issues' }, { ...INSTALLED, bugsUrl: 'https://github.com/acme/notes-ext/issues' }]) {
+    assert.ok(texts(showing(GH, { repoInfo: { widgets: { stats: null, statsError: 'rate limited', issues: null } } })).includes('GitHub stats unavailable: rate limited'));
+    // Core, hand-placed (even with an issuesRepo) and non-GitHub installs: no stats.
+    for (const entry of [BUILTIN_A, { ...INSTALLED, origin: '', issuesRepo: 'acme/notes-ext' }, { ...INSTALLED, issuesRepo: 'acme/notes-ext' }]) {
       assert.equal(byClass(showing(entry), 'ext-repo-stats').length, 0, entry.id);
     }
     assertNoThirdPartyHtml(panel);
-  });
-});
-
-test('Feedback: Request a feature sits beside Report an issue, drafting the feature template', () => {
-  withDom(() => {
-    const opened = [];
-    const panel = showing(GH, { issueEnv: ISSUE_ENV, onReportIssue: (e, d) => opened.push(d.kind) });
-    const row = byClass(panel, 'ext-feedback-row')[0];
-    assert.deepEqual(byClass(row, 'ext-issue-link').map((a) => a._text), ['Report an issue ↗', 'Request a feature ↗']);
-    const feature = byClass(panel, 'ext-request-feature')[0];
-    const url = new URL(feature.href);
-    assert.equal(url.searchParams.get('labels'), 'enhancement');
-    assert.match(url.searchParams.get('body'), /### What I'd like/);
-    assert.equal(feature.target, '_blank');
-    feature.fire('click');
-    reportLink(panel).fire('click');
-    assert.deepEqual(opened, ['feature', 'bug']);
-    assert.equal(byClass(showing({ ...INSTALLED, origin: '' }), 'ext-request-feature').length, 0, 'no tracker, no link');
   });
 });

@@ -2,6 +2,8 @@ import path from 'node:path';
 import semver from 'semver';
 import { readConfig, extensionEnabled, extensionSettings } from '../config-store.js';
 import { SKILLS_ROOT, skillAt, skillsIn } from '../skill-catalog.js';
+import { log } from '../log.js';
+import { parseIssuesRepo } from '../../public/extension-issue.js';
 import { validateSettingDef } from './setting-constraints.js';
 import { normalizeCodexPolicy } from './codex-policy.js';
 import { isValidBranchName } from '../worktree.js';
@@ -470,7 +472,7 @@ export function extensionsForGraph(list, enabledFor = extensionEnabled, valuesFo
   return list.map(({
     id, label, help, defaultEnabled, enabled: bootEnabled, handlerTypes, hideDispatchField, keybindings,
     quarantine, external, description, author, homepage, provenance, requires, settings, runtimes, earlyAdopterBranch,
-    version, bugsUrl, range,
+    version, issuesRepo, range,
   }) => ({
     id, label, help, defaultEnabled, bootEnabled: Boolean(bootEnabled) && !quarantine,
     enabled: quarantine ? false : enabledFor(id, defaultEnabled),
@@ -482,10 +484,11 @@ export function extensionsForGraph(list, enabledFor = extensionEnabled, valuesFo
     description: description || '',
     author: author || '',
     homepage: homepage || '',
-    // "Report an issue" (public/extension-issue.js): the package.json version
-    // and https:// `bugs` URL, and the declared `engines.wranglerApi` range.
+    // "Report an issue" (public/extension-issue.js): the package.json version,
+    // the validated `issuesRepo` ('' when none or ignored), and the declared
+    // `engines.wranglerApi` range.
     version: version || '',
-    bugsUrl: bugsUrl || '',
+    issuesRepo: issuesRepo || '',
     range: range || '',
     requires: [...(requires || [])],
     // The runtimes it contributes, for the dispatch dialog's Runtime select.
@@ -650,7 +653,8 @@ function quarantinedEntry(ext, quarantine) {
     // Kept for a quarantined row too: a broken extension is exactly the one
     // whose "Report an issue" matters.
     version: typeof ext?.version === 'string' ? ext.version : '',
-    bugsUrl: typeof ext?.bugsUrl === 'string' ? ext.bugsUrl : '',
+    // No manifest to agree with here, so whichever copy there is.
+    issuesRepo: issuesRepoFor(ext, { checkAgreement: false }),
     defaultEnabled: false,
     enabled: false,
     requires: [],
@@ -668,6 +672,33 @@ function quarantinedEntry(ext, quarantine) {
     earlyAdopterBranch: null,
     quarantine,
   };
+}
+
+// The `issuesRepo` "Report an issue" files to: `"owner/repo"` on GitHub, or ''.
+// Declared in the manifest and, for an installed extension, mirrored in
+// package.json's `wranglerExtension` (external.js packageFacts carries that
+// copy as `packageIssuesRepo`). Install refuses copies that disagree; one
+// edited on disk afterwards, or an invalid value, is IGNORED with one log line
+// — it only decides where issues go, so it is never worth a quarantine.
+const loggedIssuesRepo = new Set();
+function issuesRepoFor(ext, { checkAgreement = true } = {}) {
+  const id = typeof ext?.id === 'string' ? ext.id : '<no id>';
+  const manifest = ext?.issuesRepo ?? null;
+  const pkg = ext?.packageIssuesRepo ?? null;
+  const ignore = (why) => {
+    const key = `${id}:${why}`;
+    if (!loggedIssuesRepo.has(key)) {
+      loggedIssuesRepo.add(key);
+      log(`[agent-wrangler] extension ${id}: issuesRepo ignored (${why})`);
+    }
+    return '';
+  };
+  if (checkAgreement && ext?.packageDeclares && JSON.stringify(manifest) !== JSON.stringify(pkg)) {
+    return ignore(`index.js says ${JSON.stringify(manifest)} but package.json says ${JSON.stringify(pkg)}`);
+  }
+  const value = manifest ?? pkg;
+  if (value == null) return '';
+  return parseIssuesRepo(value) ? value : ignore(`${JSON.stringify(value)} is not a GitHub "owner/repo"`);
 }
 
 // Everything a manifest contributes is computed into locals FIRST and written to
@@ -705,7 +736,7 @@ function stageExtension(ext, { cfg, out, reg }) {
     homepage: typeof ext.homepage === 'string' ? ext.homepage : '',
     // From package.json (external.js packageFacts), so empty for a builtin.
     version: typeof ext.version === 'string' ? ext.version : '',
-    bugsUrl: typeof ext.bugsUrl === 'string' ? ext.bugsUrl : '',
+    issuesRepo: issuesRepoFor(ext),
     defaultEnabled: Boolean(ext.defaultEnabled),
     enabled,
     requires: [...(ext.requires || [])],

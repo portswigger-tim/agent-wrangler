@@ -71,12 +71,13 @@ function fakeClone({
   id = 'notes', requires = [], lock = true, declaration = true, deps = true,
   declaredId = id, declaredRequires = requires, indexThrows = false, defaultEnabled = true,
   range = null, declaredRange = range, earlyAdopter = null, declaredEarlyAdopter = earlyAdopter,
+  issuesRepo, declaredIssuesRepo = issuesRepo,
 } = {}) {
   return async (_url, dest) => {
     fs.mkdirSync(dest, { recursive: true });
     const body = indexThrows
       ? "throw new Error('index.js executed at disclosure time');\n"
-      : `export default {\n  id: ${JSON.stringify(id)},\n  label: 'Notes',\n  description: 'Keeps notes.',\n  author: 'A Colleague',\n  defaultEnabled: ${JSON.stringify(defaultEnabled)},\n  requires: ${JSON.stringify(requires)},\n${range ? `  engines: { wranglerApi: ${JSON.stringify(range)} },\n` : ''}${earlyAdopter ? `  earlyAdopter: { branch: ${JSON.stringify(earlyAdopter)} },\n` : ''}};\n`;
+      : `export default {\n  id: ${JSON.stringify(id)},\n  label: 'Notes',\n  description: 'Keeps notes.',\n  author: 'A Colleague',\n  defaultEnabled: ${JSON.stringify(defaultEnabled)},\n  requires: ${JSON.stringify(requires)},\n${range ? `  engines: { wranglerApi: ${JSON.stringify(range)} },\n` : ''}${earlyAdopter ? `  earlyAdopter: { branch: ${JSON.stringify(earlyAdopter)} },\n` : ''}${issuesRepo !== undefined ? `  issuesRepo: ${JSON.stringify(issuesRepo)},\n` : ''}};\n`;
     fs.writeFileSync(path.join(dest, 'index.js'), body);
     fs.writeFileSync(path.join(dest, 'package.json'), JSON.stringify({
       name: 'notes',
@@ -87,6 +88,7 @@ function fakeClone({
           id: declaredId, label: 'Notes', description: 'Keeps notes.', author: 'A Colleague', requires: declaredRequires,
           ...(declaredRange ? { engines: { wranglerApi: declaredRange } } : {}),
           ...(declaredEarlyAdopter ? { earlyAdopter: { branch: declaredEarlyAdopter } } : {}),
+          ...(declaredIssuesRepo !== undefined ? { issuesRepo: declaredIssuesRepo } : {}),
         },
       } : {}),
     }));
@@ -718,6 +720,36 @@ test('a manifest whose earlyAdopter branch differs from the disclosed one fails 
     /early-adopter branch "next" but its package.json disclosed "beta"/,
   );
   assert.equal(readProvenance().notes, undefined);
+  reset();
+});
+
+test('issuesRepo copies must agree at install; an invalid one that agrees still installs', async () => {
+  reset();
+  const c = ctx();
+  useFakes({ issuesRepo: 'acme/one', declaredIssuesRepo: 'acme/two' });
+  await extInstallHandler.handler({ type: 'ext-install', url: URL_NOTES }, c);
+  await assert.rejects(
+    extConsentHandler.handler({ type: 'ext-consent', tempId: reply(c, 'ext-install-disclosure').tempId, approve: true }, c),
+    /issuesRepo "acme\/one" but its package.json declares "acme\/two"/,
+  );
+  assert.equal(readProvenance().notes, undefined);
+  reset();
+  const half = ctx();
+  useFakes({ issuesRepo: 'acme/one', declaredIssuesRepo: null });
+  await extInstallHandler.handler({ type: 'ext-install', url: URL_NOTES }, half);
+  await assert.rejects(
+    extConsentHandler.handler({ type: 'ext-consent', tempId: reply(half, 'ext-install-disclosure').tempId, approve: true }, half),
+    /issuesRepo "acme\/one" but its package.json declares null/,
+  );
+  reset();
+  const invalid = ctx();
+  await install(invalid, { issuesRepo: 'not a repo' });
+  assert.equal(reply(invalid, 'ext-install-done').installed, true);
+  assert.equal(invalid.loaded.list.find((e) => e.id === 'notes').issuesRepo, '');
+  reset();
+  const good = ctx();
+  await install(good, { issuesRepo: 'acme/all-issues' });
+  assert.equal(good.loaded.list.find((e) => e.id === 'notes').issuesRepo, 'acme/all-issues');
   reset();
 });
 

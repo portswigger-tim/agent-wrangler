@@ -213,7 +213,7 @@ function sourceEl(entry) {
 // settings.js's delegated click handler already drives (and where it puts its
 // flip note), so the enable switch has no second flip path.
 export function extensionDetailEl(entry, {
-  status, pendingRemoval, settings, onUninstall, onAutoUpdate, issueEnv, repoStats, onReportIssue,
+  status, pendingRemoval, settings, onUninstall, onAutoUpdate, issueEnv, repoInfo,
 } = {}) {
   const pane = el('div', 'ext-detail-body');
   const head = el('div', 'setting-row ext-detail-head');
@@ -259,14 +259,13 @@ export function extensionDetailEl(entry, {
   // builtin ships with the wrangler and a hand-placed one has no record.
   if (entry.external && entry.origin && !pendingRemoval) section(pane, 'Updates', autoUpdateRowEl(entry, onAutoUpdate));
   section(pane, 'Source', sourceEl(entry));
-  const feedback = !pendingRemoval && feedbackEl(entry, { issueEnv, repoStats, onReportIssue });
+  const feedback = !pendingRemoval && feedbackEl(entry, { issueEnv, repoInfo });
   if (feedback) section(pane, 'Feedback', feedback);
   if (settings && !pendingRemoval) section(pane, 'Settings', settings);
   return pane;
 }
 
-export const REPORT_ISSUE_HELP = 'Opens a new issue with this extension\'s details filled in, for you to review and submit. Nothing is posted until you submit it.';
-export const REPORT_ISSUE_COPY_HELP = 'Opens this extension\'s issue tracker and copies a draft with its details to paste.';
+export const issueHelpText = (repo) => `Opens a new issue on ${repo} with this extension's details filled in, for you to review and submit. Nothing is posted until you submit it.`;
 const ISSUE_LINKS = [['bug', 'Report an issue ↗', 'ext-report-issue'], ['feature', 'Request a feature ↗', 'ext-request-feature']];
 
 function externalLink(className, text, href) {
@@ -277,45 +276,40 @@ function externalLink(className, text, href) {
   return a;
 }
 
-// "Report an issue" and "Request a feature", plus stars and open issues for an extension installed
-// from GitHub. The button is a link, not a script-opened window, so a popup
-// blocker never eats it; the URL is built by extension-issue.js, the same code
-// as the report_extension_issue MCP tool. Absent when the extension names no
-// tracker and has no stats to show.
+// "Report an issue" and "Request a feature", plus stars and open issues for an
+// extension installed from GitHub. The links are links, not script-opened
+// windows, so a popup blocker never eats them; their URLs are built by
+// extension-issue.js, the same code as the report_extension_issue MCP tool.
 //
-// `repoStats` is the reply to `ext-repo-stats` for this extension: undefined
-// or `{ loading }` while it is out, `{ error }`, or `{ stars, openIssues,
-// htmlUrl }`. Nothing here stars a repository: "Star on GitHub" opens the
-// repository's page, where the human can.
-function feedbackEl(entry, { issueEnv, repoStats, onReportIssue } = {}) {
+// `repoInfo` is this extension's `ext-repo-stats` reply: undefined or
+// `{ loading }` while it is out, then `{ stats, statsError, issues }`. The
+// links are hidden only when GitHub said the issue repository takes no issues
+// (`issues.available === false`); while that is unknown they are offered.
+// Nothing here stars a repository: "Star on GitHub" opens the repository's
+// page, where the human can.
+function feedbackEl(entry, { issueEnv, repoInfo } = {}) {
   const drafts = ISSUE_LINKS.map(([kind, label, className]) => ({ label, className, draft: extensionIssue(entry, issueEnv || {}, { kind }) }));
+  // Both kinds go to the same repository, so either both drafts exist or neither.
+  const repo = drafts[0].draft?.repo;
+  const offered = Boolean(repo) && repoInfo?.issues?.available !== false;
   const statsRepo = statsRepoOf(entry);
-  // Both kinds go to the same tracker, so either both drafts exist or neither.
-  const prefill = drafts[0].draft?.prefill;
-  if (!drafts[0].draft && !statsRepo) return null;
+  if (!offered && !statsRepo) return null;
   const box = el('div', 'ext-feedback');
-  if (drafts[0].draft) {
+  if (offered) {
     const row = el('div', 'ext-feedback-row');
-    for (const { label, className, draft } of drafts) {
-      const link = externalLink(`ext-btn ext-btn-sm ext-issue-link ${className}`, label, draft.url);
-      link.addEventListener('click', () => onReportIssue?.(entry, draft));
-      row.append(link);
-    }
-    row.append(el('span', 'setting-help', prefill ? REPORT_ISSUE_HELP : REPORT_ISSUE_COPY_HELP));
+    for (const { label, className, draft } of drafts) row.append(externalLink(`ext-btn ext-btn-sm ext-issue-link ${className}`, label, draft.url));
+    row.append(el('span', 'setting-help', issueHelpText(repo)));
     box.append(row);
   }
-  if (statsRepo) box.append(repoStatsEl(statsRepo, repoStats));
+  if (statsRepo) box.append(repoStatsEl(statsRepo, repoInfo));
   return box;
 }
 
-function repoStatsEl(repo, stats) {
+function repoStatsEl(repo, info) {
   const meta = el('div', 'ext-gh-meta ext-repo-stats');
-  if (!stats || stats.loading) {
-    meta.append(el('span', null, 'Loading GitHub stats…'));
-    return meta;
-  }
-  if (stats.error) {
-    meta.append(el('span', null, `GitHub stats unavailable: ${stats.error}`));
+  const stats = info?.stats;
+  if (!stats) {
+    meta.append(el('span', null, info?.statsError ? `GitHub stats unavailable: ${info.statsError}` : 'Loading GitHub stats…'));
     return meta;
   }
   const n = (count, word) => `${compactCount(count)} ${word}${count === 1 ? '' : 's'}`;
@@ -327,7 +321,7 @@ function repoStatsEl(repo, stats) {
   const issues = stats.htmlUrl
     ? externalLink('ext-kv-open', `${n(stats.openIssues, 'open issue')}`, `${stats.htmlUrl}/issues`)
     : el('span', null, n(stats.openIssues, 'open issue'));
-  issues.title = 'GitHub\'s count, which includes open pull requests.';
+  issues.title = `GitHub's count for ${repo.owner}/${repo.repo}, which includes open pull requests.`;
   meta.append(issues);
   if (stats.htmlUrl) {
     const star = externalLink('ext-kv-open', 'Star on GitHub ↗', stats.htmlUrl);
@@ -938,7 +932,7 @@ export function extensionsPanelEl({
   selectedId = '', filter = '', adding = false, browse = null, addMode = 'browse', browseQuery = '',
   onSelect, onFilter, onAdd, onAddMode, onBrowseQuery, onInstall, onBrowse, onUninstall, onUpdate, onUpdateAll,
   onCheckUpdates, onRestart, onSettingChange, onAutoUpdate, settingsEl,
-  issueEnv = {}, repoStats = {}, onReportIssue,
+  issueEnv = {}, repoInfo = {},
 } = {}) {
   const wrap = el('div', 'ext-split');
   const removing = new Set(pendingRemoval);
@@ -1046,8 +1040,7 @@ export function extensionsPanelEl({
       onUninstall,
       onAutoUpdate,
       issueEnv,
-      repoStats: repoStats[selected.id],
-      onReportIssue,
+      repoInfo: repoInfo[selected.id],
     }));
   }
   wrap.append(detail);
