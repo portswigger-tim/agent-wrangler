@@ -108,6 +108,11 @@ export function environmentLines(entry, env = {}, { short = false } = {}) {
   return lines;
 }
 
+// GitHub issue-search terms for one extension's open issues in a repository
+// it shares with others, found by the `[<id>]` prefix issueTitle gives every
+// draft. Search drops the brackets, so this matches the id as a title word.
+export const titleSearch = (id) => `is:issue is:open "[${id}]" in:title`;
+
 // A bug report or a feature request. Each kind is its body's sections, in
 // order — `[heading, field, hint]`, where a section with no hint is optional
 // and left out when its field is empty — and the label GitHub applies when the

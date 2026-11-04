@@ -1,6 +1,6 @@
 import { COPY_ICON, CHECK_ICON, PROMOTE_ICON, RESTART_ICON, GITHUB_ICON, STAR_ICON, ATTACH_ICON, SEARCH_ICON } from './icons.js';
 import { changesText } from './update-panel.js';
-import { extensionIssue, statsRepoOf } from './extension-issue.js';
+import { extensionIssue, statsRepoOf, titleSearch } from './extension-issue.js';
 
 // The Extensions settings tab and the install/update consent modal. Pure DOM
 // builders with no app state, like toast.js and system-banner.js: settings.js
@@ -282,7 +282,7 @@ function externalLink(className, text, href) {
 // extension-issue.js, the same code as the report_extension_issue MCP tool.
 //
 // `repoInfo` is this extension's `ext-repo-stats` reply: undefined or
-// `{ loading }` while it is out, then `{ stats, statsError, issues }`. The
+// `{ loading }` while it is out, then `{ stats, openIssues, statsError, issues }`. The
 // links are hidden only when GitHub said the issue repository takes no issues
 // (`issues.available === false`); while that is unknown they are offered.
 // Nothing here stars a repository: "Star on GitHub" opens the repository's
@@ -301,34 +301,42 @@ function feedbackEl(entry, { issueEnv, repoInfo } = {}) {
     row.append(el('span', 'setting-help', issueHelpText(repo)));
     box.append(row);
   }
-  if (statsRepo) box.append(repoStatsEl(statsRepo, repoInfo));
+  if (statsRepo) box.append(repoStatsEl(entry, statsRepo, repoInfo));
   return box;
 }
 
-function repoStatsEl(repo, info) {
+const countText = (count, word) => `${compactCount(count)} ${word}${count === 1 ? '' : 's'}`;
+
+function repoStatsEl(entry, repo, info) {
   const meta = el('div', 'ext-gh-meta ext-repo-stats');
   const stats = info?.stats;
   if (!stats) {
     meta.append(el('span', null, info?.statsError ? `GitHub stats unavailable: ${info.statsError}` : 'Loading GitHub stats…'));
     return meta;
   }
-  const n = (count, word) => `${compactCount(count)} ${word}${count === 1 ? '' : 's'}`;
   const stars = el('span', 'ext-gh-stars');
   stars.innerHTML = STAR_ICON;
-  stars.append(el('span', null, n(stats.stars, 'star')));
+  stars.append(el('span', null, countText(stats.stars, 'star')));
   stars.title = `${stats.stars} star${stats.stars === 1 ? '' : 's'} on GitHub`;
   meta.append(stars);
-  const issues = stats.htmlUrl
-    ? externalLink('ext-kv-open', `${n(stats.openIssues, 'open issue')}`, `${stats.htmlUrl}/issues`)
-    : el('span', null, n(stats.openIssues, 'open issue'));
-  issues.title = `GitHub's count for ${repo.owner}/${repo.repo}, which includes open pull requests.`;
-  meta.append(issues);
+  if (info.openIssues) meta.append(openIssuesEl(entry, info.openIssues));
   if (stats.htmlUrl) {
     const star = externalLink('ext-kv-open', 'Star on GitHub ↗', stats.htmlUrl);
     star.title = `Opens ${repo.owner}/${repo.repo} on GitHub, where you can star it.`;
     meta.append(star);
   }
   return meta;
+}
+
+// Open issues where this extension's reports go, never counting pull
+// requests; the server leaves the count out when it cannot tell. In a
+// repository the extension shares (its `issuesRepo`), only the issues titled
+// with its id, and the link opens that search.
+function openIssuesEl(entry, { count, repo, shared }) {
+  const url = `https://github.com/${repo}/issues${shared ? `?q=${encodeURIComponent(titleSearch(entry.id))}` : ''}`;
+  const a = externalLink('ext-kv-open', `${countText(count, 'open issue')}${shared ? ` in ${repo}` : ''}`, url);
+  a.title = shared ? `Open issues in ${repo} whose title names [${entry.id}]` : `Open issues on ${repo}`;
+  return a;
 }
 
 // The per-extension auto-update switch. No `data-id`, so settings.js's

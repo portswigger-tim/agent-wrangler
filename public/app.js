@@ -40,7 +40,7 @@ import { createSlots } from './slots.js';
 import { MODEL_FRONT } from './model-front-api.js';
 import { createClientExtensionLoader } from './extensions.js';
 import { updatePanelEl, restartPanelEl, shouldReloadForVersion, updateAvailable, rolledBackText, updateToastText, outdatedExtensions, extUpdateKeys, extUpdateIsNew, extUpdateToastText, extUpdatesEl } from './update-panel.js';
-import { statsRepoOf, issueRepoOf } from './extension-issue.js';
+import { statsRepoOf, issueRepoOf, parseIssuesRepo } from './extension-issue.js';
 import { extensionsPanelEl, extensionSettingRowsEl, commitFocusedField, focusedFieldState, restoreFocusedField, consentBodyEl, consentButtonLabels, progressText, uninstallBodyText, AUTO_UPDATE_WARNING, TRANSIENT_PROGRESS_PHASES, RESTART_NOTE as EXT_RESTART_NOTE, AUTO_RESTART_NOTE as EXT_AUTO_RESTART_NOTE, UNINSTALL_RESTART_NOTE as EXT_UNINSTALL_RESTART_NOTE } from './extensions-panel.js';
 import { HINT_CHARS, hintLabels } from './hints.js';
 import { currentModelValue } from './model-menu.js';
@@ -7529,10 +7529,14 @@ function connect() {
     else if (msg.type === 'ext-repo-stats-result') {
       if (typeof msg.id === 'string') {
         const stats = msg.stats && typeof msg.stats === 'object'
-          ? { stars: Number(msg.stats.stars) || 0, openIssues: Number(msg.stats.openIssues) || 0, htmlUrl: typeof msg.stats.htmlUrl === 'string' ? msg.stats.htmlUrl : '' }
+          ? { stars: Number(msg.stats.stars) || 0, htmlUrl: typeof msg.stats.htmlUrl === 'string' ? msg.stats.htmlUrl : '' }
+          : null;
+        const open = msg.openIssues;
+        const openIssues = open && typeof open === 'object' && Number.isInteger(open.count) && open.count >= 0 && parseIssuesRepo(open.repo)
+          ? { count: open.count, repo: open.repo, shared: open.shared === true }
           : null;
         const issues = msg.issues && typeof msg.issues === 'object' ? { available: msg.issues.available === true ? true : msg.issues.available === false ? false : null } : null;
-        extRepoInfo.set(msg.id, { stats, statsError: typeof msg.statsError === 'string' ? msg.statsError : '', issues });
+        extRepoInfo.set(msg.id, { stats, openIssues, statsError: typeof msg.statsError === 'string' ? msg.statsError : '', issues });
         remountExtensions();
       }
     }
