@@ -121,3 +121,47 @@ test('keeps an existing query on a templated bugs URL', () => {
   assert.equal(p.get('template'), 'bug.md');
   assert.equal(p.get('title'), 'T');
 });
+
+test('the kind defaults to bug, labels it, and an unknown kind is a bug', () => {
+  for (const opts of [{}, { kind: 'bug' }, { kind: 'nonsense' }]) {
+    const draft = extensionIssue(installed, ENV, { ...opts, title: 'T', description: 'D' });
+    assert.equal(draft.kind, 'bug');
+    assert.equal(params(draft.url).get('labels'), 'bug');
+    assert.match(draft.body, /### What happened\n\nD/);
+    assert.match(draft.body, /### Steps to reproduce/);
+    assert.match(draft.body, /OS: Darwin/);
+  }
+});
+
+test('a feature request has its own template, a shorter environment and the enhancement label', () => {
+  const draft = extensionIssue(installed, ENV, { kind: 'feature', title: 'Dark chips', description: 'Chips in dark mode.', why: 'I work at night.', steps: 'ignored' });
+  assert.equal(draft.kind, 'feature');
+  const p = params(draft.url);
+  assert.equal(p.get('labels'), 'enhancement');
+  assert.equal(p.get('body'), draft.body);
+  assert.match(draft.body, /### What I'd like\n\nChips in dark mode\./);
+  assert.match(draft.body, /### Why \/ what I was doing\n\nI work at night\./);
+  assert.doesNotMatch(draft.body, /How it might look/, 'the optional section is left out when empty');
+  assert.doesNotMatch(draft.body, /Steps to reproduce|ignored/, 'bug-only fields are not used');
+  assert.match(draft.body, /Extension: `widgets` 2\.0\.1/);
+  assert.match(draft.body, /Agent Wrangler: 1\.2\.3/);
+  for (const bugOnly of [/Installed commit/, /wranglerApi/, /State:/, /OS:/]) assert.doesNotMatch(draft.body, bugOnly);
+  const sketched = extensionIssue(installed, ENV, { kind: 'feature', title: 'T', description: 'D', how: 'A toggle.' });
+  assert.match(sketched.body, /### How it might look\n\nA toggle\./);
+  assert.match(extensionIssue(installed, ENV, { kind: 'feature' }).body, /<!-- The change you would like/);
+});
+
+test('a bugs URL that already chooses labels keeps them, and a non-GitHub tracker gets none', () => {
+  const labelled = extensionIssue({ ...installed, bugsUrl: 'https://github.com/acme/widgets-ext/issues/new?labels=triage' }, ENV, { kind: 'feature' });
+  assert.deepEqual(params(labelled.url).getAll('labels'), ['triage']);
+  const elsewhere = extensionIssue({ ...installed, bugsUrl: 'https://tracker.example.com/widgets' }, ENV, { kind: 'feature' });
+  assert.equal(elsewhere.url, 'https://tracker.example.com/widgets');
+});
+
+test('an over-long feature request is cut to fit too', () => {
+  const huge = 'x'.repeat(20000);
+  const draft = extensionIssue(installed, ENV, { kind: 'feature', title: 'T', description: huge, why: huge, how: huge });
+  assert.ok(draft.url.length <= MAX_ISSUE_URL_LENGTH);
+  assert.equal(draft.truncated, true);
+  assert.match(params(draft.url).get('body'), /Agent Wrangler: 1\.2\.3/);
+});

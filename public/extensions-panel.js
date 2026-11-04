@@ -267,6 +267,7 @@ export function extensionDetailEl(entry, {
 
 export const REPORT_ISSUE_HELP = 'Opens a new issue with this extension\'s details filled in, for you to review and submit. Nothing is posted until you submit it.';
 export const REPORT_ISSUE_COPY_HELP = 'Opens this extension\'s issue tracker and copies a draft with its details to paste.';
+const ISSUE_LINKS = [['bug', 'Report an issue ↗', 'ext-report-issue'], ['feature', 'Request a feature ↗', 'ext-request-feature']];
 
 function externalLink(className, text, href) {
   const a = el('a', className, text);
@@ -276,7 +277,7 @@ function externalLink(className, text, href) {
   return a;
 }
 
-// "Report an issue", plus stars and open issues for an extension installed
+// "Report an issue" and "Request a feature", plus stars and open issues for an extension installed
 // from GitHub. The button is a link, not a script-opened window, so a popup
 // blocker never eats it; the URL is built by extension-issue.js, the same code
 // as the report_extension_issue MCP tool. Absent when the extension names no
@@ -287,16 +288,20 @@ function externalLink(className, text, href) {
 // htmlUrl }`. Nothing here stars a repository: "Star on GitHub" opens the
 // repository's page, where the human can.
 function feedbackEl(entry, { issueEnv, repoStats, onReportIssue } = {}) {
-  const draft = extensionIssue(entry, issueEnv || {});
+  const drafts = ISSUE_LINKS.map(([kind, label, className]) => ({ label, className, draft: extensionIssue(entry, issueEnv || {}, { kind }) }));
   const statsRepo = statsRepoOf(entry);
-  if (!draft && !statsRepo) return null;
+  // Both kinds go to the same tracker, so either both drafts exist or neither.
+  const prefill = drafts[0].draft?.prefill;
+  if (!drafts[0].draft && !statsRepo) return null;
   const box = el('div', 'ext-feedback');
-  if (draft) {
+  if (drafts[0].draft) {
     const row = el('div', 'ext-feedback-row');
-    const report = externalLink('ext-btn ext-btn-sm ext-report-issue', 'Report an issue ↗', draft.url);
-    report.addEventListener('click', () => onReportIssue?.(entry, draft));
-    row.append(report);
-    row.append(el('span', 'setting-help', draft.prefill ? REPORT_ISSUE_HELP : REPORT_ISSUE_COPY_HELP));
+    for (const { label, className, draft } of drafts) {
+      const link = externalLink(`ext-btn ext-btn-sm ext-issue-link ${className}`, label, draft.url);
+      link.addEventListener('click', () => onReportIssue?.(entry, draft));
+      row.append(link);
+    }
+    row.append(el('span', 'setting-help', prefill ? REPORT_ISSUE_HELP : REPORT_ISSUE_COPY_HELP));
     box.append(row);
   }
   if (statsRepo) box.append(repoStatsEl(statsRepo, repoStats));

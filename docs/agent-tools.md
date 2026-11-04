@@ -109,7 +109,7 @@ same provider and lifecycle limits.
 
 | Tool | Purpose |
 | --- | --- |
-| `report_extension_issue` | Draft an issue about an extension that misbehaved: `extensionId`, `title`, `description` and optional `steps`. Returns the pre-filled new-issue URL that the extension's **Report an issue** button opens, with the extension version, installed commit and branch, Agent Wrangler version, host API, enabled or quarantine state and OS added to the body. It posts nothing. The agent gives the URL to the human, who reviews and submits it. `prefilled: false` (a tracker other than GitHub) or `truncated: true` means the human should also paste the returned `title` and `body`. Errors when the extension names no tracker. |
+| `report_extension_issue` | Draft a bug report (`kind: "bug"`, the default) or a feature request (`kind: "feature"`) about an extension: `extensionId`, `title`, `description`, plus `steps` for a bug, or `why` and `how` for a feature. Returns the pre-filled new-issue URL that the extension's **Report an issue** or **Request a feature** link opens, labelled `bug` or `enhancement`. A bug adds the extension version, installed commit and branch, Agent Wrangler version, host API, enabled or quarantine state and OS to the body; a feature request adds only the extension and Agent Wrangler versions. It posts nothing. The agent gives the URL to the human, who reviews and submits it, and drafts a feature request only after offering one and hearing yes. `prefilled: false` (a tracker other than GitHub) or `truncated: true` means the human should also paste the returned `title` and `body`. Errors when the extension names no tracker. |
 
 ## Shared checklist
 

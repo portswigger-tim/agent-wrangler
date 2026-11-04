@@ -1112,6 +1112,24 @@ test('Feedback: stats only for a GitHub-installed extension, with a Star link th
   });
 });
 
+test('Feedback: Request a feature sits beside Report an issue, drafting the feature template', () => {
+  withDom(() => {
+    const opened = [];
+    const panel = showing(GH, { issueEnv: ISSUE_ENV, onReportIssue: (e, d) => opened.push(d.kind) });
+    const row = byClass(panel, 'ext-feedback-row')[0];
+    assert.deepEqual(byClass(row, 'ext-issue-link').map((a) => a._text), ['Report an issue ↗', 'Request a feature ↗']);
+    const feature = byClass(panel, 'ext-request-feature')[0];
+    const url = new URL(feature.href);
+    assert.equal(url.searchParams.get('labels'), 'enhancement');
+    assert.match(url.searchParams.get('body'), /### What I'd like/);
+    assert.equal(feature.target, '_blank');
+    feature.fire('click');
+    reportLink(panel).fire('click');
+    assert.deepEqual(opened, ['feature', 'bug']);
+    assert.equal(byClass(showing({ ...INSTALLED, origin: '' }), 'ext-request-feature').length, 0, 'no tracker, no link');
+  });
+});
+
 test('the install consent offers the star unticked, only when the server offered it', () => {
   withDom(() => {
     const base = { id: 'notes', label: 'Notes', capabilities: [], dependencies: [], dependencyCount: 0 };

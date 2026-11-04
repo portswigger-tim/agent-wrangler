@@ -3429,7 +3429,7 @@ main.diff-fullscreen .diff-filelist-handle { display: block; }
 .ext-feedback { display: flex; flex-direction: column; gap: 8px; }
 .ext-feedback-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; }
 .ext-feedback-row .setting-help { margin-top: 0; flex: 1; min-width: 200px; }
-.ext-report-issue { text-decoration: none; color: inherit; white-space: nowrap; }
+.ext-issue-link { text-decoration: none; color: inherit; white-space: nowrap; }
 .ext-repo-stats { font-size: 12px; margin-top: 0; color: var(--fg-muted); }
 .ext-consent-star { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border-muted); }
 .modal-card label.check-row.ext-consent-star-label { font-weight: 600; gap: 8px; }

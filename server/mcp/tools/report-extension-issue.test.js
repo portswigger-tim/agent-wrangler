@@ -31,6 +31,8 @@ test('returns the same pre-filled URL the button builds, and posts nothing', asy
   assert.equal(r.prefilled, true);
   assert.equal(r.truncated, false);
   assert.equal(r.posted, false);
+  assert.equal(r.kind, 'bug', 'bug is the default');
+  assert.equal(new URL(r.url).searchParams.get('labels'), 'bug');
   assert.match(r.body, /`next` \(early adopter\)/);
   assert.match(r.body, new RegExp(`wranglerApi: ${HOST_API_VERSION.replace(/\./g, '\\.')}`));
 });
@@ -55,4 +57,19 @@ test('an unknown extension or one with no tracker is an error', async () => {
   const none = await call({ extensionId: 'local', title: 'T', description: 'D' });
   assert.equal(none.isError, true);
   assert.match(none.content[0].text, /names no issue tracker/);
+});
+
+test('kind "feature" drafts a feature request with the same builder as the button', async () => {
+  const args = { kind: 'feature', extensionId: 'widgets', title: 'Dark chips', description: 'Chips in dark mode.', why: 'I work at night.', how: 'A toggle.' };
+  const r = (await call(args)).structuredContent;
+  const entry = extensionsForGraph(LIST).find((e) => e.id === 'widgets');
+  const env = { version: VERSION, codeVersion: 'abc1234', hostApi: HOST_API_VERSION, os: platformText() };
+  assert.equal(r.url, extensionIssue(entry, env, args).url);
+  assert.equal(r.kind, 'feature');
+  assert.equal(new URL(r.url).searchParams.get('labels'), 'enhancement');
+  assert.match(r.body, /### What I'd like\n\nChips in dark mode\./);
+  assert.match(r.body, /### How it might look\n\nA toggle\./);
+  assert.doesNotMatch(r.body, /OS:/);
+  assert.ok(reportExtensionIssueTool.inputSchema.kind.safeParse(undefined).success, 'kind is optional');
+  assert.equal(reportExtensionIssueTool.inputSchema.kind.safeParse('chore').success, false);
 });
