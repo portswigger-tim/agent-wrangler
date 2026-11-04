@@ -67,12 +67,22 @@ An agent can draft the same issue with the `report_extension_issue` tool (see
 something differently, an agent offers once to draft a feature request and drafts it only if you
 say yes.
 
-An extension installed from a GitHub URL also shows its stars and open issues (GitHub's count for
-the repository it was installed from, which includes open pull requests), with a link to the issues
-and **Star on GitHub**, which opens the repository so you can star it there. Agent Wrangler never
-stars without your opt-in, and only unstars what it starred. The numbers come from GitHub's public
-API without a token, are cached for 30 minutes, and reuse what the **Browse GitHub** list already
-fetched. Core and hand-placed extensions show no stats.
+An extension installed from a GitHub URL also shows its stars, how many issues are open where its
+reports go, and **Star on GitHub**, which opens the repository so you can star it there. Agent
+Wrangler never stars without your opt-in, and only unstars what it starred. The open-issue count
+never includes pull requests, and links to the issues it counts:
+
+- With no `issuesRepo`, it counts the open issues on the repository the extension was installed from.
+- With an `issuesRepo` that other extensions may share, it counts only the issues whose titles name
+  this extension's id (the `[<id>]` prefix every drafted issue gets), shown as "N open issues in
+  owner/repo".
+
+When the `gh` CLI is signed in to github.com, the count comes from GitHub's GraphQL API as you. Otherwise
+it comes from the public API without a token: the repository's open-issue figure less its open pull
+requests, or GitHub's issue search for a shared repository. If neither works (offline, or a rate
+limit), no count is shown rather than a wrong one. Everything is cached for 30 minutes (5 after a
+failure), and the stars reuse what the **Browse GitHub** list already fetched. Core and hand-placed
+extensions show no stats.
 
 ### Star an extension when you install it
 

@@ -1062,7 +1062,11 @@ const ISSUE_ENV = { version: '1.2.3', codeVersion: '', hostApi: '1.57.0', os: 'L
 const feedbackOf = (node) => byClass(node, 'ext-feedback')[0];
 const reportLink = (node) => byClass(node, 'ext-report-issue')[0];
 
-const GH_INFO = { stats: { stars: 1200, openIssues: 1, htmlUrl: 'https://github.com/acme/widgets-ext' }, issues: { repo: 'acme/widgets-ext', available: true } };
+const GH_INFO = {
+  stats: { stars: 1200, htmlUrl: 'https://github.com/acme/widgets-ext' },
+  openIssues: { count: 1, repo: 'acme/widgets-ext', shared: false },
+  issues: { repo: 'acme/widgets-ext', available: true },
+};
 
 test('Feedback: Report an issue and Request a feature are new-tab links to the pre-filled GitHub form', () => {
   withDom(() => {
@@ -1112,6 +1116,23 @@ test('Feedback: links hidden only when GitHub says issues are unavailable, offer
   });
 });
 
+test('Feedback: no open-issue count unless the server could count issues alone; a shared repository\'s is searched', () => {
+  withDom(() => {
+    const unknown = byClass(showing(GH, { repoInfo: { widgets: { ...GH_INFO, openIssues: null } } }), 'ext-repo-stats')[0];
+    assert.ok(texts(unknown).includes('1.2k stars'));
+    assert.deepEqual(byClass(unknown, 'ext-kv-open').map((a) => a._text), ['Star on GitHub ↗']);
+    assert.ok(!texts(unknown).some((t) => /open issue/.test(t)));
+
+    const shared = { ...GH_INFO, openIssues: { count: 3, repo: 'acme/all-issues', shared: true } };
+    const link = byClass(byClass(showing({ ...GH, issuesRepo: 'acme/all-issues' }, { repoInfo: { widgets: shared } }), 'ext-repo-stats')[0], 'ext-kv-open')[0];
+    assert.equal(link._text, '3 open issues in acme/all-issues');
+    const url = new URL(link.href);
+    assert.equal(`${url.origin}${url.pathname}`, 'https://github.com/acme/all-issues/issues');
+    assert.equal(url.searchParams.get('q'), 'is:issue is:open "[widgets]" in:title');
+    assert.equal(link.title, 'Open issues in acme/all-issues whose title names [widgets]');
+  });
+});
+
 test('Feedback: stats only for a GitHub-installed extension, with a Star link that only opens GitHub', () => {
   withDom(() => {
     assert.ok(texts(showing(GH)).includes('Loading GitHub stats…'));
@@ -1123,6 +1144,7 @@ test('Feedback: stats only for a GitHub-installed extension, with a Star link th
       ['1 open issue', 'https://github.com/acme/widgets-ext/issues'],
       ['Star on GitHub ↗', 'https://github.com/acme/widgets-ext'],
     ]);
+    assert.equal(links[0].title, 'Open issues on acme/widgets-ext');
     assert.ok(texts(showing(GH, { repoInfo: { widgets: { stats: null, statsError: 'rate limited', issues: null } } })).includes('GitHub stats unavailable: rate limited'));
     // Core, hand-placed (even with an issuesRepo) and non-GitHub installs: no stats.
     for (const entry of [BUILTIN_A, { ...INSTALLED, origin: '', issuesRepo: 'acme/notes-ext' }, { ...INSTALLED, issuesRepo: 'acme/notes-ext' }]) {

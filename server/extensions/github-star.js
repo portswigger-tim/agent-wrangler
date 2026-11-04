@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { realGh } from './gh-cli.js';
 
 // Starring an extension's GitHub repository as the human, through the `gh` CLI
 // they are already signed in to. OPT-IN ONLY: the install consent dialog offers
@@ -10,22 +10,8 @@ import { execFile } from 'node:child_process';
 // No token of the wrangler's own: `gh` holds the credential, and a human
 // without `gh` signed in to github.com is simply never offered the checkbox.
 //
-// A LEAF: node:child_process only. The runner is a parameter so tests stub
-// `gh` without spawning anything.
-
-const TIMEOUT_MS = 15000;
-
-// `(args) => Promise<{ code, stdout, stderr }>`, resolving on a non-zero exit
-// too: `gh api` exits 1 for a 404, and "not starred" is an answer, not a
-// failure. Only a `gh` that could not run at all rejects.
-export function realGh(args) {
-  return new Promise((resolve, reject) => {
-    execFile('gh', args, { timeout: TIMEOUT_MS, env: { ...process.env, GH_PROMPT_DISABLED: '1', NO_COLOR: '1' } }, (err, stdout, stderr) => {
-      if (err && typeof err.code !== 'number') { reject(err); return; }
-      resolve({ code: err ? err.code : 0, stdout: String(stdout || ''), stderr: String(stderr || '') });
-    });
-  });
-}
+// A LEAF: the `gh` runner (gh-cli.js) only. The runner is a parameter so tests
+// stub `gh` without spawning anything.
 
 const path = ({ owner, repo }) => `user/starred/${owner}/${repo}`;
 

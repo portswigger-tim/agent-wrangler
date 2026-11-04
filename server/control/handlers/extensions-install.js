@@ -8,7 +8,8 @@ import { externalDir, tmpDir, ensureDirs, isValidExtensionId, readProvenance, re
 import { unconsentedCapabilities, admitExternal, importViolation, packageFacts } from '../../extensions/external.js';
 import { assertAllowedUrl, cloneTo, readHead, lockDependencies, npmCi, lsRemoteHead, commitsSince, readDeclaration, MissingLockfileError, MissingDeclarationError } from '../../extensions/install.js';
 import { HOST_API_VERSION, servesRange, isValidRange } from '../../host-api/version.js';
-import { realGh, ghLogin, starRepo, unstarRepo } from '../../extensions/github-star.js';
+import { ghLogin, starRepo, unstarRepo } from '../../extensions/github-star.js';
+import { realGh } from '../../extensions/gh-cli.js';
 import { githubRepoOf } from '../../../public/extension-issue.js';
 import { log } from '../../log.js';
 
